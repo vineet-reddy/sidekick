@@ -309,7 +309,7 @@ The phone talks to OpenAI. That's the entire architecture.
 
 1. **App shell** — Xcode project, SwiftData models, tab bar, NoteListView + NoteEditorView with CRUD
 2. **Auth** — AuthService, OAuth PKCE, SettingsView sign-in/out
-3. **Heartbeat + clustering** — OpenAIService.assessNotes, heartbeat on app open
+3. **Heartbeat + clustering** — OpenAIService.assessNotes, heartbeat on app open + Background App Refresh
 4. **Paper generation** — OpenAIService.submitPaperTask + checkTask, polling, Paper creation
 5. **Paper display** — PaperDetailView with WKWebView rendering, PaperListView
 6. **Export** — PDF + LaTeX from rendered paper

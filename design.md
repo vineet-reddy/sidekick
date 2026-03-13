@@ -147,10 +147,7 @@ Export formats: PDF, LaTeX.
 
 ## Open Questions
 
-1. **Relay server vs. direct REST API calls?**
-   Start with tiny relay (safer, uses official SDK). Migrate to direct calls later if the REST surface is stable.
-
-2. **Note format?**
+1. **Note format?**
    Plain text with optional tags. Don't over-structure.
 
 3. **Voice input?**
@@ -189,7 +186,7 @@ Export formats: PDF, LaTeX.
 | App | SwiftUI, SwiftData |
 | Auth | OAuth 2.0 PKCE (OpenAI) |
 | Secrets | iOS Keychain |
-| Relay | Node.js + `@openai/codex-sdk` (or direct REST) |
+| AI | OpenAI REST APIs (direct from Swift) |
 | Paper rendering | Markdown + WKWebView |
 | Export | PDF generation + LaTeX templating |
 | Notifications | APNs |
@@ -201,9 +198,8 @@ Export formats: PDF, LaTeX.
 1. Finalize this design
 2. SwiftUI app shell (notes CRUD + tabs)
 3. ChatGPT OAuth flow
-4. Relay server + Codex SDK integration
-5. Heartbeat (clustering + paper-readiness)
-6. Paper generation pipeline
+4. Heartbeat (clustering + paper-readiness + background app refresh)
+5. Paper generation pipeline
 7. Paper display + export
 8. Push notifications
 9. Polish (liquid glass, animations, haptics)
