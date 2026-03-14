@@ -93,7 +93,7 @@ One service handles everything AI. Two methods that matter.
 class OpenAIService {
     private let auth: AuthService
 
-    /// Lightweight call — sends notes to chat completions, gets back clusters + readiness
+    /// Lightweight call — sends notes to the Responses API, gets back clusters + readiness
     func assessNotes(_ notes: [Note]) async throws -> [NoteCluster]
 
     /// Heavyweight call — submits Codex cloud task, returns task ID
@@ -118,7 +118,7 @@ struct PaperArtifacts {
 
 ### assessNotes — Clustering Prompt
 
-Sent to chat completions (fast, cheap). Not Codex.
+Sent through the Codex-backed Responses API, but routed to the latest lightweight GPT-5-family model first. If that alias is not available on the user's ChatGPT-backed Codex surface yet, the app falls back automatically to the next recommended GPT-5 model.
 
 ```
 You are a research assistant. Group these notes into thematic clusters.
@@ -134,7 +134,7 @@ Notes:
 
 ### submitPaperTask — Paper Generation Prompt
 
-Sent to Codex cloud task. This is the core of the product.
+Sent to a Codex cloud task. The app prefers the latest rolling Codex model alias for long-running sandboxed work and falls back automatically to older Codex snapshots if the backend has not caught up yet. This keeps the app on the newest Codex model without hard-failing when model availability lags.
 
 ```
 You are a research scientist. Write a complete academic paper.

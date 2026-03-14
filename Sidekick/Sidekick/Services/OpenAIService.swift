@@ -38,6 +38,8 @@ final class OpenAIService: ObservableObject {
     private let auth: AuthService
     private let session: URLSession
     private let baseURL = URL(string: "https://chatgpt.com/backend-api/codex")!
+    private let originator = "codex_cli_rs"
+    private let modelRouter = OpenAIModelRouter()
 
     init(auth: AuthService, session: URLSession = .shared) {
         self.auth = auth
@@ -79,7 +81,7 @@ final class OpenAIService: ObservableObject {
         """
 
         let response = try await createResponse(
-            model: "gpt-4o-mini",  // lightweight model for clustering
+            for: .noteAssessment,
             background: false,
             tools: [],
             input: prompt
@@ -135,7 +137,7 @@ final class OpenAIService: ObservableObject {
         """
 
         let response = try await createResponse(
-            model: "gpt-4o",  // full model for paper generation with code interpreter
+            for: .paperGeneration,
             background: true,
             tools: [["type": "code_interpreter", "container": ["type": "auto"]]],
             input: prompt
@@ -173,33 +175,53 @@ final class OpenAIService: ObservableObject {
     }
 
     private func createResponse(
-        model: String,
+        for workload: OpenAIWorkload,
         background: Bool,
         tools: [[String: Any]],
         input: String
     ) async throws -> ResponseEnvelope {
-        let body: [String: Any] = [
-            "model": model,
-            "background": background,
-            "store": true,
-            "tools": tools,
-            "input": [
-                [
-                    "role": "user",
-                    "content": [
-                        [
-                            "type": "input_text",
-                            "text": input
+        let candidates = await modelRouter.candidates(for: workload)
+        var unsupportedMessages: [String] = []
+
+        for model in candidates {
+            let body: [String: Any] = [
+                "model": model,
+                "background": background,
+                "store": true,
+                "tools": tools,
+                "input": [
+                    [
+                        "role": "user",
+                        "content": [
+                            [
+                                "type": "input_text",
+                                "text": input
+                            ]
                         ]
                     ]
                 ]
             ]
-        ]
 
-        return try await sendJSONRequest(
-            pathComponents: ["responses"],
-            method: "POST",
-            body: body
+            do {
+                let response = try await sendJSONRequest(
+                    pathComponents: ["responses"],
+                    method: "POST",
+                    body: body
+                )
+                await modelRouter.remember(model: model, for: workload)
+                return response
+            } catch {
+                guard let retryMessage = retryableModelSelectionMessage(from: error) else {
+                    throw error
+                }
+
+                unsupportedMessages.append("\(model): \(retryMessage)")
+            }
+        }
+
+        let details = unsupportedMessages.joined(separator: " | ")
+        throw ServiceError.taskFailed(
+            "OpenAI did not accept any recommended \(workload.description) model. Tried \(candidates.joined(separator: ", ")). \(details)"
         )
     }
 
@@ -217,6 +239,7 @@ final class OpenAIService: ObservableObject {
         request.httpMethod = method
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(originator, forHTTPHeaderField: "originator")
 
         if let body {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -228,7 +251,7 @@ final class OpenAIService: ObservableObject {
         }
 
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
-            let message = String(data: data, encoding: .utf8) ?? "OpenAI request failed."
+            let message = responseErrorMessage(from: data)
             throw ServiceError.taskFailed(message)
         }
 
@@ -251,6 +274,7 @@ final class OpenAIService: ObservableObject {
             var request = URLRequest(url: endpoint(["files", file.fileID, "content"]))
             request.httpMethod = "GET"
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            request.setValue(originator, forHTTPHeaderField: "originator")
             let (data, response) = try await session.data(for: request)
 
             guard let httpResponse = response as? HTTPURLResponse,
@@ -292,10 +316,115 @@ final class OpenAIService: ObservableObject {
         return cleaned.data(using: .utf8)
     }
 
+    private func retryableModelSelectionMessage(from error: Error) -> String? {
+        guard case let ServiceError.taskFailed(message) = error else {
+            return nil
+        }
+
+        let normalized = message.lowercased()
+        let retryableIndicators = [
+            "model is not supported",
+            "unsupported model",
+            "unknown model",
+            "unrecognized model",
+            "does not exist",
+            "not available",
+            "invalid model",
+            "tool is not supported",
+            "tools are not supported"
+        ]
+
+        return retryableIndicators.contains(where: normalized.contains) ? message : nil
+    }
+
+    private func responseErrorMessage(from data: Data) -> String {
+        guard !data.isEmpty else {
+            return "OpenAI request failed."
+        }
+
+        if let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+            if let detail = object["detail"] as? String, !detail.isEmpty {
+                return detail
+            }
+
+            if let message = object["message"] as? String, !message.isEmpty {
+                return message
+            }
+
+            if let error = object["error"] as? [String: Any],
+               let message = error["message"] as? String,
+               !message.isEmpty {
+                return message
+            }
+        }
+
+        return String(data: data, encoding: .utf8) ?? "OpenAI request failed."
+    }
+
     private func endpoint(_ path: [String]) -> URL {
         path.reduce(baseURL) { url, component in
             url.appendingPathComponent(component)
         }
+    }
+}
+
+private enum OpenAIWorkload {
+    case noteAssessment
+    case paperGeneration
+
+    nonisolated var description: String {
+        switch self {
+        case .noteAssessment:
+            return "note assessment"
+        case .paperGeneration:
+            return "paper generation"
+        }
+    }
+
+    nonisolated var storageKey: String {
+        switch self {
+        case .noteAssessment:
+            return "noteAssessment"
+        case .paperGeneration:
+            return "paperGeneration"
+        }
+    }
+
+    nonisolated var preferredModels: [String] {
+        switch self {
+        case .noteAssessment:
+            return [
+                "gpt-5-mini",
+                "gpt-5.4",
+                "gpt-5.1",
+                "gpt-5"
+            ]
+        case .paperGeneration:
+            return [
+                "gpt-5-codex",
+                "gpt-5.3-codex",
+                "gpt-5.2-codex",
+                "gpt-5.1-codex-max",
+                "gpt-5.1-codex",
+                "gpt-5.4"
+            ]
+        }
+    }
+}
+
+private actor OpenAIModelRouter {
+    private var rememberedModels: [String: String] = [:]
+
+    func candidates(for workload: OpenAIWorkload) -> [String] {
+        if let remembered = rememberedModels[workload.storageKey] {
+            return [remembered] + workload.preferredModels.filter { $0 != remembered }
+        }
+
+        return workload.preferredModels
+    }
+
+    func remember(model: String, for workload: OpenAIWorkload) {
+        rememberedModels[workload.storageKey] = model
     }
 }
 

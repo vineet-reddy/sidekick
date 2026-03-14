@@ -69,6 +69,7 @@ When the AI decides to write a paper, it submits a Codex cloud task. The task ru
 The sandbox is the same whether triggered from chatgpt.com, the CLI, or programmatically. We get the full environment.
 
 The app calls OpenAI's REST APIs directly from Swift. No SDK wrapper, no relay server, no backend.
+Model choice is workload-aware rather than user-configurable: note clustering prefers the latest lightweight GPT-5 model, while paper generation prefers the latest Codex model alias and falls back automatically if a ChatGPT-backed Codex surface is behind the newest release.
 
 ### The Heartbeat
 
