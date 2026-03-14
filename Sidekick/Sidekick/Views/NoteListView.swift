@@ -3,10 +3,14 @@ import SwiftUI
 
 struct NoteListView: View {
     @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var heartbeat: HeartbeatManager
     @Query(sort: \Note.updatedAt, order: .reverse) private var notes: [Note]
 
     @State private var searchText = ""
-    @State private var draftMode: DraftMode?
+    @State private var editingNote: Note?
+    @State private var newNoteText = ""
+    @FocusState private var isNewNoteFocused: Bool
+    @State private var prioritizedNoteID: UUID?
 
     private var filteredNotes: [Note] {
         guard !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -24,125 +28,163 @@ struct NoteListView: View {
             SidekickBackground()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    SectionHeader(
-                        eyebrow: "Research notes",
-                        title: "Capture sparks before they vanish",
-                        subtitle: "Write fragments fast. Sidekick clusters them quietly in the background."
-                    )
+                LazyVStack(spacing: 12) {
+                    if filteredNotes.isEmpty && newNoteText.isEmpty {
+                        Text("Jot something down below to get started.")
+                            .font(.subheadline)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 80)
+                    }
 
-                    if filteredNotes.isEmpty {
-                        emptyState
-                    } else {
-                        LazyVStack(spacing: 14) {
-                            ForEach(filteredNotes) { note in
-                                Button {
-                                    draftMode = .edit(note)
-                                } label: {
-                                    noteCard(for: note)
+                    ForEach(filteredNotes) { note in
+                        noteCard(for: note)
+                            .offset(x: 0, y: prioritizedNoteID == note.id ? -6 : 0)
+                            .animation(.spring(response: 0.3), value: prioritizedNoteID)
+                            .onTapGesture {
+                                editingNote = note
+                            }
+                            .simultaneousGesture(
+                                DragGesture(minimumDistance: 30, coordinateSpace: .local)
+                                    .onEnded { value in
+                                        if value.translation.height < -40 &&
+                                            abs(value.translation.width) < abs(value.translation.height) {
+                                            prioritize(note)
+                                        }
+                                    }
+                            )
+                            .contextMenu {
+                                Button("Prioritize") {
+                                    prioritize(note)
                                 }
-                                .buttonStyle(.plain)
-                                .contextMenu {
-                                    Button("Edit") {
-                                        draftMode = .edit(note)
-                                    }
 
-                                    Button("Delete", role: .destructive) {
-                                        delete(note)
-                                    }
+                                Button("Delete", role: .destructive) {
+                                    delete(note)
                                 }
                             }
-                        }
                     }
                 }
-                .padding(20)
-                .padding(.bottom, 96)
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+                .padding(.bottom, 120)
+            }
+
+            // Always-present input field at bottom
+            VStack {
+                Spacer()
+                inlineComposer
             }
         }
         .navigationTitle("Notes")
         .navigationBarTitleDisplayMode(.inline)
-        .searchable(text: $searchText, prompt: "Search notes")
-        .toolbar {
-            ToolbarItem(placement: .topBarTrailing) {
+        .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search notes")
+        .sheet(item: $editingNote) { note in
+            NoteEditorView(note: note)
+        }
+    }
+
+    // MARK: - Inline Composer
+
+    private var inlineComposer: some View {
+        HStack(spacing: 12) {
+            TextField("Just start typing...", text: $newNoteText, axis: .vertical)
+                .lineLimit(1...4)
+                .focused($isNewNoteFocused)
+                .onSubmit {
+                    commitNewNote()
+                }
+
+            if !newNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Button {
-                    draftMode = .create
+                    commitNewNote()
                 } label: {
-                    Image(systemName: "plus.circle.fill")
-                        .font(.title3)
+                    Image(systemName: "arrow.up.circle.fill")
+                        .font(.title2)
                         .foregroundStyle(SidekickTheme.accent)
                 }
             }
         }
-        .sheet(item: $draftMode) { mode in
-            NoteEditorView(mode: mode)
-        }
+        .padding(.horizontal, 16)
+        .padding(.vertical, 12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .overlay(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .stroke(SidekickTheme.edge, lineWidth: 1)
+        )
+        .shadow(color: SidekickTheme.shadow, radius: 12, x: 0, y: -4)
+        .padding(.horizontal, 16)
+        .padding(.bottom, 4)
     }
 
-    private var emptyState: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            Text("No notes yet")
-                .font(.title3.weight(.semibold))
-            Text("Start with messy thoughts, half-baked hypotheses, or voice memos from the hallway.")
-                .foregroundStyle(.secondary)
-            Button("Write your first note") {
-                draftMode = .create
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(SidekickTheme.accent)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard(padding: 24)
-    }
+    // MARK: - Note Card
 
     private func noteCard(for note: Note) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 8) {
             HStack {
                 Text(note.title)
                     .font(.headline)
                     .foregroundStyle(.primary)
-                    .multilineTextAlignment(.leading)
+                    .lineLimit(1)
 
                 Spacer()
 
-                Text(note.updatedAt.formatted(date: .abbreviated, time: .shortened))
+                Text(note.updatedAt, style: .relative)
                     .font(.caption)
-                    .foregroundStyle(.secondary)
+                    .foregroundStyle(.tertiary)
             }
 
-            Text(note.summary)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.leading)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            if note.content.split(separator: "\n").count > 1 || note.content.count > 64 {
+                Text(note.summary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard()
+        .glassCard(padding: 14)
+    }
+
+    // MARK: - Actions
+
+    private func commitNewNote() {
+        let trimmed = newNoteText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        let note = Note(content: trimmed, createdAt: .now, updatedAt: .now)
+        modelContext.insert(note)
+        try? modelContext.save()
+        newNoteText = ""
+        isNewNoteFocused = false
+
+        // Debounced heartbeat trigger after note creation
+        scheduleHeartbeat()
+    }
+
+    private func prioritize(_ note: Note) {
+        prioritizedNoteID = note.id
+        let impact = UIImpactFeedbackGenerator(style: .medium)
+        impact.impactOccurred()
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+            prioritizedNoteID = nil
+        }
+
+        // Force heartbeat run immediately
+        Task {
+            await heartbeat.run(modelContext: modelContext, force: true)
+        }
+    }
+
+    private func scheduleHeartbeat() {
+        Task {
+            try? await Task.sleep(for: .seconds(30))
+            await heartbeat.run(modelContext: modelContext, force: true)
+        }
     }
 
     private func delete(_ note: Note) {
         modelContext.delete(note)
         try? modelContext.save()
-    }
-}
-
-enum DraftMode: Identifiable {
-    case create
-    case edit(Note)
-
-    var id: String {
-        switch self {
-        case .create:
-            return "create"
-        case let .edit(note):
-            return note.id.uuidString
-        }
-    }
-
-    var isCreate: Bool {
-        if case .create = self {
-            return true
-        }
-
-        return false
     }
 }

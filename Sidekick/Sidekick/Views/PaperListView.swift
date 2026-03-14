@@ -9,37 +9,27 @@ struct PaperListView: View {
             SidekickBackground()
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 18) {
-                    SectionHeader(
-                        eyebrow: "Draft papers",
-                        title: "Your ideas condense into manuscripts",
-                        subtitle: "Generated drafts appear here with figures, methods, and citations when Sidekick thinks a thread is ready."
-                    )
-
-                    if papers.isEmpty {
-                        VStack(alignment: .leading, spacing: 16) {
-                            Text("Nothing published yet")
-                                .font(.title3.weight(.semibold))
-                            Text("Keep dropping notes. The heartbeat will cluster them and draft papers automatically.")
-                                .foregroundStyle(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .glassCard(padding: 24)
-                    } else {
-                        LazyVStack(spacing: 14) {
-                            ForEach(papers) { paper in
-                                NavigationLink {
-                                    PaperDetailView(paper: paper)
-                                } label: {
-                                    paperCard(for: paper)
-                                }
-                                .buttonStyle(.plain)
+                if papers.isEmpty {
+                    Text("Papers will appear here as your notes develop.")
+                        .font(.subheadline)
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity)
+                        .padding(.top, 80)
+                } else {
+                    LazyVStack(spacing: 14) {
+                        ForEach(papers) { paper in
+                            NavigationLink {
+                                PaperDetailView(paper: paper)
+                            } label: {
+                                paperCard(for: paper)
                             }
+                            .buttonStyle(.plain)
                         }
                     }
+                    .padding(.horizontal, 20)
+                    .padding(.top, 12)
+                    .padding(.bottom, 96)
                 }
-                .padding(20)
-                .padding(.bottom, 96)
             }
         }
         .navigationTitle("Papers")
@@ -47,55 +37,39 @@ struct PaperListView: View {
     }
 
     private func paperCard(for paper: Paper) -> some View {
-        VStack(alignment: .leading, spacing: 12) {
+        VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
-                VStack(alignment: .leading, spacing: 6) {
-                    Text(paper.title.isEmpty ? "Untitled paper" : paper.title)
-                        .font(.headline)
-                        .foregroundStyle(.primary)
-                        .multilineTextAlignment(.leading)
-
-                    Text(paper.createdAt.formatted(date: .abbreviated, time: .shortened))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                Text(paper.title.isEmpty ? "Untitled paper" : paper.title)
+                    .font(.headline)
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .multilineTextAlignment(.leading)
 
                 Spacer()
 
-                StatusPill(
-                    title: pillTitle(for: paper.status),
-                    tint: pillTint(for: paper.status)
-                )
+                // Only show a pill for non-ready states
+                if paper.status == .generating {
+                    StatusPill(title: "Generating...", tint: SidekickTheme.accent)
+                }
             }
 
-            Text(paper.summary)
-                .font(.subheadline)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: .infinity, alignment: .leading)
+            HStack {
+                Text(paper.createdAt, style: .relative)
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+
+                Spacer()
+            }
+
+            if !paper.summary.isEmpty {
+                Text(paper.summary)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .glassCard()
-    }
-
-    private func pillTitle(for status: PaperStatus) -> String {
-        switch status {
-        case .generating:
-            return "Generating"
-        case .ready:
-            return "Ready"
-        case .failed:
-            return "Needs attention"
-        }
-    }
-
-    private func pillTint(for status: PaperStatus) -> Color {
-        switch status {
-        case .generating:
-            return SidekickTheme.accent
-        case .ready:
-            return .green
-        case .failed:
-            return .orange
-        }
+        .glassCard(padding: 14)
     }
 }

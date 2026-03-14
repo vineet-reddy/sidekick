@@ -27,7 +27,7 @@ struct PaperDetailView: View {
                 case .failed:
                     progressCard(
                         title: "The draft stalled",
-                        message: "OpenAI returned a partial or failed run. Add a few sharper notes and trigger the heartbeat again."
+                        message: "Something went wrong during generation. Sidekick will retry automatically on the next cycle."
                     )
                 }
             }

@@ -3,9 +3,30 @@ import Combine
 import Foundation
 import SwiftData
 
+enum HeartbeatPhase: Equatable {
+    case idle
+    case checkingPapers
+    case assessingNotes
+    case submittingPaper(String)  // cluster title
+    case done(Int)               // number of papers submitted
+
+    var label: String {
+        switch self {
+        case .idle: return ""
+        case .checkingPapers: return "Checking papers..."
+        case .assessingNotes: return "Reading your notes..."
+        case .submittingPaper(let title): return "Drafting \"\(title)\"..."
+        case .done(let count):
+            if count == 0 { return "All caught up." }
+            return count == 1 ? "1 new paper started." : "\(count) new papers started."
+        }
+    }
+}
+
 @MainActor
 final class HeartbeatManager: ObservableObject {
     @Published private(set) var isRunning = false
+    @Published private(set) var phase: HeartbeatPhase = .idle
     @Published var lastError: String?
 
     private let openAI: OpenAIService
@@ -40,6 +61,7 @@ final class HeartbeatManager: ObservableObject {
 
     func run(modelContext: ModelContext, force: Bool) async {
         if isRunning {
+            print("[Heartbeat] Already running, skipping.")
             return
         }
 
@@ -47,24 +69,43 @@ final class HeartbeatManager: ObservableObject {
             let lastRun = defaults.object(forKey: lastRunKey) as? Date
             let shouldRun = lastRun.map { Date().timeIntervalSince($0) > cooldown } ?? true
             guard shouldRun else {
+                print("[Heartbeat] Cooldown active, skipping.")
                 return
             }
         }
 
+        print("[Heartbeat] Starting run (force=\(force))")
         isRunning = true
         defer {
             isRunning = false
             defaults.set(Date(), forKey: lastRunKey)
             scheduleBackgroundRefresh()
+            print("[Heartbeat] Run complete.")
         }
 
         do {
+            phase = .checkingPapers
+            print("[Heartbeat] Phase: checking in-flight papers...")
             try await resolveInFlightPapers(modelContext: modelContext)
-            try await discoverNewPaperCandidates(modelContext: modelContext)
+
+            phase = .assessingNotes
+            print("[Heartbeat] Phase: assessing notes...")
+            let submitted = try await discoverNewPaperCandidates(modelContext: modelContext)
+
             try modelContext.save()
             lastError = nil
+            phase = .done(submitted)
+            print("[Heartbeat] Done. Submitted \(submitted) new paper(s).")
+
+            // Clear the "done" message after a few seconds
+            Task {
+                try? await Task.sleep(for: .seconds(4))
+                if case .done = phase { phase = .idle }
+            }
         } catch {
+            print("[Heartbeat] ERROR: \(error.localizedDescription)")
             lastError = error.localizedDescription
+            phase = .idle
         }
     }
 
@@ -74,8 +115,12 @@ final class HeartbeatManager: ObservableObject {
         )
             .filter { $0.status == .generating }
 
+        print("[Heartbeat] Found \(papers.count) in-flight paper(s).")
+
         for paper in papers {
+            print("[Heartbeat]   Checking task \(paper.codexTaskID) for \"\(paper.title)\"...")
             guard let artifacts = try await openAI.checkTask(paper.codexTaskID) else {
+                print("[Heartbeat]   -> Still in progress.")
                 continue
             }
 
@@ -83,6 +128,7 @@ final class HeartbeatManager: ObservableObject {
             paper.markdown = artifacts.markdown
             paper.figureData = artifacts.figures
             paper.status = .ready
+            print("[Heartbeat]   -> Paper ready: \"\(artifacts.title)\"")
 
             if paper.lastNotifiedAt == nil {
                 notifications.notify(paper: paper)
@@ -91,23 +137,31 @@ final class HeartbeatManager: ObservableObject {
         }
     }
 
-    private func discoverNewPaperCandidates(modelContext: ModelContext) async throws {
+    @discardableResult
+    private func discoverNewPaperCandidates(modelContext: ModelContext) async throws -> Int {
         let notes = try modelContext.fetch(
             FetchDescriptor<Note>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
         )
 
+        print("[Heartbeat] Found \(notes.count) note(s) to assess.")
         guard !notes.isEmpty else {
-            return
+            print("[Heartbeat] No notes — nothing to do.")
+            return 0
         }
 
+        print("[Heartbeat] Calling OpenAI assessNotes API...")
         let clusters = try await openAI.assessNotes(notes)
+        print("[Heartbeat] Got \(clusters.count) cluster(s). Ready: \(clusters.filter(\.isReady).count)")
+
         let existingPapers = try modelContext.fetch(
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
 
+        var submitted = 0
         for cluster in clusters where cluster.isReady {
             let alreadyTracked = existingPapers.contains { $0.matches(noteIDs: cluster.noteIDs) }
             if alreadyTracked {
+                print("[Heartbeat]   Cluster \"\(cluster.suggestedTitle)\" already tracked, skipping.")
                 continue
             }
 
@@ -116,11 +170,15 @@ final class HeartbeatManager: ObservableObject {
                 continue
             }
 
+            phase = .submittingPaper(cluster.suggestedTitle)
+            print("[Heartbeat]   Submitting paper task: \"\(cluster.suggestedTitle)\"...")
+
             let taskID = try await openAI.submitPaperTask(
                 notes: clusterNotes,
                 title: cluster.suggestedTitle,
                 theme: cluster.theme
             )
+            print("[Heartbeat]   -> Task ID: \(taskID)")
 
             let paper = Paper(
                 title: cluster.suggestedTitle,
@@ -129,7 +187,10 @@ final class HeartbeatManager: ObservableObject {
                 sourceNoteIDs: cluster.noteIDs
             )
             modelContext.insert(paper)
+            submitted += 1
         }
+
+        return submitted
     }
 }
 
