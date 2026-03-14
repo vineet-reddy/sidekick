@@ -124,6 +124,16 @@ final class HeartbeatManager: ObservableObject {
                 continue
             }
 
+            do {
+                try PaperArtifactStore.finalizeProvenance(
+                    taskID: paper.codexTaskID,
+                    title: artifacts.title,
+                    modelProvenance: artifacts.provenance
+                )
+            } catch {
+                print("[Heartbeat]   -> Failed to persist provenance: \(error.localizedDescription)")
+            }
+
             paper.title = artifacts.title
             paper.markdown = artifacts.markdown
             paper.figureData = artifacts.figures
@@ -180,6 +190,12 @@ final class HeartbeatManager: ObservableObject {
                 datasetIDs: cluster.datasetIDs
             )
             print("[Heartbeat]   -> Task ID: \(submission.taskID)")
+
+            do {
+                try PaperArtifactStore.persistPendingSubmission(submission, title: cluster.suggestedTitle)
+            } catch {
+                print("[Heartbeat]   -> Failed to persist submission metadata: \(error.localizedDescription)")
+            }
 
             let paper = Paper(
                 title: cluster.suggestedTitle,
