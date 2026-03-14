@@ -6,12 +6,19 @@ struct NoteCluster: Codable, Hashable {
     let theme: String
     let suggestedTitle: String
     let isReady: Bool
+    let datasetIDs: [String]
+    let readinessMode: NoteClusterReadinessMode
+
+    var isAutomaticallyRunnable: Bool {
+        readinessMode == .trustedReady && !datasetIDs.isEmpty
+    }
 }
 
 struct PaperArtifacts {
     let title: String
     let markdown: String
     let figures: [Data]
+    let provenance: TaskOutputProvenance?
 }
 
 final class OpenAIService: ObservableObject {
@@ -41,10 +48,21 @@ final class OpenAIService: ObservableObject {
     private let originator = "codex_cli_rs"
     private let modelRouter = OpenAIModelRouter()
     private let environmentRouter = OpenAIEnvironmentRouter()
+    private let trustedDatasets: TrustedDatasetRegistry
 
-    init(auth: AuthService, session: URLSession = .shared) {
+    init(
+        auth: AuthService,
+        session: URLSession = .shared,
+        trustedDatasets: TrustedDatasetRegistry? = nil
+    ) {
         self.auth = auth
         self.session = session
+        let registry = trustedDatasets ?? TrustedDatasetRegistry(session: session)
+        self.trustedDatasets = registry
+
+        Task {
+            await registry.refreshIfNeeded()
+        }
     }
 
     func assessNotes(_ notes: [Note]) async throws -> [NoteCluster] {
@@ -61,11 +79,24 @@ final class OpenAIService: ObservableObject {
                 "createdAt": ISO8601DateFormatter().string(from: note.createdAt)
             ]
         }
+        let shortlistedDatasets = await trustedDatasets.assessmentShortlist(
+            noteTexts: notes.map(\.content),
+            limit: 10
+        )
+        let datasetGuide = shortlistedDatasets.isEmpty
+            ? "- No trusted dataset cards are currently loaded."
+            : shortlistedDatasets.map { $0.assessmentLine() }.joined(separator: "\n")
 
         let systemInstructions = """
         You are a research assistant. Group these notes into thematic clusters.
-        A cluster is ready when the notes imply a testable claim and relevant open data likely exists.
-        Be eager. Rough first drafts are better than unused ideas.
+        Be eager with clustering, but conservative about automatic paper generation.
+
+        Readiness modes:
+        - trusted_ready: at least one trusted dataset card clearly fits; set is_ready to true
+        - trusted_partial: trusted data exists but the paper would be weak or incomplete; set is_ready to false
+        - exploratory_ready: the idea likely needs unvetted external data; set is_ready to false
+
+        Use only dataset_ids from the trusted dataset cards below. Prefer at most 3 dataset_ids per cluster.
 
         Return strict JSON only with this shape:
         {
@@ -74,13 +105,21 @@ final class OpenAIService: ObservableObject {
               "noteIDs": ["UUID"],
               "theme": "string",
               "suggestedTitle": "string",
-              "isReady": true
+              "dataset_ids": ["trusted-dataset-id"],
+              "readiness_mode": "trusted_ready",
+              "is_ready": true
             }
           ]
         }
         """
 
-        let userInput = "Notes:\n\(stringify(notesPayload))"
+        let userInput = """
+        Trusted dataset cards:
+        \(datasetGuide)
+
+        Notes:
+        \(stringify(notesPayload))
+        """
 
         log("assessNotes creating /codex/responses request")
         let response = try await createResponse(
@@ -90,7 +129,7 @@ final class OpenAIService: ObservableObject {
             input: userInput
         )
 
-        let text = response.outputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let text = response.outputText.trimmingCharacters(in: CharacterSet.whitespacesAndNewlines)
         log("assessNotes response completed. status=\(response.status) id=\(response.id ?? "<none>") output_chars=\(text.count)")
         log("assessNotes output preview: \(preview(text, limit: 320))")
 
@@ -108,11 +147,18 @@ final class OpenAIService: ObservableObject {
                     return nil
                 }
 
+                let readinessMode = NoteClusterReadinessMode(rawValue: rawCluster.readinessMode ?? "")
+                    ?? ((rawCluster.isReady ?? false) ? .trustedReady : .exploratoryReady)
+                let datasetIDs = rawCluster.datasetIDs ?? []
+                let isReady = rawCluster.isReady ?? (readinessMode == .trustedReady)
+
                 return NoteCluster(
                     noteIDs: ids,
                     theme: rawCluster.theme,
                     suggestedTitle: rawCluster.suggestedTitle,
-                    isReady: rawCluster.isReady
+                    isReady: isReady,
+                    datasetIDs: datasetIDs,
+                    readinessMode: readinessMode
                 )
             }
         } catch {
@@ -122,31 +168,60 @@ final class OpenAIService: ObservableObject {
         }
     }
 
-    func submitPaperTask(notes: [Note], title: String, theme: String) async throws -> String {
+    func submitPaperTask(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String]
+    ) async throws -> PaperTaskSubmission {
         let notesBody = notes.map { note in
             "- [\(note.id.uuidString)] \(note.content)"
         }.joined(separator: "\n\n")
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: notes.map(\.content),
+            limit: 4
+        )
+        let datasetCards = selectedDatasets.isEmpty
+            ? "- No trusted dataset cards were resolved for this task."
+            : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
+        let registryVersion = await trustedDatasets.registryVersion()
+        let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
 
         let systemInstructions = """
         You are a research scientist using Code Interpreter.
         Create a real draft paper from the notes below.
 
         Requirements:
-        1. Use open datasets or open literature APIs when relevant.
-        2. Prefer focused API queries and subsets over bulk downloads.
-        3. Run real analysis if data is available.
-        4. Generate charts as PNG files when they add value.
-        5. Return strict JSON only in your final message:
+        1. Prefer the vetted dataset cards below before using anything else.
+        2. Keep internet usage inside the approved domains unless you truly need to leave the trusted set.
+        3. Prefer focused API queries and small subsets over bulk downloads.
+        4. Run real analysis whenever data is available.
+        5. Generate charts as PNG files when they add value.
+        6. Cite every source actually used in the paper.
+        7. Return strict JSON only in your final message:
            {
              "title": "string",
-             "markdown": "full academic markdown with references to figure_1.png style filenames"
+             "markdown": "full academic markdown with references to figure_1.png style filenames",
+             "provenance": {
+               "used_dataset_ids": ["trusted-dataset-id"],
+               "accessed_domains": ["domain"],
+               "left_trusted_set": false,
+               "external_sources": ["optional domain or source name"],
+               "notes": "short summary of data access and limits"
+             }
            }
-        6. If analysis is partial, state limitations clearly and still produce the strongest draft possible.
+        8. If analysis is partial, state limitations clearly and still produce the strongest draft possible.
         """
 
         let userInput = """
         Suggested title: \(title)
         Theme: \(theme)
+        Approved domains: \(allowedDomainText)
+
+        Vetted dataset cards:
+        \(datasetCards)
 
         Notes:
         \(notesBody)
@@ -160,7 +235,13 @@ final class OpenAIService: ObservableObject {
         """
 
         log("submitPaperTask creating remote task. title=\(title)")
-        return try await createTask(prompt: prompt)
+        let taskID = try await createTask(prompt: prompt)
+        return PaperTaskSubmission(
+            taskID: taskID,
+            selectedDatasetIDs: selectedDatasets.map(\.id),
+            allowedDomains: allowedDomains,
+            registryVersion: registryVersion
+        )
     }
 
     func checkTask(_ taskID: String) async throws -> PaperArtifacts? {
@@ -185,7 +266,12 @@ final class OpenAIService: ObservableObject {
 
         let payload = try JSONDecoder().decode(PaperResponse.self, from: data)
 
-        return PaperArtifacts(title: payload.title, markdown: payload.markdown, figures: [])
+        return PaperArtifacts(
+            title: payload.title,
+            markdown: payload.markdown,
+            figures: [],
+            provenance: payload.provenance
+        )
     }
 
     private func createResponse(
@@ -867,7 +953,18 @@ private struct ClusterResponse: Decodable {
         let noteIDs: [String]
         let theme: String
         let suggestedTitle: String
-        let isReady: Bool
+        let isReady: Bool?
+        let datasetIDs: [String]?
+        let readinessMode: String?
+
+        enum CodingKeys: String, CodingKey {
+            case noteIDs
+            case theme
+            case suggestedTitle
+            case isReady = "is_ready"
+            case datasetIDs = "dataset_ids"
+            case readinessMode = "readiness_mode"
+        }
     }
 
     let clusters: [Cluster]
@@ -876,6 +973,7 @@ private struct ClusterResponse: Decodable {
 private struct PaperResponse: Decodable {
     let title: String
     let markdown: String
+    let provenance: TaskOutputProvenance?
 }
 
 private struct CloudTaskEnvironment: Decodable {

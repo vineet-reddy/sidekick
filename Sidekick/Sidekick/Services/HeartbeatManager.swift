@@ -151,14 +151,14 @@ final class HeartbeatManager: ObservableObject {
 
         print("[Heartbeat] Calling OpenAI assessNotes API...")
         let clusters = try await openAI.assessNotes(notes)
-        print("[Heartbeat] Got \(clusters.count) cluster(s). Ready: \(clusters.filter(\.isReady).count)")
+        print("[Heartbeat] Got \(clusters.count) cluster(s). Auto-runnable: \(clusters.filter(\.isAutomaticallyRunnable).count)")
 
         let existingPapers = try modelContext.fetch(
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
 
         var submitted = 0
-        for cluster in clusters where cluster.isReady {
+        for cluster in clusters where cluster.isAutomaticallyRunnable {
             let alreadyTracked = existingPapers.contains { $0.matches(noteIDs: cluster.noteIDs) }
             if alreadyTracked {
                 print("[Heartbeat]   Cluster \"\(cluster.suggestedTitle)\" already tracked, skipping.")
@@ -173,17 +173,18 @@ final class HeartbeatManager: ObservableObject {
             phase = .submittingPaper(cluster.suggestedTitle)
             print("[Heartbeat]   Submitting paper task: \"\(cluster.suggestedTitle)\"...")
 
-            let taskID = try await openAI.submitPaperTask(
+            let submission = try await openAI.submitPaperTask(
                 notes: clusterNotes,
                 title: cluster.suggestedTitle,
-                theme: cluster.theme
+                theme: cluster.theme,
+                datasetIDs: cluster.datasetIDs
             )
-            print("[Heartbeat]   -> Task ID: \(taskID)")
+            print("[Heartbeat]   -> Task ID: \(submission.taskID)")
 
             let paper = Paper(
                 title: cluster.suggestedTitle,
                 status: .generating,
-                codexTaskID: taskID,
+                codexTaskID: submission.taskID,
                 sourceNoteIDs: cluster.noteIDs
             )
             modelContext.insert(paper)
