@@ -52,6 +52,8 @@ final class OpenAIService: ObservableObject {
             return []
         }
 
+        log("assessNotes starting. notes=\(notes.count)")
+
         let notesPayload = notes.map { note in
             [
                 "id": note.id.uuidString,
@@ -80,6 +82,7 @@ final class OpenAIService: ObservableObject {
 
         let userInput = "Notes:\n\(stringify(notesPayload))"
 
+        log("assessNotes creating /codex/responses request")
         let response = try await createResponse(
             for: .noteAssessment,
             tools: [],
@@ -88,23 +91,34 @@ final class OpenAIService: ObservableObject {
         )
 
         let text = response.outputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        log("assessNotes response completed. status=\(response.status) id=\(response.id ?? "<none>") output_chars=\(text.count)")
+        log("assessNotes output preview: \(preview(text, limit: 320))")
+
         guard let data = normalizedJSONData(from: text) else {
+            log("assessNotes normalizedJSONData returned nil")
             throw ServiceError.malformedPayload
         }
 
-        let decoded = try JSONDecoder().decode(ClusterResponse.self, from: data)
-        return decoded.clusters.compactMap { rawCluster in
-            let ids = rawCluster.noteIDs.compactMap(UUID.init(uuidString:))
-            guard !ids.isEmpty else {
-                return nil
-            }
+        do {
+            let decoded = try JSONDecoder().decode(ClusterResponse.self, from: data)
+            log("assessNotes decoded clusters successfully. cluster_count=\(decoded.clusters.count)")
+            return decoded.clusters.compactMap { rawCluster in
+                let ids = rawCluster.noteIDs.compactMap(UUID.init(uuidString:))
+                guard !ids.isEmpty else {
+                    return nil
+                }
 
-            return NoteCluster(
-                noteIDs: ids,
-                theme: rawCluster.theme,
-                suggestedTitle: rawCluster.suggestedTitle,
-                isReady: rawCluster.isReady
-            )
+                return NoteCluster(
+                    noteIDs: ids,
+                    theme: rawCluster.theme,
+                    suggestedTitle: rawCluster.suggestedTitle,
+                    isReady: rawCluster.isReady
+                )
+            }
+        } catch {
+            log("assessNotes failed to decode ClusterResponse: \(String(describing: error))")
+            log("assessNotes normalized JSON preview: \(preview(String(data: data, encoding: .utf8) ?? "<non-utf8>", limit: 320))")
+            throw error
         }
     }
 
@@ -145,11 +159,14 @@ final class OpenAIService: ObservableObject {
         \(userInput)
         """
 
+        log("submitPaperTask creating remote task. title=\(title)")
         return try await createTask(prompt: prompt)
     }
 
     func checkTask(_ taskID: String) async throws -> PaperArtifacts? {
+        log("checkTask polling. task_id=\(taskID)")
         let task = try await fetchTask(taskID: taskID)
+        log("checkTask status=\(task.normalizedStatus) output_chars=\(task.outputText.count)")
 
         switch task.normalizedStatus {
         case "queued", "in_progress", "incomplete":
@@ -181,6 +198,7 @@ final class OpenAIService: ObservableObject {
         var unsupportedMessages: [String] = []
 
         for model in candidates {
+            log("createResponse starting. workload=\(workload.description) model=\(model) tool_count=\(tools.count)")
             let body: [String: Any] = [
                 "model": model,
                 "instructions": instructions,
@@ -210,9 +228,11 @@ final class OpenAIService: ObservableObject {
                     body: body,
                     responseMode: .completed
                 )
+                log("createResponse succeeded. workload=\(workload.description) model=\(model) status=\(response.status)")
                 await modelRouter.remember(model: model, for: workload)
                 return response
             } catch {
+                log("createResponse failed. workload=\(workload.description) model=\(model) error=\(String(describing: error))")
                 guard let retryMessage = retryableModelSelectionMessage(from: error) else {
                     throw error
                 }
@@ -229,6 +249,7 @@ final class OpenAIService: ObservableObject {
 
     private func createTask(prompt: String) async throws -> String {
         let environment = try await selectEnvironment()
+        log("createTask using environment id=\(environment.id) label=\(environment.label ?? "<none>") branch=\(resolvedTaskBranch())")
         let body: [String: Any] = [
             "new_task": [
                 "environment_id": environment.id,
@@ -254,8 +275,10 @@ final class OpenAIService: ObservableObject {
             method: "POST",
             body: body
         )
+        log("createTask response bytes=\(data.count)")
 
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            log("createTask failed to decode top-level task response JSON")
             throw ServiceError.invalidResponse
         }
 
@@ -278,6 +301,7 @@ final class OpenAIService: ObservableObject {
             method: "GET",
             body: nil
         )
+        log("fetchTask response bytes=\(data.count) task_id=\(taskID)")
 
         return try JSONDecoder().decode(CloudTaskDetails.self, from: data)
     }
@@ -294,6 +318,7 @@ final class OpenAIService: ObservableObject {
         )
 
         let environments = try JSONDecoder().decode([CloudTaskEnvironment].self, from: data)
+        log("selectEnvironment fetched environments count=\(environments.count)")
         guard !environments.isEmpty else {
             throw ServiceError.taskFailed("No Codex cloud environments are available for this ChatGPT workspace.")
         }
@@ -327,6 +352,7 @@ final class OpenAIService: ObservableObject {
         request.httpMethod = method
         applyAuthHeaders(to: &request, token: token)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        log("sendJSONRequest \(method) \(request.url?.absoluteString ?? "<nil>")")
 
         if let body {
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
@@ -358,6 +384,7 @@ final class OpenAIService: ObservableObject {
         var request = URLRequest(url: endpoint(baseURL: backendBaseURL, path: pathComponents))
         request.httpMethod = method
         applyAuthHeaders(to: &request, token: token)
+        log("sendBackendRequest \(method) \(request.url?.absoluteString ?? "<nil>")")
 
         if let body {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -383,6 +410,7 @@ final class OpenAIService: ObservableObject {
     ) async throws -> ResponseEnvelope {
         var request = request
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+        log("sendStreamingRequest opening stream \(request.url?.absoluteString ?? "<nil>")")
 
         let (bytes, response) = try await session.bytes(for: request)
         guard let httpResponse = response as? HTTPURLResponse else {
@@ -468,62 +496,110 @@ final class OpenAIService: ObservableObject {
             return nil
         }
 
-        let data = Data(payload.utf8)
-        let event = try JSONDecoder().decode(StreamedResponseEvent.self, from: data)
+        let events = try decodeStreamedEvents(from: dataLines, joinedPayload: payload)
 
-        switch event.type {
-        case "response.created":
-            if let response = event.response {
-                createdResponse = response
+        for event in events {
+            if event.type == "response.output_text.delta" {
+                log("stream event=response.output_text.delta chars=\(event.delta?.count ?? 0)")
+            } else {
+                log("stream event=\(event.type)")
+            }
 
-                if responseMode == .created,
-                   let id = response.id,
-                   !id.isEmpty {
-                    return ResponseEnvelope(
-                        id: id,
-                        status: response.status.isEmpty ? "in_progress" : response.status,
-                        output: nil,
-                        error: response.error
-                    )
+            switch event.type {
+            case "response.created":
+                if let response = event.response {
+                    createdResponse = response
+
+                    if responseMode == .created,
+                       let id = response.id,
+                       !id.isEmpty {
+                        return ResponseEnvelope(
+                            id: id,
+                            status: response.status.isEmpty ? "in_progress" : response.status,
+                            output: nil,
+                            error: response.error
+                        )
+                    }
                 }
-            }
-        case "response.output_item.done":
-            if let item = event.item {
-                outputItems.append(item)
-            }
-        case "response.output_text.delta":
-            if let delta = event.delta, !delta.isEmpty {
-                outputTextDeltas.append(delta)
-            }
-        case "response.completed":
-            let response = event.response ?? createdResponse ?? ResponseEnvelope(
-                id: nil,
-                status: "completed",
-                output: nil,
-                error: nil
-            )
+            case "response.output_item.done":
+                if let item = event.item {
+                    outputItems.append(item)
+                }
+            case "response.output_text.delta":
+                if let delta = event.delta, !delta.isEmpty {
+                    outputTextDeltas.append(delta)
+                }
+            case "response.completed":
+                let response = event.response ?? createdResponse ?? ResponseEnvelope(
+                    id: nil,
+                    status: "completed",
+                    output: nil,
+                    error: nil
+                )
 
-            let finalOutput = response.output.flatMap { $0.isEmpty ? nil : $0 }
-                ?? accumulatedOutput(from: outputItems, outputTextDeltas: outputTextDeltas)
+                let finalOutput = response.output.flatMap { $0.isEmpty ? nil : $0 }
+                    ?? accumulatedOutput(from: outputItems, outputTextDeltas: outputTextDeltas)
 
-            return ResponseEnvelope(
-                id: response.id ?? createdResponse?.id,
-                status: response.status.isEmpty ? "completed" : response.status,
-                output: finalOutput,
-                error: response.error ?? createdResponse?.error
-            )
-        case "response.failed", "error":
-            let message = event.response?.error?.message
-                ?? event.error?.message
-                ?? "OpenAI request failed."
-            throw ServiceError.taskFailed(message)
-        case "response.incomplete":
-            throw ServiceError.taskFailed("OpenAI response was incomplete.")
-        default:
-            break
+                return ResponseEnvelope(
+                    id: response.id ?? createdResponse?.id,
+                    status: response.status.isEmpty ? "completed" : response.status,
+                    output: finalOutput,
+                    error: response.error ?? createdResponse?.error
+                )
+            case "response.failed", "error":
+                let message = event.response?.error?.message
+                    ?? event.error?.message
+                    ?? "OpenAI request failed."
+                throw ServiceError.taskFailed(message)
+            case "response.incomplete":
+                throw ServiceError.taskFailed("OpenAI response was incomplete.")
+            default:
+                break
+            }
         }
 
         return nil
+    }
+
+    private func decodeStreamedEvents(
+        from dataLines: [String],
+        joinedPayload: String
+    ) throws -> [StreamedResponseEvent] {
+        do {
+            return [try decodeSingleStreamedEvent(from: joinedPayload)]
+        } catch {
+            guard dataLines.count > 1 else {
+                throw error
+            }
+
+            log("processStreamedEvent retrying batched SSE payload line-by-line. line_count=\(dataLines.count)")
+
+            var events: [StreamedResponseEvent] = []
+            events.reserveCapacity(dataLines.count)
+
+            for line in dataLines {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty, trimmed != "[DONE]" else {
+                    continue
+                }
+
+                events.append(try decodeSingleStreamedEvent(from: trimmed))
+            }
+
+            return events
+        }
+    }
+
+    private func decodeSingleStreamedEvent(from payload: String) throws -> StreamedResponseEvent {
+        let data = Data(payload.utf8)
+
+        do {
+            return try JSONDecoder().decode(StreamedResponseEvent.self, from: data)
+        } catch {
+            log("processStreamedEvent failed to decode SSE event: \(String(describing: error))")
+            log("processStreamedEvent payload preview: \(preview(payload, limit: 500))")
+            throw error
+        }
     }
 
     private func accumulatedOutput(
@@ -592,6 +668,22 @@ final class OpenAIService: ObservableObject {
         }
 
         return object
+    }
+
+    private func log(_ message: String) {
+        print("[OpenAI] \(message)")
+    }
+
+    private func preview(_ value: String, limit: Int) -> String {
+        let flattened = value
+            .replacingOccurrences(of: "\n", with: "\\n")
+            .replacingOccurrences(of: "\r", with: "\\r")
+
+        guard flattened.count > limit else {
+            return flattened
+        }
+
+        return "\(flattened.prefix(limit))..."
     }
 
     private func stringify(_ value: Any) -> String {
@@ -724,10 +816,10 @@ private enum OpenAIWorkload {
         switch self {
         case .noteAssessment:
             return [
-                "gpt-5-mini",
                 "gpt-5.4",
                 "gpt-5.1",
-                "gpt-5"
+                "gpt-5",
+                "gpt-5-mini"
             ]
         case .paperGeneration:
             return [
@@ -1212,6 +1304,23 @@ private struct StreamedResponseEvent: Decodable {
     let item: ResponseOutputItem?
     let delta: String?
     let error: ResponseAPIError?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case response
+        case item
+        case delta
+        case error
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        type = try container.decode(String.self, forKey: .type)
+        response = try? container.decodeIfPresent(ResponseEnvelope.self, forKey: .response)
+        item = try? container.decodeIfPresent(ResponseOutputItem.self, forKey: .item)
+        delta = try? container.decodeIfPresent(String.self, forKey: .delta)
+        error = try? container.decodeIfPresent(ResponseAPIError.self, forKey: .error)
+    }
 }
 
 private struct ResponseAPIError: Decodable {
