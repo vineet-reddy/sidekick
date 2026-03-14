@@ -4,3 +4,7 @@
 # Xcode user-specific state
 **/xcuserdata/
 **/*.xcuserstate
+
+# Local planning and handoff notes
+/SESSION_HANDOFF_*.md
+/REDESIGN*.md
