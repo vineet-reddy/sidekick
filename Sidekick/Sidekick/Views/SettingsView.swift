@@ -7,7 +7,6 @@ struct SettingsView: View {
     @EnvironmentObject private var notifications: NotificationService
 
     @State private var authError: String?
-    @State private var isSigningIn = false
 
     var body: some View {
         ZStack {
@@ -45,6 +44,7 @@ struct SettingsView: View {
                                 auth.signOut()
                             }
                             .buttonStyle(.bordered)
+
                         } else {
                             Text("Sign in with your ChatGPT account to let Sidekick generate papers using your subscription.")
                                 .font(.subheadline)
@@ -54,24 +54,33 @@ struct SettingsView: View {
                                 signIn()
                             } label: {
                                 HStack {
-                                    if isSigningIn {
+                                    if auth.isSigningIn {
                                         ProgressView()
                                             .tint(.white)
                                     }
-                                    Text(isSigningIn ? "Signing in..." : "Sign in with ChatGPT")
+                                    Text(auth.signInURL == nil ? "Sign in with ChatGPT" : "Continue in Sidekick")
                                 }
                                 .frame(maxWidth: .infinity)
                             }
                             .buttonStyle(.borderedProminent)
                             .tint(SidekickTheme.accent)
-                            .disabled(isSigningIn)
+                            .disabled(auth.isSigningIn)
 
                             HStack {
-                                StatusPill(title: "Not signed in", tint: .orange)
+                                StatusPill(
+                                    title: auth.signInURL == nil ? "Not signed in" : "Waiting for browser",
+                                    tint: auth.signInURL == nil ? .orange : SidekickTheme.accent
+                                )
 
                                 if notifications.authorizationStatus == .authorized {
                                     StatusPill(title: "Notifications on", tint: SidekickTheme.accent)
                                 }
+                            }
+
+                            if auth.signInURL != nil {
+                                Text("Finish the secure ChatGPT sign-in in the browser sheet, then Sidekick will close it automatically.")
+                                    .font(.footnote)
+                                    .foregroundStyle(.secondary)
                             }
                         }
 
@@ -122,18 +131,32 @@ struct SettingsView: View {
         }
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(isPresented: signInSheetBinding) {
+            if let url = auth.signInURL {
+                SafariBrowserView(url: url)
+            }
+        }
     }
 
     private func signIn() {
-        isSigningIn = true
         authError = nil
         Task {
             do {
                 try await auth.signIn()
+            } catch is CancellationError {
             } catch {
                 authError = error.localizedDescription
             }
-            isSigningIn = false
         }
+    }
+
+    private var signInSheetBinding: Binding<Bool> {
+        Binding(
+            get: { auth.signInURL != nil },
+            set: { isPresented in
+                guard !isPresented else { return }
+                auth.cancelSignIn()
+            }
+        )
     }
 }
