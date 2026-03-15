@@ -425,6 +425,15 @@ final class OpenAIService: ObservableObject {
         return try await createTask(prompt: prompt)
     }
 
+    func quarantineSelfContainedBundleEnvironment(_ environmentID: String?) async {
+        guard let environmentID,
+              !environmentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        await environmentRouter.quarantine(environmentID, for: .selfContainedBundle)
+    }
+
     func runResearchInspectionFallback(
         notes: [Note],
         title: String,
@@ -1521,12 +1530,18 @@ final class OpenAIService: ObservableObject {
         for preference: CloudTaskEnvironmentPreference
     ) async throws -> [CloudTaskEnvironment] {
         let environments = try await fetchEnvironments()
+        let quarantinedIDs = await environmentRouter.quarantinedIDs(for: preference)
+        let viableEnvironments =
+            quarantinedIDs.isEmpty
+            ? environments
+            : environments.filter { !quarantinedIDs.contains($0.id) }
+        let environmentPool = viableEnvironments.isEmpty ? environments : viableEnvironments
         let candidates: [CloudTaskEnvironment]
 
         switch preference {
         case .repositoryBound:
-            let networkEnabled = environments.filter { $0.agentNetworkAccess?.mode?.lowercased() != "off" }
-            var prioritized = (networkEnabled.isEmpty ? environments : networkEnabled)
+            let networkEnabled = environmentPool.filter { $0.agentNetworkAccess?.mode?.lowercased() != "off" }
+            var prioritized = (networkEnabled.isEmpty ? environmentPool : networkEnabled)
                 .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
 
             if let remembered = await environmentRouter.cached(for: preference),
@@ -1538,8 +1553,16 @@ final class OpenAIService: ObservableObject {
             candidates = prioritized
 
         case .selfContainedBundle:
-            candidates = environments
+            var prioritized = environmentPool
                 .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
+
+            if let remembered = await environmentRouter.cached(for: preference),
+               let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
+                let cached = prioritized.remove(at: index)
+                prioritized.insert(cached, at: 0)
+            }
+
+            candidates = prioritized
         }
 
         return candidates
@@ -1598,6 +1621,12 @@ final class OpenAIService: ObservableObject {
                 score += 10
             }
         } else {
+            if environment.hasPythonRuntime {
+                score += 5_000
+            } else {
+                score -= 5_000
+            }
+
             if mode == "off" {
                 score += 6_000
             } else if mode == "on" {
@@ -2591,6 +2620,15 @@ private enum OpenAIWorkload {
 private enum CloudTaskEnvironmentPreference {
     case repositoryBound
     case selfContainedBundle
+
+    var storageKey: String {
+        switch self {
+        case .repositoryBound:
+            return "repositoryBound"
+        case .selfContainedBundle:
+            return "selfContainedBundle"
+        }
+    }
 }
 
 private struct BackendRequestFailure: LocalizedError {
@@ -2630,14 +2668,44 @@ private actor OpenAIModelRouter {
 }
 
 private actor OpenAIEnvironmentRouter {
-    private var selectedEnvironments: [CloudTaskEnvironmentPreference: CloudTaskEnvironment] = [:]
+    private var selectedEnvironments: [String: CloudTaskEnvironment] = [:]
+    private var quarantinedEnvironmentExpirations: [String: [String: Date]] = [:]
 
     func cached(for preference: CloudTaskEnvironmentPreference) -> CloudTaskEnvironment? {
-        selectedEnvironments[preference]
+        selectedEnvironments[preference.storageKey]
     }
 
     func remember(_ environment: CloudTaskEnvironment, for preference: CloudTaskEnvironmentPreference) {
-        selectedEnvironments[preference] = environment
+        selectedEnvironments[preference.storageKey] = environment
+    }
+
+    func quarantine(
+        _ environmentID: String,
+        for preference: CloudTaskEnvironmentPreference,
+        duration: TimeInterval = 6 * 60 * 60
+    ) {
+        pruneExpiredQuarantines(now: .now)
+
+        let storageKey = preference.storageKey
+        var quarantined = quarantinedEnvironmentExpirations[storageKey] ?? [:]
+        quarantined[environmentID] = Date().addingTimeInterval(duration)
+        quarantinedEnvironmentExpirations[storageKey] = quarantined
+
+        if selectedEnvironments[storageKey]?.id == environmentID {
+            selectedEnvironments[storageKey] = nil
+        }
+    }
+
+    func quarantinedIDs(for preference: CloudTaskEnvironmentPreference) -> Set<String> {
+        pruneExpiredQuarantines(now: .now)
+        return Set(quarantinedEnvironmentExpirations[preference.storageKey]?.keys.map { $0 } ?? [])
+    }
+
+    private func pruneExpiredQuarantines(now: Date) {
+        for storageKey in Array(quarantinedEnvironmentExpirations.keys) {
+            let retained = quarantinedEnvironmentExpirations[storageKey]?.filter { $0.value > now } ?? [:]
+            quarantinedEnvironmentExpirations[storageKey] = retained.isEmpty ? nil : retained
+        }
     }
 }
 
@@ -2690,6 +2758,7 @@ private struct CloudTaskEnvironment: Decodable {
     let isPinned: Bool?
     let taskCount: Int?
     let agentNetworkAccess: CloudTaskAgentNetworkAccess?
+    let envVars: [String: String]?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -2697,6 +2766,11 @@ private struct CloudTaskEnvironment: Decodable {
         case isPinned = "is_pinned"
         case taskCount = "task_count"
         case agentNetworkAccess = "agent_network_access"
+        case envVars = "env_vars"
+    }
+
+    var hasPythonRuntime: Bool {
+        envVars?["CODEX_ENV_PYTHON_VERSION"] != nil
     }
 }
 

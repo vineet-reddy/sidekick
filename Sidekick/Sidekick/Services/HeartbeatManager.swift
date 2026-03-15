@@ -45,6 +45,7 @@ final class HeartbeatManager: ObservableObject {
     private let supportedLocalRecoveryGracePeriod: TimeInterval = 3 * 60
     private let remoteRetryGracePeriod: TimeInterval = 8 * 60
     private let bundledRemoteRetryGracePeriod: TimeInterval = 20 * 60
+    private let deadBundledTaskGracePeriod: TimeInterval = 2 * 60
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
     private let maxResearchStageAttempts = 3
@@ -400,7 +401,7 @@ final class HeartbeatManager: ObservableObject {
             ?? run.currentStageStartedAt
             ?? run.updatedAt
 
-        return Date().timeIntervalSince(taskStart) >= remoteRetryGracePeriod
+        return Date().timeIntervalSince(taskStart) >= deadBundledTaskGracePeriod
     }
 
     private func resolveResearchRun(
@@ -735,6 +736,7 @@ final class HeartbeatManager: ObservableObject {
                 if shouldRescueDeadBundledTask(run: run, snapshot: snapshot) {
                     let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
                     print("[Heartbeat]   -> Inspect stage bundled task looks dead on \(environmentLabel); rerouting without spending another stage attempt.")
+                    await openAI.quarantineSelfContainedBundleEnvironment(snapshot.environmentID)
                     run.activeTaskID = nil
 
                     do {
@@ -895,6 +897,7 @@ final class HeartbeatManager: ObservableObject {
                 if shouldRescueDeadBundledTask(run: run, snapshot: snapshot) {
                     let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
                     print("[Heartbeat]   -> Analysis stage bundled task looks dead on \(environmentLabel); rerouting without spending another stage attempt.")
+                    await openAI.quarantineSelfContainedBundleEnvironment(snapshot.environmentID)
                     run.activeTaskID = nil
 
                     do {
