@@ -820,6 +820,7 @@ final class OpenAIService: ObservableObject {
         - If the study question or verification guidance asks about sex-specific survival differences, sex distributions alone are insufficient; report an explicit sex effect estimate and/or a sex-stratified survival comparison from the supplied cohort.
         - If harmonized MGMT measurements are available for the modeled cohort, include the harmonized MGMT term in the Cox model or report the exact complete-case loss and scientific reason that forced exclusion.
         - Findings and results text must address every requested predictor that is available in the supplied bundle, including IDH1, EGFR, MGMT, age, and sex, or explicitly explain any omission in `limitations` or `quality_notes`.
+        - For each hazard ratio, make the modeled contrast explicit in the table or narrative. For sex and other binary predictors, name the reference group and ensure the interpretation matches the reported hazard ratio direction.
         - If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
         - If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
         - If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
@@ -957,18 +958,19 @@ final class OpenAIService: ObservableObject {
         14. If the study question or verification guidance asks about sex-specific survival differences, sex distributions alone are insufficient; report an explicit sex effect estimate and/or a sex-stratified survival comparison from the supplied cohort.
         15. If harmonized MGMT measurements are available for the modeled cohort, include the harmonized MGMT term in the Cox model or report the exact complete-case loss and scientific reason that forced exclusion.
         16. Findings and results text must address every requested predictor that is available in the supplied bundle, including IDH1, EGFR, MGMT, age, and sex, or explicitly explain any omission in `limitations` or `quality_notes`.
-        17. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
-        18. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
-        19. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
-        20. Keep narrative claims directionally consistent with the reported estimates and confidence intervals; do not describe an effect as harmful or protective if the estimate and uncertainty do not support that wording.
-        21. When a subgroup is small or the confidence interval is wide, qualify the claim explicitly in the narrative and limitations instead of stating a definitive benefit or harm.
-        22. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        23. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
-        24. Report sex distributions or explicitly explain why the supplied fields cannot support them.
-        25. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
-        26. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
-        27. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
-        28. The final assistant message must contain only the JSON object and nothing before or after it.
+        17. For each hazard ratio, make the modeled contrast explicit in the table or narrative. For sex and other binary predictors, name the reference group and ensure the interpretation matches the reported hazard ratio direction.
+        18. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
+        19. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
+        20. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
+        21. Keep narrative claims directionally consistent with the reported estimates and confidence intervals; do not describe an effect as harmful or protective if the estimate and uncertainty do not support that wording.
+        22. When a subgroup is small or the confidence interval is wide, qualify the claim explicitly in the narrative and limitations instead of stating a definitive benefit or harm.
+        23. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
+        24. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
+        25. Report sex distributions or explicitly explain why the supplied fields cannot support them.
+        26. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
+        27. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
+        28. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
+        29. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)

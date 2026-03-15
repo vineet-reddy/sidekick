@@ -50,6 +50,9 @@ final class HeartbeatManager: ObservableObject {
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
     private let maxResearchStageAttempts = 3
+    private let maxAnalysisRevisionCycles = 6
+    private let analysisRevisionCycleAttemptKey = "analysis_revision_cycle"
+    private let analysisRevisionCycleLimitMessage = "Analysis revision cycles exceeded the retry budget."
 
     init(
         openAI: OpenAIService,
@@ -135,7 +138,7 @@ final class HeartbeatManager: ObservableObject {
         let runsByPaperID = runs.latestRunsByPaperID()
         let recoverablePaperIDs = Set(
             runs.compactMap { run in
-                pendingAnalysisRevision(for: run.runID) == nil ? nil : run.paperID
+                isFailedResearchRunRecoverable(run) ? run.paperID : nil
             }
         )
         let inFlightPapers = papers.filter { paper in
@@ -410,8 +413,22 @@ final class HeartbeatManager: ObservableObject {
         paper: Paper,
         notesByID: [UUID: Note]
     ) async throws {
-        if run.status == .failed, pendingAnalysisRevision(for: run.runID) != nil {
+        if shouldRetryLatestVerification(for: run) {
             paper.status = .generating
+            run.resetAttemptCount(for: .verify)
+            run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+        } else if run.status == .failed, pendingAnalysisRevision(for: run.runID) != nil {
+            guard run.attemptCount(forKey: analysisRevisionCycleAttemptKey) < maxAnalysisRevisionCycles else {
+                markResearchRunFailed(
+                    run,
+                    paper: paper,
+                    message: analysisRevisionCycleLimitMessage
+                )
+                return
+            }
+
+            paper.status = .generating
+            run.resetAttemptCount(for: .verify)
             run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
         }
 
@@ -426,6 +443,26 @@ final class HeartbeatManager: ObservableObject {
         }
 
         try await advanceResearchRun(run, paper: paper, notes: notes)
+    }
+
+    private func isFailedResearchRunRecoverable(_ run: ResearchRun) -> Bool {
+        pendingAnalysisRevision(for: run.runID) != nil || shouldRetryLatestVerification(for: run)
+    }
+
+    private func shouldRetryLatestVerification(for run: ResearchRun) -> Bool {
+        guard run.status == .failed,
+              run.currentStage == .verify,
+              (run.lastError ?? "").localizedCaseInsensitiveContains("verification exceeded the retry budget."),
+              PaperArtifactStore.stageArtifact(
+                  ResearchAnalysisArtifact.self,
+                  runID: run.runID,
+                  stage: .analyze
+              ) != nil,
+              currentVerificationArtifact(for: run.runID) == nil else {
+            return false
+        }
+
+        return true
     }
 
     private func advanceResearchRun(
@@ -535,11 +572,24 @@ final class HeartbeatManager: ObservableObject {
 
         case .verify:
             if let verification = currentVerificationArtifact(for: run.runID) {
+                run.resetAttemptCount(for: .verify)
+
                 if verification.decision == .reviseAnalysis {
+                    guard run.attemptCount(forKey: analysisRevisionCycleAttemptKey) < maxAnalysisRevisionCycles else {
+                        markResearchRunFailed(
+                            run,
+                            paper: paper,
+                            message: analysisRevisionCycleLimitMessage
+                        )
+                        return
+                    }
+
                     run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
                     try await advanceResearchRun(run, paper: paper, notes: notes)
                     return
                 }
+
+                run.resetAttemptCount(forKey: analysisRevisionCycleAttemptKey)
 
                 guard verification.allowsWriting else {
                     markResearchRunFailed(run, paper: paper, message: verification.blockingMessage)
@@ -1228,14 +1278,27 @@ final class HeartbeatManager: ObservableObject {
                 analysis: analysis
             )
             try PaperArtifactStore.persistStageArtifact(normalizedVerification, runID: run.runID, stage: .verify)
+            run.resetAttemptCount(for: .verify)
 
             if normalizedVerification.decision == .reviseAnalysis {
+                guard run.attemptCount(forKey: analysisRevisionCycleAttemptKey) < maxAnalysisRevisionCycles else {
+                    markResearchRunFailed(
+                        run,
+                        paper: paper,
+                        message: analysisRevisionCycleLimitMessage
+                    )
+                    return
+                }
+
+                run.incrementAttempt(forKey: analysisRevisionCycleAttemptKey)
                 run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
                 try persistModelChanges(in: run.modelContext)
                 print("[Heartbeat]   -> Verification requested analysis revisions for \(run.runID)")
                 try await advanceResearchRun(run, paper: paper, notes: notes)
                 return
             }
+
+            run.resetAttemptCount(forKey: analysisRevisionCycleAttemptKey)
 
             guard normalizedVerification.allowsWriting else {
                 print("[Heartbeat]   -> Verification blocked drafting for \(run.runID)")

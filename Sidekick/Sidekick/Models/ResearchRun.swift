@@ -181,12 +181,32 @@ final class ResearchRun {
     }
 
     func attemptCount(for stage: ResearchRunStage) -> Int {
-        stageAttempts[stage.rawValue] ?? 0
+        attemptCount(forKey: stage.rawValue)
     }
 
     func incrementAttempt(for stage: ResearchRunStage) {
+        incrementAttempt(forKey: stage.rawValue)
+    }
+
+    func resetAttemptCount(for stage: ResearchRunStage) {
+        resetAttemptCount(forKey: stage.rawValue)
+    }
+
+    func attemptCount(forKey key: String) -> Int {
+        stageAttempts[key] ?? 0
+    }
+
+    func incrementAttempt(forKey key: String) {
         var attempts = stageAttempts
-        attempts[stage.rawValue] = (attempts[stage.rawValue] ?? 0) + 1
+        attempts[key] = (attempts[key] ?? 0) + 1
+        stageAttempts = attempts
+    }
+
+    func resetAttemptCount(forKey key: String) {
+        var attempts = stageAttempts
+        guard attempts.removeValue(forKey: key) != nil else {
+            return
+        }
         stageAttempts = attempts
     }
 
