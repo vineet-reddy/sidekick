@@ -543,11 +543,13 @@ final class OpenAIService: ObservableObject {
         let prompt = """
         You are a research scientist working inside a Codex task with Python available.
         A thin local coordinator already fetched a narrow trusted public cohort bundle. Use only that supplied bundle.
+        Treat network access as unavailable for this task even if the environment technically exposes it.
 
         Requirements:
         1. Do not rely on repository files or repository context; the repo is irrelevant to this task.
-        2. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
-        3. Inspect the supplied bundle only and return strict JSON only with this exact shape:
+        2. Do not make network requests, browse for external data, or hit live APIs. The supplied bundle is authoritative for this task.
+        3. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
+        4. Inspect the supplied bundle only and return strict JSON only with this exact shape:
            {
              "dataset_manifest": {
                "primary_dataset_ids": ["trusted-dataset-id"],
@@ -561,8 +563,9 @@ final class OpenAIService: ObservableObject {
              "quality_checks": ["string"],
              "analysis_checklist": ["string"]
            }
-        4. If MGMT is only available as continuous methylation values, say that explicitly instead of inventing a binary promoter status field.
-        5. The final assistant message must contain only the JSON object and nothing before or after it.
+        5. If MGMT is only available as continuous methylation values, say that explicitly instead of inventing a binary promoter status field.
+        6. If the supplied bundle lacks something you wanted to inspect, record that limitation in `quality_checks` instead of trying to fetch replacement data.
+        7. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -731,7 +734,7 @@ final class OpenAIService: ObservableObject {
         let instructions = """
         You are a research scientist using Code Interpreter.
         A thin local orchestrator has already fetched a narrow trusted public cohort slice and checkpointed the inspection artifact.
-        Analyze only the supplied cohort bundle. Do not widen the dataset, do not invent extra variables, and do not write the paper yet.
+        Analyze only the supplied cohort bundle. Do not widen the dataset, do not invent extra variables, do not make network requests, and do not write the paper yet.
 
         Return strict JSON only with this exact shape:
         {
@@ -781,12 +784,17 @@ final class OpenAIService: ObservableObject {
         }
 
         Requirements:
-        - Use Code Interpreter to analyze only the supplied bundle and generate any figure bytes included in the final JSON.
+        - Use Code Interpreter to decode and analyze only the supplied bundle and generate any figure bytes included in the final JSON.
+        - Do not contact GDC, cBioPortal, or any other external service. The supplied bundle is authoritative for this analysis pass.
         - Prefer one concrete public cohort analysis over speculative multi-source synthesis.
         - Treat MGMT measurements exactly as represented in the bundle; do not relabel continuous methylation values as binary promoter status unless the data justify it.
+        - If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png`; do not substitute a bar chart or median-only graphic.
+        - If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
+        - If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
+        - If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
         - If the strongest trustworthy result is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
         - `findings[].evidence` must cite exact counts, field names, subgroup definitions, or figure/table identifiers from this run.
-        - If verification guidance is supplied below, address every required revision directly in this analysis pass.
+        - If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
         - Report sex distributions or state explicitly why the supplied fields cannot support them.
         - The final assistant message must contain only the JSON object and nothing before or after it.
         """
@@ -851,12 +859,14 @@ final class OpenAIService: ObservableObject {
         let prompt = """
         You are a research scientist working inside a Codex task with Python available.
         A thin local coordinator already fetched a narrow trusted public cohort bundle and checkpointed the inspection artifact. Analyze only that supplied bundle.
+        Treat network access as unavailable for this task even if the environment technically exposes it.
 
         Requirements:
         1. Do not rely on repository files or repository context; the repo is irrelevant to this task.
-        2. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
-        3. Use Python or equivalent computation inside the task to decode the supplied base64+zlib CSV payload and analyze that cohort only.
-        4. Return strict JSON only with this exact shape:
+        2. Do not make network requests, browse for external data, or hit live APIs. Do not contact GDC, cBioPortal, or any other external domain.
+        3. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
+        4. Use Python or equivalent computation inside the task to decode the supplied base64+zlib CSV payload and analyze that cohort only.
+        5. Return strict JSON only with this exact shape:
            {
              "dataset_manifest": {
                "primary_dataset_ids": ["trusted-dataset-id"],
@@ -902,11 +912,18 @@ final class OpenAIService: ObservableObject {
                "notes": "short summary of data access and limits"
              }
            }
-        5. Treat MGMT measurements exactly as represented in the supplied bundle. Do not relabel continuous methylation values as a binary promoter status unless the data justify it.
-        6. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        7. If verification guidance is supplied below, address every required revision directly in this analysis pass.
-        8. Report sex distributions or explicitly explain why the supplied fields cannot support them.
-        9. The final assistant message must contain only the JSON object and nothing before or after it.
+        6. Treat MGMT measurements exactly as represented in the supplied bundle. Do not relabel continuous methylation values as a binary promoter status unless the data justify it.
+        7. If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png`; do not substitute a bar chart or median-only graphic.
+        8. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
+        9. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
+        10. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
+        11. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
+        12. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
+        13. Report sex distributions or explicitly explain why the supplied fields cannot support them.
+        14. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
+        15. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
+        16. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
+        17. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -1581,16 +1598,16 @@ final class OpenAIService: ObservableObject {
                 score += 10
             }
         } else {
-            if mode == "on" {
-                score += 5_000
-            } else if mode == "off" {
-                score -= 2_000
+            if mode == "off" {
+                score += 6_000
+            } else if mode == "on" {
+                score += 500
             }
 
             if preset == "all" {
-                score += 1_000
+                score += 150
             } else if preset == "codex" {
-                score += 250
+                score += 75
             }
 
             if label.contains("/") {
