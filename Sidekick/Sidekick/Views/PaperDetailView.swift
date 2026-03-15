@@ -22,11 +22,11 @@ struct PaperDetailView: View {
                 case .generating:
                     progressCard(
                         title: "Sidekick is writing",
-                        message: "This draft is still running in the background. The app will notify you when it lands."
+                        message: "This paper is still running in the background. The app will notify you when it lands."
                     )
                 case .failed:
                     progressCard(
-                        title: "The draft stalled",
+                        title: "The paper stalled",
                         message: "Something went wrong during generation. Sidekick will retry automatically on the next cycle."
                     )
                 }

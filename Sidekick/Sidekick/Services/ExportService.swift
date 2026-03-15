@@ -5,13 +5,19 @@ import WebKit
 enum ExportService {
     static func exportLaTeX(for paper: Paper) throws -> URL {
         let title = paper.title.replacingOccurrences(of: "\\", with: "\\\\")
-        let body = LatexRenderer.render(markdown: paper.markdown)
+        let body = LatexRenderer.render(markdown: PaperContentNormalizer.normalize(markdown: paper.markdown))
         let document = """
-        \\documentclass{article}
+        \\documentclass[11pt]{article}
+        \\usepackage[margin=1in]{geometry}
         \\usepackage[utf8]{inputenc}
         \\usepackage{graphicx}
-        \\usepackage{hyperref}
+        \\usepackage{amsmath}
+        \\usepackage{amssymb}
+        \\usepackage[hidelinks]{hyperref}
+        \\usepackage{booktabs}
+        \\usepackage{enumitem}
         \\title{\(title)}
+        \\date{}
         \\begin{document}
         \\maketitle
         \(body)
@@ -53,14 +59,46 @@ private extension WKWebView {
 
 private enum LatexRenderer {
     static func render(markdown: String) -> String {
-        markdown
-            .split(separator: "\n", omittingEmptySubsequences: false)
-            .map(render(line:))
-            .joined(separator: "\n")
+        let lines = markdown.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var rendered: [String] = []
+        var isMathBlock = false
+        var mathLines: [String] = []
+
+        func flushMathBlock() {
+            guard !mathLines.isEmpty else { return }
+            rendered.append("\\[")
+            rendered.append(contentsOf: mathLines)
+            rendered.append("\\]")
+            mathLines.removeAll()
+        }
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            if trimmed == "\\[" {
+                isMathBlock = true
+                continue
+            }
+
+            if isMathBlock {
+                if trimmed == "\\]" {
+                    flushMathBlock()
+                    isMathBlock = false
+                } else {
+                    mathLines.append(line)
+                }
+                continue
+            }
+
+            rendered.append(render(line: line))
+        }
+
+        flushMathBlock()
+        return rendered.joined(separator: "\n")
     }
 
-    private static func render(line: Substring) -> String {
-        let text = String(line)
+    private static func render(line: String) -> String {
+        let text = line
 
         if text.hasPrefix("# ") {
             return "\\section*{\(escape(text.dropFirst(2)))}"

@@ -123,7 +123,7 @@ final class Paper {
     }
 
     var summary: String {
-        let body = markdown
+        let body = PaperContentNormalizer.normalize(markdown: markdown)
             .replacingOccurrences(of: "\n", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
