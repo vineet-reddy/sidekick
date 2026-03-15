@@ -11,6 +11,7 @@ nonisolated struct PaperTaskProgressSnapshot: Codable {
     let outputCharacterCount: Int
     let environmentID: String?
     let environmentLabel: String?
+    let environmentNetworkMode: String?
 }
 
 nonisolated enum PaperTaskCheckResult {

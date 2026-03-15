@@ -60,7 +60,7 @@ final class AuthService: ObservableObject {
         clientID: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_CLIENT_ID"] ?? "app_EMoamEEZ73f0CkXaXp7hrann",
         issuer: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_ISSUER"] ?? "https://auth.openai.com",
         callbackPort: UInt16 = UInt16(ProcessInfo.processInfo.environment["SIDEKICK_AUTH_CALLBACK_PORT"] ?? "") ?? 1455,
-        scopes: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_SCOPE"] ?? "openid profile email offline_access api.connectors.read api.connectors.invoke"
+        scopes: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_SCOPE"] ?? "openid profile email offline_access api.connectors.read api.connectors.invoke api.responses.write"
     ) {
         self.clientID = clientID
         self.issuer = issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/"))

@@ -315,7 +315,8 @@ final class OpenAIService: ObservableObject {
         datasetIDs: [String],
         allowedDomains: [String],
         plan: ResearchPlanArtifact,
-        inspection: ResearchInspectionArtifact
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact? = nil
     ) async throws -> String {
         let selectedDatasets = await trustedDatasets.taskDatasetSelection(
             datasetIDs: datasetIDs,
@@ -393,6 +394,8 @@ final class OpenAIService: ObservableObject {
         10. `findings[].evidence` must cite concrete observed counts, variables, subgroup definitions, or figure/table identifiers from this run.
         11. If a full inferential model is not supportable, return the strongest trustworthy descriptive cohort analysis you can instead of stalling.
         12. The final assistant message must contain only the JSON object and nothing before or after it.
+        13. If verification guidance is supplied below, address every required revision directly in the returned findings, tables, or limitations.
+        14. Report sex distributions or explicitly explain why the supplied bundle cannot support them.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -412,6 +415,11 @@ final class OpenAIService: ObservableObject {
 
         Research inspection JSON:
         \(stringify(inspectionPromptPayload(from: inspection)))
+        \(revisionRequest.map { """
+
+        Verification revision JSON:
+        \(stringify(verificationPromptPayload(from: $0)))
+        """ } ?? "")
         """
 
         return try await createTask(prompt: prompt)
@@ -699,7 +707,8 @@ final class OpenAIService: ObservableObject {
         theme: String,
         datasetIDs: [String],
         plan: ResearchPlanArtifact,
-        inspection: ResearchInspectionArtifact
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact? = nil
     ) async throws -> ResearchAnalysisArtifact {
         let noteTexts = notes.map(\.content)
         guard let fallback = try await stageFallback.bundledAnalysisInput(
@@ -781,6 +790,8 @@ final class OpenAIService: ObservableObject {
         - Treat MGMT measurements exactly as represented in the bundle; do not relabel continuous methylation values as binary promoter status unless the data justify it.
         - If the strongest trustworthy result is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
         - `findings[].evidence` must cite exact counts, field names, subgroup definitions, or figure/table identifiers from this run.
+        - If verification guidance is supplied below, address every required revision directly in this analysis pass.
+        - Report sex distributions or state explicitly why the supplied fields cannot support them.
         - The final assistant message must contain only the JSON object and nothing before or after it.
         """
 
@@ -802,6 +813,11 @@ final class OpenAIService: ObservableObject {
 
         Research inspection JSON:
         \(stringify(inspectionPromptPayload(from: inspection)))
+        \(revisionRequest.map { """
+
+        Verification revision JSON:
+        \(stringify(verificationPromptPayload(from: $0)))
+        """ } ?? "")
 
         Resolved public cohort bundle (\(fallback.providerLabel)) JSON:
         \(fallback.promptJSON)
@@ -825,7 +841,8 @@ final class OpenAIService: ObservableObject {
         theme: String,
         datasetIDs: [String],
         plan: ResearchPlanArtifact,
-        inspection: ResearchInspectionArtifact
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact? = nil
     ) async throws -> String {
         let noteTexts = notes.map(\.content)
         guard let fallback = try await stageFallback.bundledAnalysisInput(
@@ -895,13 +912,20 @@ final class OpenAIService: ObservableObject {
            }
         5. Treat MGMT measurements exactly as represented in the supplied bundle. Do not relabel continuous methylation values as a binary promoter status unless the data justify it.
         6. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        7. The final assistant message must contain only the JSON object and nothing before or after it.
+        7. If verification guidance is supplied below, address every required revision directly in this analysis pass.
+        8. Report sex distributions or explicitly explain why the supplied fields cannot support them.
+        9. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
         Study question: \(plan.question)
         Key hypotheses: \(compactHypotheses)
         Inspection checklist: \(compactChecklist)
+        \(revisionRequest.map { """
+
+        Verification revision JSON:
+        \(stringify(verificationPromptPayload(from: $0)))
+        """ } ?? "")
 
         Resolved public cohort bundle (\(fallback.providerLabel)):
         \(fallback.promptJSON)
@@ -1518,24 +1542,36 @@ final class OpenAIService: ObservableObject {
         }
 
         let mode = environment.agentNetworkAccess?.mode?.lowercased()
-        if mode == "on" {
-            score += preference == .repositoryBound ? 1_000 : 100
-        } else if mode == "off", preference == .selfContainedBundle {
-            score += 500
-        }
-
         let preset = environment.agentNetworkAccess?.presetAllowlist?.lowercased()
+        let label = environment.label ?? ""
+
         if preference == .repositoryBound {
+            if mode == "on" {
+                score += 1_000
+            }
             if preset == "all" {
                 score += 100
             } else if preset == "codex" {
                 score += 10
             }
-        }
+        } else {
+            if mode == "on" {
+                score += 5_000
+            } else if mode == "off" {
+                score -= 2_000
+            }
 
-        let label = environment.label ?? ""
-        if preference == .selfContainedBundle, !label.contains("/") {
-            score += 5_000
+            if preset == "all" {
+                score += 1_000
+            } else if preset == "codex" {
+                score += 250
+            }
+
+            if label.contains("/") {
+                score -= 100
+            } else {
+                score += 25
+            }
         }
 
         // Prefer less-loaded environments when the coarse capabilities are otherwise similar.
@@ -2687,7 +2723,8 @@ private struct CloudTaskDetails: Decodable {
             latestEventText: assistantTurn?.latestEvent?.text,
             outputCharacterCount: outputText.count,
             environmentID: assistantTurn?.environmentID,
-            environmentLabel: assistantTurn?.environment?.label
+            environmentLabel: assistantTurn?.environment?.label,
+            environmentNetworkMode: assistantTurn?.environment?.agentNetworkAccess?.mode
         )
     }
 
@@ -2814,6 +2851,12 @@ private struct CloudTaskLatestEvent: Decodable {
 
 private struct CloudTaskExecutionEnvironment: Decodable {
     let label: String?
+    let agentNetworkAccess: CloudTaskAgentNetworkAccess?
+
+    enum CodingKeys: String, CodingKey {
+        case label
+        case agentNetworkAccess = "agent_network_access"
+    }
 }
 
 private struct CloudTaskOutputItem: Decodable {

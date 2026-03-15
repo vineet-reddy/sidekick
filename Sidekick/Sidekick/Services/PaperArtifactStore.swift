@@ -142,6 +142,15 @@ enum PaperArtifactStore {
         load(type, from: stageArtifactURL(for: runID, stage: stage))
     }
 
+    static func stageArtifactModifiedAt(
+        runID: String,
+        stage: ResearchRunStage
+    ) -> Date? {
+        let url = stageArtifactURL(for: runID, stage: stage)
+        let values = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+        return values?.contentModificationDate
+    }
+
     static func renderedBundle(for taskID: String, fingerprint: String) -> RenderedPaperBundle? {
         let manifestURL = renderManifestURL(for: taskID)
         guard let manifest = load(RenderedPaperManifest.self, from: manifestURL),

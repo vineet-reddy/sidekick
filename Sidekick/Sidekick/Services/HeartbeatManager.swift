@@ -126,17 +126,24 @@ final class HeartbeatManager: ObservableObject {
         let papers = try modelContext.fetch(
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
-        .filter { $0.status == .generating }
         let runs = try modelContext.fetch(
             FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
         let runsByPaperID = Dictionary(uniqueKeysWithValues: runs.map { ($0.paperID, $0) })
+        let recoverablePaperIDs = Set(
+            runs.compactMap { run in
+                pendingAnalysisRevision(for: run.runID) == nil ? nil : run.paperID
+            }
+        )
+        let inFlightPapers = papers.filter { paper in
+            paper.status == .generating || (paper.status == .failed && recoverablePaperIDs.contains(paper.id))
+        }
         let notes = try modelContext.fetch(FetchDescriptor<Note>())
         let notesByID = Dictionary(uniqueKeysWithValues: notes.map { ($0.id, $0) })
 
-        print("[Heartbeat] Found \(papers.count) in-flight paper(s).")
+        print("[Heartbeat] Found \(inFlightPapers.count) in-flight paper(s).")
 
-        for paper in papers {
+        for paper in inFlightPapers {
             print("[Heartbeat]   Checking task \(paper.codexTaskID) for \"\(paper.title)\"...")
 
             if let run = runsByPaperID[paper.id] {
@@ -333,10 +340,44 @@ final class HeartbeatManager: ObservableObject {
         let taskAgeSeconds = snapshot.taskCreatedAt.map { Int(now.timeIntervalSince($0)) } ?? -1
         let progressAgeSeconds = snapshot.latestEventAt.map { Int(now.timeIntervalSince($0)) } ?? -1
         let latestEvent = snapshot.latestEventText ?? "<none>"
+        let environmentLabel = snapshot.environmentLabel ?? "<none>"
+        let networkMode = snapshot.environmentNetworkMode ?? "<unknown>"
 
         return "status=\(snapshot.status) task_age_s=\(taskAgeSeconds) " +
             "latest_event_age_s=\(progressAgeSeconds) output_chars=\(snapshot.outputCharacterCount) " +
-            "latest_event=\"\(latestEvent)\""
+            "env=\"\(environmentLabel)\" network=\(networkMode) latest_event=\"\(latestEvent)\""
+    }
+
+    private func shouldRescueDeadBundledTask(
+        run: ResearchRun,
+        snapshot: PaperTaskProgressSnapshot
+    ) -> Bool {
+        let latestProgress = run.latestProgressMessage?.lowercased() ?? ""
+        guard latestProgress.contains("bundled") else {
+            return false
+        }
+
+        let normalizedStatus = snapshot.status.lowercased()
+        guard ["pending", "queued", "in_progress", "incomplete"].contains(normalizedStatus) else {
+            return false
+        }
+
+        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard latestEvent.isEmpty, snapshot.outputCharacterCount == 0 else {
+            return false
+        }
+
+        let networkMode = snapshot.environmentNetworkMode?.lowercased() ?? ""
+        guard networkMode == "off" else {
+            return false
+        }
+
+        let taskStart = snapshot.taskCreatedAt
+            ?? snapshot.assistantTurnCreatedAt
+            ?? run.currentStageStartedAt
+            ?? run.updatedAt
+
+        return Date().timeIntervalSince(taskStart) >= remoteRetryGracePeriod
     }
 
     private func resolveResearchRun(
@@ -344,6 +385,11 @@ final class HeartbeatManager: ObservableObject {
         paper: Paper,
         notesByID: [UUID: Note]
     ) async throws {
+        if run.status == .failed, pendingAnalysisRevision(for: run.runID) != nil {
+            paper.status = .generating
+            run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
+        }
+
         let notes = run.sourceNoteIDs.compactMap { notesByID[$0] }
         guard !notes.isEmpty else {
             markResearchRunFailed(
@@ -407,7 +453,10 @@ final class HeartbeatManager: ObservableObject {
             try await executeInspectStage(run, paper: paper, notes: notes, plan: plan)
 
         case .analyze:
-            if PaperArtifactStore.stageArtifact(ResearchAnalysisArtifact.self, runID: run.runID, stage: .analyze) != nil {
+            let revisionRequest = pendingAnalysisRevision(for: run.runID)
+
+            if PaperArtifactStore.stageArtifact(ResearchAnalysisArtifact.self, runID: run.runID, stage: .analyze) != nil,
+               revisionRequest == nil {
                 run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
                 try await advanceResearchRun(run, paper: paper, notes: notes)
                 return
@@ -441,6 +490,7 @@ final class HeartbeatManager: ObservableObject {
                         notes: notes,
                         plan: plan,
                         inspection: inspection,
+                        revisionRequest: revisionRequest,
                         incrementAttempt: false
                     )
                 } catch {
@@ -454,15 +504,18 @@ final class HeartbeatManager: ObservableObject {
                 paper: paper,
                 notes: notes,
                 plan: plan,
-                inspection: inspection
+                inspection: inspection,
+                revisionRequest: revisionRequest
             )
 
         case .verify:
-            if let verification = PaperArtifactStore.stageArtifact(
-                ResearchVerificationArtifact.self,
-                runID: run.runID,
-                stage: .verify
-            ) {
+            if let verification = currentVerificationArtifact(for: run.runID) {
+                if verification.decision == .reviseAnalysis {
+                    run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
+                    try await advanceResearchRun(run, paper: paper, notes: notes)
+                    return
+                }
+
                 guard verification.allowsWriting else {
                     markResearchRunFailed(run, paper: paper, message: verification.blockingMessage)
                     return
@@ -653,6 +706,25 @@ final class HeartbeatManager: ObservableObject {
                     return
                 }
 
+                if shouldRescueDeadBundledTask(run: run, snapshot: snapshot) {
+                    let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
+                    print("[Heartbeat]   -> Inspect stage bundled task looks dead on \(environmentLabel); rerouting without spending another stage attempt.")
+                    run.activeTaskID = nil
+
+                    do {
+                        try await performInspectResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                    }
+                    return
+                }
+
                 if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .inspect) {
                     print("[Heartbeat]   -> Inspect stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
@@ -756,7 +828,8 @@ final class HeartbeatManager: ObservableObject {
         paper: Paper,
         notes: [Note],
         plan: ResearchPlanArtifact,
-        inspection: ResearchInspectionArtifact
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact?
     ) async throws {
         if let taskID = run.activeTaskID, !taskID.isEmpty {
             let result = try await openAI.checkResearchAnalysisTask(taskID)
@@ -780,6 +853,28 @@ final class HeartbeatManager: ObservableObject {
                             notes: notes,
                             plan: plan,
                             inspection: inspection,
+                            revisionRequest: revisionRequest,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                    }
+                    return
+                }
+
+                if shouldRescueDeadBundledTask(run: run, snapshot: snapshot) {
+                    let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
+                    print("[Heartbeat]   -> Analysis stage bundled task looks dead on \(environmentLabel); rerouting without spending another stage attempt.")
+                    run.activeTaskID = nil
+
+                    do {
+                        try await performAnalyzeResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest,
                             incrementAttempt: false
                         )
                     } catch {
@@ -800,6 +895,7 @@ final class HeartbeatManager: ObservableObject {
                                 notes: notes,
                                 plan: plan,
                                 inspection: inspection,
+                                revisionRequest: revisionRequest,
                                 incrementAttempt: true
                             )
                         } catch {
@@ -813,7 +909,8 @@ final class HeartbeatManager: ObservableObject {
                         paper: paper,
                         notes: notes,
                         plan: plan,
-                        inspection: inspection
+                        inspection: inspection,
+                        revisionRequest: revisionRequest
                     )
                 }
 
@@ -829,14 +926,15 @@ final class HeartbeatManager: ObservableObject {
                 persistTaskProgress(snapshot)
                 run.activeTaskID = nil
 
-                if run.attemptCount(for: .analyze) < maxResearchStageAttempts {
+                if revisionRequest != nil || run.attemptCount(for: .analyze) < maxResearchStageAttempts {
                     print("[Heartbeat]   -> Analysis stage failed for \(run.runID); retrying same stage.")
                     try await startResearchAnalysisTask(
                         run,
                         paper: paper,
                         notes: notes,
                         plan: plan,
-                        inspection: inspection
+                        inspection: inspection,
+                        revisionRequest: revisionRequest
                     )
                 } else {
                     markResearchRunFailed(run, paper: paper, message: message)
@@ -851,7 +949,8 @@ final class HeartbeatManager: ObservableObject {
             paper: paper,
             notes: notes,
             plan: plan,
-            inspection: inspection
+            inspection: inspection,
+            revisionRequest: revisionRequest
         )
     }
 
@@ -860,9 +959,12 @@ final class HeartbeatManager: ObservableObject {
         paper: Paper,
         notes: [Note],
         plan: ResearchPlanArtifact,
-        inspection: ResearchInspectionArtifact
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact?
     ) async throws {
-        guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
+        let isRevisionRetry = revisionRequest != nil
+
+        guard isRevisionRetry || run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
             markResearchRunFailed(
                 run,
                 paper: paper,
@@ -871,8 +973,15 @@ final class HeartbeatManager: ObservableObject {
             return
         }
 
-        run.incrementAttempt(for: .analyze)
-        run.markRunning(stage: .analyze, message: "Starting remote analysis task.")
+        if !isRevisionRetry {
+            run.incrementAttempt(for: .analyze)
+        }
+        run.markRunning(
+            stage: .analyze,
+            message: isRevisionRetry
+                ? "Re-running analysis with verification revisions."
+                : "Starting remote analysis task."
+        )
 
         do {
             let taskID = try await openAI.startResearchAnalysisTask(
@@ -882,7 +991,8 @@ final class HeartbeatManager: ObservableObject {
                 datasetIDs: run.datasetIDs,
                 allowedDomains: run.allowedDomains,
                 plan: plan,
-                inspection: inspection
+                inspection: inspection,
+                revisionRequest: revisionRequest
             )
             run.activeTaskID = taskID
             run.updateProgress(message: "Remote analysis is running.", at: .now)
@@ -896,6 +1006,7 @@ final class HeartbeatManager: ObservableObject {
                         notes: notes,
                         plan: plan,
                         inspection: inspection,
+                        revisionRequest: revisionRequest,
                         incrementAttempt: false
                     )
                 } catch {
@@ -938,6 +1049,13 @@ final class HeartbeatManager: ObservableObject {
                 analysis: analysis
             )
             try PaperArtifactStore.persistStageArtifact(verification, runID: run.runID, stage: .verify)
+
+            if verification.decision == .reviseAnalysis {
+                run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
+                print("[Heartbeat]   -> Verification requested analysis revisions for \(run.runID)")
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
 
             guard verification.allowsWriting else {
                 print("[Heartbeat]   -> Verification blocked drafting for \(run.runID)")
@@ -1086,6 +1204,7 @@ final class HeartbeatManager: ObservableObject {
         notes: [Note],
         plan: ResearchPlanArtifact,
         inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact?,
         incrementAttempt: Bool
     ) async throws {
         if incrementAttempt {
@@ -1110,7 +1229,8 @@ final class HeartbeatManager: ObservableObject {
                 theme: run.theme,
                 datasetIDs: run.datasetIDs,
                 plan: plan,
-                inspection: inspection
+                inspection: inspection,
+                revisionRequest: revisionRequest
             )
 
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
@@ -1129,7 +1249,8 @@ final class HeartbeatManager: ObservableObject {
                 theme: run.theme,
                 datasetIDs: run.datasetIDs,
                 plan: plan,
-                inspection: inspection
+                inspection: inspection,
+                revisionRequest: revisionRequest
             )
             run.activeTaskID = taskID
             run.updateProgress(message: "Remote bundled analysis is running.", at: .now)
@@ -1222,6 +1343,44 @@ final class HeartbeatManager: ObservableObject {
         ]
 
         return indicators.contains(where: message.contains)
+    }
+
+    private func pendingAnalysisRevision(for runID: String) -> ResearchVerificationArtifact? {
+        guard let verification = PaperArtifactStore.stageArtifact(
+            ResearchVerificationArtifact.self,
+            runID: runID,
+            stage: .verify
+        ), verification.decision == .reviseAnalysis else {
+            return nil
+        }
+
+        let verifyModifiedAt = PaperArtifactStore.stageArtifactModifiedAt(runID: runID, stage: .verify)
+        let analyzeModifiedAt = PaperArtifactStore.stageArtifactModifiedAt(runID: runID, stage: .analyze)
+
+        if let verifyModifiedAt, let analyzeModifiedAt, verifyModifiedAt <= analyzeModifiedAt {
+            return nil
+        }
+
+        return verification
+    }
+
+    private func currentVerificationArtifact(for runID: String) -> ResearchVerificationArtifact? {
+        guard let verification = PaperArtifactStore.stageArtifact(
+            ResearchVerificationArtifact.self,
+            runID: runID,
+            stage: .verify
+        ) else {
+            return nil
+        }
+
+        let verifyModifiedAt = PaperArtifactStore.stageArtifactModifiedAt(runID: runID, stage: .verify)
+        let analyzeModifiedAt = PaperArtifactStore.stageArtifactModifiedAt(runID: runID, stage: .analyze)
+
+        if let verifyModifiedAt, let analyzeModifiedAt, verifyModifiedAt < analyzeModifiedAt {
+            return nil
+        }
+
+        return verification
     }
 
     private func handleResearchStageError(
