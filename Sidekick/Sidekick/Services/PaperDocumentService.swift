@@ -45,6 +45,15 @@ enum PaperDocumentService {
             stage: .analyze
         )
         let figureCaptions = analysis?.figures.map(\.caption) ?? []
+        let validExistingFigures = paper.figureData.filter(isSidekickRenderableImageData)
+
+        if validExistingFigures.count != paper.figureData.count {
+            print(
+                "[PaperDocs] dropped \(paper.figureData.count - validExistingFigures.count) invalid figure(s) " +
+                    "task=\(taskID)"
+            )
+            paper.figureData = validExistingFigures
+        }
 
         if paper.figureData.isEmpty, let analysis {
             let recoveredFigures = analysis.figureData

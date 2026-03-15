@@ -1,4 +1,5 @@
 import Foundation
+import ImageIO
 import SwiftData
 
 enum ResearchRunStage: String, Codable, CaseIterable {
@@ -408,7 +409,12 @@ nonisolated struct ResearchFigureArtifact: Codable {
     }
 
     var imageData: Data? {
-        decodeSidekickBase64Payload(base64Data)
+        guard let data = decodeSidekickBase64Payload(base64Data),
+              isSidekickRenderableImageData(data) else {
+            return nil
+        }
+
+        return data
     }
 }
 
@@ -495,8 +501,26 @@ nonisolated struct ResearchVerificationArtifact: Codable {
     }
 }
 
+nonisolated func isSidekickRenderableImageData(_ data: Data) -> Bool {
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+          CGImageSourceGetCount(source) > 0,
+          CGImageSourceCreateImageAtIndex(source, 0, nil) != nil else {
+        return false
+    }
+
+    return true
+}
+
 nonisolated func decodeSidekickBase64Payload(_ raw: String) -> Data? {
     var normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    // Long cloud-task messages can inject "... 123 chars truncated ..." into text output.
+    guard normalized.range(
+        of: #"(?:\d+\s+)?(?:chars|tokens)\s+truncated"#,
+        options: [.regularExpression, .caseInsensitive]
+    ) == nil else {
+        return nil
+    }
 
     if let commaIndex = normalized.firstIndex(of: ","),
        normalized[..<commaIndex].lowercased().contains("base64") {
@@ -505,7 +529,16 @@ nonisolated func decodeSidekickBase64Payload(_ raw: String) -> Data? {
 
     normalized = normalized.replacingOccurrences(of: "\n", with: "")
     normalized = normalized.replacingOccurrences(of: "\r", with: "")
+    normalized = normalized.replacingOccurrences(of: "\t", with: "")
     normalized = normalized.replacingOccurrences(of: " ", with: "")
+    normalized = normalized.replacingOccurrences(of: "-", with: "+")
+    normalized = normalized.replacingOccurrences(of: "_", with: "/")
+
+    let base64Alphabet = CharacterSet(charactersIn: "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=")
+    normalized = String(String.UnicodeScalarView(
+        normalized.unicodeScalars.filter { base64Alphabet.contains($0) }
+    ))
+    normalized = normalized.replacingOccurrences(of: "=", with: "")
 
     guard !normalized.isEmpty else {
         return nil

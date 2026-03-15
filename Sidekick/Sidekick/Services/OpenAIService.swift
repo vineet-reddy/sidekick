@@ -50,6 +50,7 @@ final class OpenAIService: ObservableObject {
     private let originator = "codex_cli_rs"
     private let modelRouter = OpenAIModelRouter()
     private let environmentRouter = OpenAIEnvironmentRouter()
+    private let researchStageFallbackRouter = OpenAIResearchStageFallbackRouter()
     private let trustedDatasets: TrustedDatasetRegistry
     private let stageFallback: ResearchStageFallbackService
 
@@ -706,7 +707,7 @@ final class OpenAIService: ObservableObject {
         }
 
         let artifact = try decodeStructuredPayload(ResearchAnalysisArtifact.self, from: task.outputText)
-        return .completed(snapshot, artifact)
+        return .completed(snapshot, try normalizedResearchAnalysisArtifact(artifact, task: task))
     }
 
     func runResearchAnalysisFallback(
@@ -798,6 +799,8 @@ final class OpenAIService: ObservableObject {
         - Prefer one concrete public cohort analysis over speculative multi-source synthesis.
         - Treat MGMT measurements exactly as represented in the bundle; do not relabel continuous methylation values as binary promoter status unless the data justify it.
         - If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png`; do not substitute a bar chart or median-only graphic.
+        - Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.
+        - Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
         - If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
         - If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
         - If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
@@ -841,7 +844,8 @@ final class OpenAIService: ObservableObject {
             input: input
         )
 
-        return try decodeStructuredPayload(ResearchAnalysisArtifact.self, from: response.outputText)
+        let artifact = try decodeStructuredPayload(ResearchAnalysisArtifact.self, from: response.outputText)
+        return try normalizedResearchAnalysisArtifact(artifact)
     }
 
     func startBundledResearchAnalysisTask(
@@ -923,16 +927,18 @@ final class OpenAIService: ObservableObject {
            }
         6. Treat MGMT measurements exactly as represented in the supplied bundle. Do not relabel continuous methylation values as a binary promoter status unless the data justify it.
         7. If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png`; do not substitute a bar chart or median-only graphic.
-        8. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
-        9. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
-        10. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
-        11. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        12. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
-        13. Report sex distributions or explicitly explain why the supplied fields cannot support them.
-        14. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
-        15. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
-        16. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
-        17. The final assistant message must contain only the JSON object and nothing before or after it.
+        8. Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.
+        9. Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
+        10. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
+        11. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
+        12. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
+        13. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
+        14. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
+        15. Report sex distributions or explicitly explain why the supplied fields cannot support them.
+        16. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
+        17. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
+        18. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
+        19. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -1316,7 +1322,12 @@ final class OpenAIService: ObservableObject {
         }
 
         return figures.compactMap { figure in
-            decodeSidekickBase64Payload(figure.base64Data)
+            guard let data = decodeSidekickBase64Payload(figure.base64Data),
+                  isSidekickRenderableImageData(data) else {
+                return nil
+            }
+
+            return data
         }
     }
 
@@ -1334,6 +1345,80 @@ final class OpenAIService: ObservableObject {
             from: task.outputDiffText,
             referencedBy: markdown
         )
+    }
+
+    private func normalizedResearchAnalysisArtifact(
+        _ artifact: ResearchAnalysisArtifact,
+        task: CloudTaskDetails? = nil
+    ) throws -> ResearchAnalysisArtifact {
+        guard !artifact.figures.isEmpty else {
+            return artifact
+        }
+
+        let repairedFigures = repairedAnalysisFigures(from: artifact, task: task)
+        guard repairedFigures.count == artifact.figures.count else {
+            let reason: String
+            if let task, outputContainsTruncationMarker(task.outputText) {
+                reason = "The analysis task output was truncated before all figure bytes arrived."
+            } else {
+                reason = "The analysis task returned figure metadata without recoverable image bytes."
+            }
+
+            throw ServiceError.taskFailed(reason)
+        }
+
+        return ResearchAnalysisArtifact(
+            datasetManifest: artifact.datasetManifest,
+            narrativeSummary: artifact.narrativeSummary,
+            findings: artifact.findings,
+            tables: artifact.tables,
+            figures: repairedFigures,
+            limitations: artifact.limitations,
+            provenance: artifact.provenance
+        )
+    }
+
+    private func repairedAnalysisFigures(
+        from artifact: ResearchAnalysisArtifact,
+        task: CloudTaskDetails?
+    ) -> [ResearchFigureArtifact] {
+        let recoveredDiffFigures: [Data]
+        if let task {
+            let referencedFigures = artifact.figures
+                .map { "![\($0.caption)](\($0.filename))" }
+                .joined(separator: "\n")
+            recoveredDiffFigures = GitBinaryPatchFigureExtractor.extractFigureData(
+                from: task.outputDiffText,
+                referencedBy: referencedFigures
+            )
+        } else {
+            recoveredDiffFigures = []
+        }
+
+        return artifact.figures.enumerated().compactMap { index, figure in
+            if figure.imageData != nil {
+                return figure
+            }
+
+            guard recoveredDiffFigures.indices.contains(index),
+                  isSidekickRenderableImageData(recoveredDiffFigures[index]) else {
+                return nil
+            }
+
+            return ResearchFigureArtifact(
+                filename: figure.filename,
+                caption: figure.caption,
+                mimeType: figure.mimeType,
+                base64Data: recoveredDiffFigures[index].base64EncodedString()
+            )
+        }
+    }
+
+    private func outputContainsTruncationMarker(_ text: String) -> Bool {
+        text.range(
+            of: #"(?:\d+\s+)?(?:chars|tokens)\s+truncated"#,
+            options: [.regularExpression, .caseInsensitive]
+        ) != nil
     }
 
     private func createResponse(
@@ -1402,8 +1487,16 @@ final class OpenAIService: ObservableObject {
         instructions: String,
         input: String
     ) async throws -> ResponseEnvelope {
+        if let unavailableReason = await researchStageFallbackRouter.cachedUnavailabilityReason() {
+            log(
+                "createResearchStageFallbackResponse skipping direct responses fallback " +
+                    "due to cached unavailability: \(unavailableReason)"
+            )
+            throw ServiceError.taskFailed(unavailableReason)
+        }
+
         do {
-            return try await createResponse(
+            let response = try await createResponse(
                 for: .researchStageFallback,
                 tools: codeInterpreterTools(),
                 toolChoice: "required",
@@ -1411,6 +1504,8 @@ final class OpenAIService: ObservableObject {
                 instructions: instructions,
                 input: input
             )
+            await researchStageFallbackRouter.clear()
+            return response
         } catch {
             guard shouldRetryResearchStageFallbackResponse(after: error) else {
                 throw error
@@ -1421,14 +1516,23 @@ final class OpenAIService: ObservableObject {
                     "after api failure: \(String(describing: error))"
             )
 
-            return try await createResponse(
-                for: .researchStageFallback,
-                tools: codeInterpreterTools(),
-                toolChoice: "required",
-                responseBaseURL: codexBaseURL,
-                instructions: instructions,
-                input: input
-            )
+            do {
+                let response = try await createResponse(
+                    for: .researchStageFallback,
+                    tools: codeInterpreterTools(),
+                    toolChoice: "required",
+                    responseBaseURL: codexBaseURL,
+                    instructions: instructions,
+                    input: input
+                )
+                await researchStageFallbackRouter.clear()
+                return response
+            } catch {
+                if shouldRetryResearchStageFallbackResponse(after: error) {
+                    await researchStageFallbackRouter.remember(error.localizedDescription)
+                }
+                throw error
+            }
         }
     }
 
@@ -2620,15 +2724,6 @@ private enum OpenAIWorkload {
 private enum CloudTaskEnvironmentPreference {
     case repositoryBound
     case selfContainedBundle
-
-    var storageKey: String {
-        switch self {
-        case .repositoryBound:
-            return "repositoryBound"
-        case .selfContainedBundle:
-            return "selfContainedBundle"
-        }
-    }
 }
 
 private struct BackendRequestFailure: LocalizedError {
@@ -2668,15 +2763,27 @@ private actor OpenAIModelRouter {
 }
 
 private actor OpenAIEnvironmentRouter {
-    private var selectedEnvironments: [String: CloudTaskEnvironment] = [:]
-    private var quarantinedEnvironmentExpirations: [String: [String: Date]] = [:]
+    private var repositoryBoundEnvironment: CloudTaskEnvironment?
+    private var selfContainedBundleEnvironment: CloudTaskEnvironment?
+    private var repositoryBoundQuarantine: [String: Date] = [:]
+    private var selfContainedBundleQuarantine: [String: Date] = [:]
 
     func cached(for preference: CloudTaskEnvironmentPreference) -> CloudTaskEnvironment? {
-        selectedEnvironments[preference.storageKey]
+        switch preference {
+        case .repositoryBound:
+            return repositoryBoundEnvironment
+        case .selfContainedBundle:
+            return selfContainedBundleEnvironment
+        }
     }
 
     func remember(_ environment: CloudTaskEnvironment, for preference: CloudTaskEnvironmentPreference) {
-        selectedEnvironments[preference.storageKey] = environment
+        switch preference {
+        case .repositoryBound:
+            repositoryBoundEnvironment = environment
+        case .selfContainedBundle:
+            selfContainedBundleEnvironment = environment
+        }
     }
 
     func quarantine(
@@ -2686,26 +2793,50 @@ private actor OpenAIEnvironmentRouter {
     ) {
         pruneExpiredQuarantines(now: .now)
 
-        let storageKey = preference.storageKey
-        var quarantined = quarantinedEnvironmentExpirations[storageKey] ?? [:]
-        quarantined[environmentID] = Date().addingTimeInterval(duration)
-        quarantinedEnvironmentExpirations[storageKey] = quarantined
-
-        if selectedEnvironments[storageKey]?.id == environmentID {
-            selectedEnvironments[storageKey] = nil
+        switch preference {
+        case .repositoryBound:
+            repositoryBoundQuarantine[environmentID] = Date().addingTimeInterval(duration)
+            if repositoryBoundEnvironment?.id == environmentID {
+                repositoryBoundEnvironment = nil
+            }
+        case .selfContainedBundle:
+            selfContainedBundleQuarantine[environmentID] = Date().addingTimeInterval(duration)
+            if selfContainedBundleEnvironment?.id == environmentID {
+                selfContainedBundleEnvironment = nil
+            }
         }
     }
 
     func quarantinedIDs(for preference: CloudTaskEnvironmentPreference) -> Set<String> {
         pruneExpiredQuarantines(now: .now)
-        return Set(quarantinedEnvironmentExpirations[preference.storageKey]?.keys.map { $0 } ?? [])
+
+        switch preference {
+        case .repositoryBound:
+            return Set(repositoryBoundQuarantine.keys)
+        case .selfContainedBundle:
+            return Set(selfContainedBundleQuarantine.keys)
+        }
     }
 
     private func pruneExpiredQuarantines(now: Date) {
-        for storageKey in Array(quarantinedEnvironmentExpirations.keys) {
-            let retained = quarantinedEnvironmentExpirations[storageKey]?.filter { $0.value > now } ?? [:]
-            quarantinedEnvironmentExpirations[storageKey] = retained.isEmpty ? nil : retained
-        }
+        repositoryBoundQuarantine = repositoryBoundQuarantine.filter { $0.value > now }
+        selfContainedBundleQuarantine = selfContainedBundleQuarantine.filter { $0.value > now }
+    }
+}
+
+private actor OpenAIResearchStageFallbackRouter {
+    private var unavailableReason: String?
+
+    func cachedUnavailabilityReason() -> String? {
+        unavailableReason
+    }
+
+    func remember(_ reason: String) {
+        unavailableReason = reason
+    }
+
+    func clear() {
+        unavailableReason = nil
     }
 }
 
