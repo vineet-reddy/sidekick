@@ -200,6 +200,10 @@ final class OpenAIService: ObservableObject {
                     theme: theme,
                     selectedDatasets: selectedDatasets
                 ),
+                inspectionArtifact: localInspectionArtifact(
+                    selectedDatasets: selectedDatasets,
+                    artifacts: localArtifacts
+                ),
                 analysisArtifact: localAnalysisArtifact(
                     selectedDatasets: selectedDatasets,
                     artifacts: localArtifacts
@@ -216,6 +220,7 @@ final class OpenAIService: ObservableObject {
             allowedDomains: allowedDomains,
             registryVersion: registryVersion,
             planArtifact: nil,
+            inspectionArtifact: nil,
             analysisArtifact: nil,
             draftArtifact: nil
         )
@@ -301,7 +306,8 @@ final class OpenAIService: ObservableObject {
         theme: String,
         datasetIDs: [String],
         allowedDomains: [String],
-        plan: ResearchPlanArtifact
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact
     ) async throws -> String {
         let selectedDatasets = await trustedDatasets.taskDatasetSelection(
             datasetIDs: datasetIDs,
@@ -318,13 +324,14 @@ final class OpenAIService: ObservableObject {
 
         let prompt = """
         You are a research scientist using Code Interpreter.
-        Run the empirical analysis only. Do not write the paper yet.
+        Run the empirical analysis only. The dataset inspection checkpoint has already happened. Do not write the paper yet.
 
         Requirements:
-        1. Prefer the vetted dataset cards below before using anything else.
+        1. Prefer the vetted dataset cards below and the inspected manifest before using anything else.
         2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
-        3. Access real data, run the analysis, and produce real figures when warranted.
-        4. Return strict JSON only with this exact shape:
+        3. Stay aligned with the inspected dataset slice unless inspection clearly missed a blocker.
+        4. Access real data, run the analysis, and produce real figures when warranted.
+        5. Return strict JSON only with this exact shape:
            {
              "dataset_manifest": {
                "primary_dataset_ids": ["trusted-dataset-id"],
@@ -370,8 +377,75 @@ final class OpenAIService: ObservableObject {
                "notes": "short summary of data access and limits"
              }
            }
-        5. Include concrete estimates, diagnostics, sample sizes, and uncertainty whenever the data support them.
-        6. If the analysis cannot be completed, maximize the structured evidence you can deliver instead of returning a memo.
+        6. Include concrete estimates, diagnostics, sample sizes, and uncertainty whenever the data support them.
+        7. If the analysis cannot be completed, maximize the structured evidence you can deliver instead of returning a memo.
+        8. The final assistant message must contain only the JSON object and nothing before or after it.
+
+        Suggested title: \(title)
+        Theme: \(theme)
+        Approved domains: \(allowedDomainText)
+
+        Trusted dataset cards:
+        \(datasetCards)
+
+        Notes:
+        \(notesBody)
+
+        Research plan JSON:
+        \(prettyJSONString(plan))
+
+        Research inspection JSON:
+        \(stringify(inspectionPromptPayload(from: inspection)))
+        """
+
+        return try await createTask(prompt: prompt)
+    }
+
+    func startResearchInspectionTask(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        allowedDomains: [String],
+        plan: ResearchPlanArtifact
+    ) async throws -> String {
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: notes.map(\.content),
+            limit: 4
+        )
+        let datasetCards = selectedDatasets.isEmpty
+            ? "- No trusted dataset cards were resolved for this run."
+            : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
+        let notesBody = notes.map { note in
+            "- [\(note.id.uuidString)] \(note.content)"
+        }.joined(separator: "\n\n")
+
+        let prompt = """
+        You are a research scientist using Code Interpreter.
+        Resolve the best reachable dataset slice and inspect it only. Do not run the final analysis yet.
+
+        Requirements:
+        1. Prefer the vetted dataset cards below before using anything else.
+        2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
+        3. Resolve a concrete dataset slice, inspect the schema or metadata, and report what is actually usable for analysis.
+        4. Return strict JSON only with this exact shape:
+           {
+             "dataset_manifest": {
+               "primary_dataset_ids": ["trusted-dataset-id"],
+               "data_sources": ["string"],
+               "sample_description": "string",
+               "row_count": 123,
+               "selected_variables": ["string"],
+               "quality_notes": ["string"]
+             },
+             "access_notes": "string",
+             "quality_checks": ["string"],
+             "analysis_checklist": ["string"]
+           }
+        5. Prefer a small, concrete, trustworthy slice over a broad speculative one.
+        6. Capture any blockers or limitations you uncovered during inspection in `quality_checks`.
         7. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
@@ -389,6 +463,26 @@ final class OpenAIService: ObservableObject {
         """
 
         return try await createTask(prompt: prompt)
+    }
+
+    func checkResearchInspectionTask(_ taskID: String) async throws -> ResearchInspectionTaskCheckResult {
+        let task = try await fetchTask(taskID: taskID)
+        let snapshot = task.progressSnapshot(taskID: taskID)
+        persistDebugPayload(Data(task.outputText.utf8), named: "inspection-task-output-\(taskID).txt")
+
+        switch task.normalizedStatus {
+        case "queued", "in_progress", "incomplete":
+            return .waiting(snapshot)
+        case "completed":
+            break
+        case "failed", "cancelled":
+            return .failed(snapshot, task.errorMessage ?? "The dataset inspection task failed.")
+        default:
+            return .waiting(snapshot)
+        }
+
+        let artifact = try decodeStructuredPayload(ResearchInspectionArtifact.self, from: task.outputText)
+        return .completed(snapshot, artifact)
     }
 
     func checkResearchAnalysisTask(_ taskID: String) async throws -> ResearchAnalysisTaskCheckResult {
@@ -1378,6 +1472,26 @@ final class OpenAIService: ObservableObject {
         )
     }
 
+    private func localInspectionArtifact(
+        selectedDatasets: [TrustedDataset],
+        artifacts: PaperArtifacts
+    ) -> ResearchInspectionArtifact {
+        let analysis = localAnalysisArtifact(selectedDatasets: selectedDatasets, artifacts: artifacts)
+
+        return ResearchInspectionArtifact(
+            datasetManifest: analysis.datasetManifest,
+            accessNotes: artifacts.provenance?.notes ?? "The trusted BRFSS mirror was resolved locally and inspected before the validation analysis.",
+            qualityChecks: [
+                "The local validation wedge resolved one trusted public-health dataset and a compact predictor set.",
+                "This manifest is synthesized from the local BRFSS path so the staged pipeline keeps a consistent checkpoint shape."
+            ],
+            analysisChecklist: [
+                "Quantify sample size and prevalence across the selected outcome and predictor strata.",
+                "Fit the planned regression model and carry the finished figures into the final paper bundle."
+            ]
+        )
+    }
+
     private func localAnalysisArtifact(
         selectedDatasets: [TrustedDataset],
         artifacts: PaperArtifacts
@@ -1426,6 +1540,22 @@ final class OpenAIService: ObservableObject {
                 notes: "Local BRFSS validation slice."
             )
         )
+    }
+
+    private func inspectionPromptPayload(from inspection: ResearchInspectionArtifact) -> [String: Any] {
+        [
+            "dataset_manifest": [
+                "primary_dataset_ids": inspection.datasetManifest.primaryDatasetIDs,
+                "data_sources": inspection.datasetManifest.dataSources,
+                "sample_description": inspection.datasetManifest.sampleDescription,
+                "row_count": inspection.datasetManifest.rowCount.map { NSNumber(value: $0) } ?? NSNull(),
+                "selected_variables": inspection.datasetManifest.selectedVariables,
+                "quality_notes": inspection.datasetManifest.qualityNotes
+            ],
+            "access_notes": inspection.accessNotes,
+            "quality_checks": inspection.qualityChecks,
+            "analysis_checklist": inspection.analysisChecklist
+        ]
     }
 
     private func analysisPromptPayload(from analysis: ResearchAnalysisArtifact) -> [String: Any] {

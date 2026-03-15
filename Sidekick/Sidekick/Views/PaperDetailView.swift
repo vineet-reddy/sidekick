@@ -3,10 +3,13 @@ import SwiftData
 import SwiftUI
 
 struct PaperDetailView: View {
+    @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
     @Query(sort: \ResearchRun.createdAt, order: .reverse) private var runs: [ResearchRun]
     @State private var shareItem: ShareItem?
     @State private var exportError: String?
     @State private var isShowingExportError = false
+    @State private var isShowingDeleteConfirmation = false
     @State private var documentState: DocumentState = .loading
 
     let paper: Paper
@@ -42,7 +45,7 @@ struct PaperDetailView: View {
         .toolbar {
             if case let .ready(url) = documentState {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu("Share") {
+                    Menu {
                         Button("Share PDF") {
                             shareItem = ShareItem(url: url)
                         }
@@ -50,8 +53,19 @@ struct PaperDetailView: View {
                         Button("Share LaTeX") {
                             shareLaTeX()
                         }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
                     }
                 }
+            }
+
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(role: .destructive) {
+                    isShowingDeleteConfirmation = true
+                } label: {
+                    Image(systemName: "trash")
+                }
+                .accessibilityLabel("Delete paper")
             }
         }
         .sheet(item: $shareItem) { item in
@@ -65,6 +79,17 @@ struct PaperDetailView: View {
         }, message: {
             Text(exportError ?? "")
         })
+        .confirmationDialog(
+            "Delete this paper?",
+            isPresented: $isShowingDeleteConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Delete Paper", role: .destructive) {
+                deletePaper()
+            }
+        } message: {
+            Text("This removes the paper, its cached PDF bundle, and any persisted staged artifacts for this run.")
+        }
     }
 
     @ViewBuilder
@@ -145,6 +170,11 @@ struct PaperDetailView: View {
         } catch {
             documentState = .failed(error.localizedDescription)
         }
+    }
+
+    private func deletePaper() {
+        try? ContentDeletionService.deletePaper(paper, modelContext: modelContext)
+        dismiss()
     }
 
     private func pipelineRow(stage: ResearchRunStage, state: ResearchRunPipelineStepState) -> some View {

@@ -134,6 +134,7 @@ nonisolated struct TrustedDataset: Codable, Hashable, Sendable {
     }
 
     func taskLine() -> String {
+        let disciplinesText = disciplines.prefix(3).joined(separator: ", ")
         let domainsText = domains.prefix(4).joined(separator: ", ")
         let exampleText: String
         if let exampleAccess, !exampleAccess.isEmpty {
@@ -141,8 +142,14 @@ nonisolated struct TrustedDataset: Codable, Hashable, Sendable {
         } else {
             exampleText = ""
         }
+        let samplingText: String
+        if let samplingHint, !samplingHint.isEmpty {
+            samplingText = " | sample: \(samplingHint.compactPromptText(limit: 76))"
+        } else {
+            samplingText = ""
+        }
 
-        return "[\(id)] \(title) | use: \(useFor.compactPromptText(limit: 90)) | avoid: \(avoidFor.compactPromptText(limit: 70)) | access: \(accessHint.compactPromptText(limit: 92)) | domains: \(domainsText)\(exampleText)"
+        return "[\(id)] \(title) | disciplines: \(disciplinesText) | use: \(useFor.compactPromptText(limit: 90)) | avoid: \(avoidFor.compactPromptText(limit: 70)) | access: \(accessHint.compactPromptText(limit: 92))\(samplingText) | domains: \(domainsText)\(exampleText)"
     }
 }
 
@@ -242,10 +249,11 @@ actor TrustedDatasetRegistry {
 
     private func shortlist(noteTexts: [String], limit: Int) -> [TrustedDataset] {
         let terms = Self.tokenize(noteTexts.joined(separator: " "))
+        let enrichedTerms = Self.enrichedTerms(from: terms)
         let directSources = catalog.entries.filter(\.isTrustedDirectSource)
 
         let scored = directSources.map { entry in
-            (entry: entry, score: score(entry: entry, terms: terms))
+            (entry: entry, score: score(entry: entry, directTerms: terms, enrichedTerms: enrichedTerms))
         }
         .sorted { lhs, rhs in
             if lhs.score == rhs.score {
@@ -265,13 +273,31 @@ actor TrustedDatasetRegistry {
         return Array(pool.prefix(limit).map(\.entry))
     }
 
-    private func score(entry: TrustedDataset, terms: Set<String>) -> Double {
-        guard !terms.isEmpty else {
+    private func score(
+        entry: TrustedDataset,
+        directTerms: Set<String>,
+        enrichedTerms: Set<String>
+    ) -> Double {
+        guard !directTerms.isEmpty else {
             return entry.priority + officialBoost(for: entry)
         }
 
-        let overlap = Double(entry.searchTerms.intersection(terms).count)
-        return entry.priority + officialBoost(for: entry) + (overlap * 2.4)
+        let titleTerms = Self.tokenize(entry.title)
+        let disciplineTerms = Self.tokenize(entry.disciplines.joined(separator: " "))
+        let searchTerms = entry.searchTerms
+
+        let directOverlap = Double(searchTerms.intersection(directTerms).count)
+        let enrichedOverlap = Double(searchTerms.intersection(enrichedTerms).count)
+        let titleOverlap = Double(titleTerms.intersection(directTerms).count)
+        let disciplineOverlap = Double(disciplineTerms.intersection(enrichedTerms).count)
+        let expandedOnlyOverlap = max(0, enrichedOverlap - directOverlap)
+
+        return entry.priority
+            + officialBoost(for: entry)
+            + (directOverlap * 2.6)
+            + (expandedOnlyOverlap * 1.3)
+            + (titleOverlap * 1.4)
+            + (disciplineOverlap * 1.1)
     }
 
     private func officialBoost(for entry: TrustedDataset) -> Double {
@@ -326,6 +352,50 @@ actor TrustedDatasetRegistry {
     private static func modificationDate(for url: URL) -> Date? {
         (try? FileManager.default.attributesOfItem(atPath: url.path)[.modificationDate]) as? Date
     }
+
+    private static func enrichedTerms(from terms: Set<String>) -> Set<String> {
+        var expanded = terms
+
+        for term in terms {
+            guard let additions = termExpansions[term] else {
+                continue
+            }
+
+            expanded.formUnion(additions)
+        }
+
+        return expanded
+    }
+
+    private static let termExpansions: [String: Set<String>] = [
+        "glioblastoma": ["gbm", "glioma", "oncology", "tumor", "cancer", "survival", "mutation", "expression", "tcga"],
+        "gbm": ["glioblastoma", "glioma", "oncology", "tumor", "cancer", "survival", "tcga"],
+        "glioma": ["glioblastoma", "gbm", "oncology", "tumor", "cancer", "survival"],
+        "neurosurgery": ["brain", "oncology", "clinical", "glioblastoma", "neuroscience"],
+        "neurosurgeon": ["brain", "oncology", "clinical", "glioblastoma", "neuroscience"],
+        "neuroscience": ["brain", "neuron", "glia", "cortex", "electrophysiology", "imaging", "atlas"],
+        "neural": ["brain", "neuron", "glia", "neuroscience"],
+        "brain": ["neuroscience", "neuron", "glia", "cortex", "atlas"],
+        "neuron": ["neuroscience", "brain", "electrophysiology", "morphology"],
+        "glia": ["astrocyte", "brain", "neuroscience", "transcriptomics"],
+        "astrocyte": ["glia", "brain", "single", "cell", "transcriptomics"],
+        "electrophysiology": ["neurophysiology", "spike", "nwb", "neuropixels", "dandiset"],
+        "neuropixels": ["electrophysiology", "neurophysiology", "spike", "brain"],
+        "fmri": ["brain", "neuroscience", "imaging"],
+        "genomics": ["gene", "expression", "mutation", "cohort", "transcriptomics"],
+        "transcriptomics": ["expression", "gene", "rna", "scrna", "single", "cell"],
+        "scrna": ["single", "cell", "transcriptomics", "atlas", "expression"],
+        "singlecell": ["single", "cell", "transcriptomics", "atlas", "expression"],
+        "proteomics": ["protein", "uniprot", "pathway", "biomarker"],
+        "astrophysics": ["astronomy", "telescope", "spectra", "photometry", "galaxy", "exoplanet", "stellar"],
+        "astronomy": ["astrophysics", "telescope", "spectra", "photometry", "galaxy", "exoplanet", "stellar"],
+        "jwst": ["mast", "telescope", "infrared", "spectra"],
+        "hubble": ["mast", "telescope", "imaging", "catalog"],
+        "tess": ["exoplanet", "transit", "photometry", "stellar"],
+        "exoplanet": ["planet", "transit", "tess", "kepler", "stellar", "archive"],
+        "galaxy": ["survey", "spectra", "photometry", "catalog", "stellar"],
+        "stellar": ["galaxy", "spectra", "photometry", "telescope"]
+    ]
 
     private static let stopwords: Set<String> = [
         "about", "after", "all", "also", "and", "any", "are", "because", "been", "before",

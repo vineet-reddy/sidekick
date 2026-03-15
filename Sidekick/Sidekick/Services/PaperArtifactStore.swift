@@ -208,6 +208,15 @@ enum PaperArtifactStore {
         )
     }
 
+    static func deleteArtifacts(for taskID: String) {
+        let directory = existingDirectoryURL(for: taskID)
+        guard FileManager.default.fileExists(atPath: directory.path) else {
+            return
+        }
+
+        try? FileManager.default.removeItem(at: directory)
+    }
+
     private static func submissionURL(for taskID: String) -> URL {
         directoryURL(for: taskID).appendingPathComponent("submission.json")
     }
@@ -229,15 +238,19 @@ enum PaperArtifactStore {
     }
 
     private static func directoryURL(for taskID: String) -> URL {
+        let taskURL = existingDirectoryURL(for: taskID)
+        try? FileManager.default.createDirectory(at: taskURL, withIntermediateDirectories: true)
+        return taskURL
+    }
+
+    private static func existingDirectoryURL(for taskID: String) -> URL {
         let baseURL = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
             .appendingPathComponent("PaperArtifacts", isDirectory: true)
 
         let key = storageKey(for: taskID)
-        let taskURL = baseURL.appendingPathComponent(key, isDirectory: true)
-        try? FileManager.default.createDirectory(at: taskURL, withIntermediateDirectories: true)
-        return taskURL
+        return baseURL.appendingPathComponent(key, isDirectory: true)
     }
 
     private static func storageKey(for taskID: String) -> String {

@@ -365,12 +365,31 @@ final class HeartbeatManager: ObservableObject {
         switch run.currentStage {
         case .plan:
             if PaperArtifactStore.stageArtifact(ResearchPlanArtifact.self, runID: run.runID, stage: .plan) != nil {
-                run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+                run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
                 try await advanceResearchRun(run, paper: paper, notes: notes)
                 return
             }
 
             try await executePlanStage(run, paper: paper, notes: notes)
+
+        case .inspect:
+            if PaperArtifactStore.stageArtifact(ResearchInspectionArtifact.self, runID: run.runID, stage: .inspect) != nil {
+                run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            guard let plan = PaperArtifactStore.stageArtifact(
+                ResearchPlanArtifact.self,
+                runID: run.runID,
+                stage: .plan
+            ) else {
+                run.markRunning(stage: .plan, message: ResearchRunStage.plan.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            try await executeInspectStage(run, paper: paper, notes: notes, plan: plan)
 
         case .analyze:
             if PaperArtifactStore.stageArtifact(ResearchAnalysisArtifact.self, runID: run.runID, stage: .analyze) != nil {
@@ -389,7 +408,23 @@ final class HeartbeatManager: ObservableObject {
                 return
             }
 
-            try await executeAnalyzeStage(run, paper: paper, notes: notes, plan: plan)
+            guard let inspection = PaperArtifactStore.stageArtifact(
+                ResearchInspectionArtifact.self,
+                runID: run.runID,
+                stage: .inspect
+            ) else {
+                run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            try await executeAnalyzeStage(
+                run,
+                paper: paper,
+                notes: notes,
+                plan: plan,
+                inspection: inspection
+            )
 
         case .write:
             guard let analysis = PaperArtifactStore.stageArtifact(
@@ -468,10 +503,92 @@ final class HeartbeatManager: ObservableObject {
             )
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .plan)
             print("[Heartbeat]   -> Plan stage completed for \(run.runID)")
-            run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+            run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
             handleResearchStageError(error, run: run, paper: paper, stage: .plan)
+        }
+    }
+
+    private func executeInspectStage(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact
+    ) async throws {
+        if let taskID = run.activeTaskID, !taskID.isEmpty {
+            let result = try await openAI.checkResearchInspectionTask(taskID)
+
+            switch result {
+            case let .waiting(snapshot):
+                persistTaskProgress(snapshot)
+                let message = snapshot.latestEventText ?? ResearchRunStage.inspect.title
+                run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
+
+                if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .inspect) {
+                    print("[Heartbeat]   -> Inspect stage stalled for \(run.runID); restarting from checkpoint.")
+                    run.activeTaskID = nil
+                    try await startResearchInspectionTask(run, paper: paper, notes: notes, plan: plan)
+                }
+
+            case let .completed(snapshot, artifact):
+                persistTaskProgress(snapshot)
+                try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
+                run.activeTaskID = nil
+                run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+                print("[Heartbeat]   -> Inspect stage completed for \(run.runID)")
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+
+            case let .failed(snapshot, message):
+                persistTaskProgress(snapshot)
+                run.activeTaskID = nil
+
+                if run.attemptCount(for: .inspect) < maxResearchStageAttempts {
+                    print("[Heartbeat]   -> Inspect stage failed for \(run.runID); retrying same stage.")
+                    try await startResearchInspectionTask(run, paper: paper, notes: notes, plan: plan)
+                } else {
+                    markResearchRunFailed(run, paper: paper, message: message)
+                }
+            }
+
+            return
+        }
+
+        try await startResearchInspectionTask(run, paper: paper, notes: notes, plan: plan)
+    }
+
+    private func startResearchInspectionTask(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact
+    ) async throws {
+        guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
+            markResearchRunFailed(
+                run,
+                paper: paper,
+                message: "Dataset inspection exceeded the retry budget."
+            )
+            return
+        }
+
+        run.incrementAttempt(for: .inspect)
+        run.markRunning(stage: .inspect, message: "Resolving and inspecting the dataset slice.")
+
+        do {
+            let taskID = try await openAI.startResearchInspectionTask(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                datasetIDs: run.datasetIDs,
+                allowedDomains: run.allowedDomains,
+                plan: plan
+            )
+            run.activeTaskID = taskID
+            run.updateProgress(message: "Remote dataset inspection is running.", at: .now)
+            print("[Heartbeat]   -> Inspect task started as \(taskID)")
+        } catch {
+            handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
         }
     }
 
@@ -479,7 +596,8 @@ final class HeartbeatManager: ObservableObject {
         _ run: ResearchRun,
         paper: Paper,
         notes: [Note],
-        plan: ResearchPlanArtifact
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact
     ) async throws {
         if let taskID = run.activeTaskID, !taskID.isEmpty {
             let result = try await openAI.checkResearchAnalysisTask(taskID)
@@ -490,10 +608,16 @@ final class HeartbeatManager: ObservableObject {
                 let message = snapshot.latestEventText ?? ResearchRunStage.analyze.title
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
 
-                if shouldRestartResearchAnalysis(run: run, snapshot: snapshot) {
+                if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .analyze) {
                     print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
-                    try await startResearchAnalysisTask(run, paper: paper, notes: notes, plan: plan)
+                    try await startResearchAnalysisTask(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        inspection: inspection
+                    )
                 }
 
             case let .completed(snapshot, artifact):
@@ -510,7 +634,13 @@ final class HeartbeatManager: ObservableObject {
 
                 if run.attemptCount(for: .analyze) < maxResearchStageAttempts {
                     print("[Heartbeat]   -> Analysis stage failed for \(run.runID); retrying same stage.")
-                    try await startResearchAnalysisTask(run, paper: paper, notes: notes, plan: plan)
+                    try await startResearchAnalysisTask(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        inspection: inspection
+                    )
                 } else {
                     markResearchRunFailed(run, paper: paper, message: message)
                 }
@@ -519,14 +649,21 @@ final class HeartbeatManager: ObservableObject {
             return
         }
 
-        try await startResearchAnalysisTask(run, paper: paper, notes: notes, plan: plan)
+        try await startResearchAnalysisTask(
+            run,
+            paper: paper,
+            notes: notes,
+            plan: plan,
+            inspection: inspection
+        )
     }
 
     private func startResearchAnalysisTask(
         _ run: ResearchRun,
         paper: Paper,
         notes: [Note],
-        plan: ResearchPlanArtifact
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact
     ) async throws {
         guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
             markResearchRunFailed(
@@ -547,7 +684,8 @@ final class HeartbeatManager: ObservableObject {
                 theme: run.theme,
                 datasetIDs: run.datasetIDs,
                 allowedDomains: run.allowedDomains,
-                plan: plan
+                plan: plan,
+                inspection: inspection
             )
             run.activeTaskID = taskID
             run.updateProgress(message: "Remote analysis is running.", at: .now)
@@ -628,11 +766,12 @@ final class HeartbeatManager: ObservableObject {
         print("[Heartbeat]   -> Research run complete for \(run.runID)")
     }
 
-    private func shouldRestartResearchAnalysis(
+    private func shouldRestartResearchTask(
         run: ResearchRun,
-        snapshot: PaperTaskProgressSnapshot
+        snapshot: PaperTaskProgressSnapshot,
+        stage: ResearchRunStage
     ) -> Bool {
-        guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
+        guard run.attemptCount(for: stage) < maxResearchStageAttempts else {
             return false
         }
 
@@ -790,6 +929,10 @@ final class HeartbeatManager: ObservableObject {
 
         if let plan = preparation.planArtifact {
             try PaperArtifactStore.persistStageArtifact(plan, runID: runID, stage: .plan)
+        }
+
+        if let inspection = preparation.inspectionArtifact {
+            try PaperArtifactStore.persistStageArtifact(inspection, runID: runID, stage: .inspect)
         }
 
         if let analysis = preparation.analysisArtifact {

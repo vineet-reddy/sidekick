@@ -6,6 +6,7 @@ struct NoteEditorView: View {
     @Environment(\.modelContext) private var modelContext
 
     @State private var content: String
+    @State private var isShowingDeleteConfirmation = false
     @FocusState private var isFocused: Bool
 
     let note: Note
@@ -35,6 +36,15 @@ struct NoteEditorView: View {
                 }
 
                 ToolbarItem(placement: .topBarTrailing) {
+                    Button(role: .destructive) {
+                        isShowingDeleteConfirmation = true
+                    } label: {
+                        Image(systemName: "trash")
+                    }
+                    .accessibilityLabel("Delete note")
+                }
+
+                ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") {
                         save()
                     }
@@ -44,6 +54,17 @@ struct NoteEditorView: View {
             }
             .onAppear {
                 isFocused = true
+            }
+            .confirmationDialog(
+                "Delete this note?",
+                isPresented: $isShowingDeleteConfirmation,
+                titleVisibility: .visible
+            ) {
+                Button("Delete Note", role: .destructive) {
+                    delete()
+                }
+            } message: {
+                Text("The note will be removed from Sidekick. Existing papers stay available, but generating runs that depended on only this note will stop.")
             }
         }
     }
@@ -58,6 +79,11 @@ struct NoteEditorView: View {
         note.content = trimmed
         note.updatedAt = .now
         try? modelContext.save()
+        dismiss()
+    }
+
+    private func delete() {
+        try? ContentDeletionService.deleteNote(note, modelContext: modelContext)
         dismiss()
     }
 }

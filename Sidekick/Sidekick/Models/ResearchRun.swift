@@ -3,6 +3,7 @@ import SwiftData
 
 enum ResearchRunStage: String, Codable, CaseIterable {
     case plan
+    case inspect
     case analyze
     case write
     case typeset
@@ -11,6 +12,8 @@ enum ResearchRunStage: String, Codable, CaseIterable {
         switch self {
         case .plan:
             return "Planning"
+        case .inspect:
+            return "Inspecting data"
         case .analyze:
             return "Running analysis"
         case .write:
@@ -331,6 +334,20 @@ nonisolated struct ResearchDatasetManifest: Codable {
     }
 }
 
+nonisolated struct ResearchInspectionArtifact: Codable {
+    let datasetManifest: ResearchDatasetManifest
+    let accessNotes: String
+    let qualityChecks: [String]
+    let analysisChecklist: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case datasetManifest = "dataset_manifest"
+        case accessNotes = "access_notes"
+        case qualityChecks = "quality_checks"
+        case analysisChecklist = "analysis_checklist"
+    }
+}
+
 nonisolated struct ResearchFinding: Codable {
     let claim: String
     let estimate: String
@@ -407,8 +424,15 @@ nonisolated struct ResearchRunPreparation {
     let allowedDomains: [String]
     let registryVersion: Int
     let planArtifact: ResearchPlanArtifact?
+    let inspectionArtifact: ResearchInspectionArtifact?
     let analysisArtifact: ResearchAnalysisArtifact?
     let draftArtifact: ResearchDraftArtifact?
+}
+
+nonisolated enum ResearchInspectionTaskCheckResult {
+    case waiting(PaperTaskProgressSnapshot)
+    case completed(PaperTaskProgressSnapshot, ResearchInspectionArtifact)
+    case failed(PaperTaskProgressSnapshot, String)
 }
 
 nonisolated enum ResearchAnalysisTaskCheckResult {

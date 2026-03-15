@@ -207,7 +207,6 @@ struct NoteListView: View {
     }
 
     private func delete(_ note: Note) {
-        modelContext.delete(note)
-        try? modelContext.save()
+        try? ContentDeletionService.deleteNote(note, modelContext: modelContext)
     }
 }

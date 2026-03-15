@@ -2,6 +2,7 @@ import SwiftData
 import SwiftUI
 
 struct PaperListView: View {
+    @Environment(\.modelContext) private var modelContext
     @Query(sort: \Paper.createdAt, order: .reverse) private var papers: [Paper]
     @Query(sort: \ResearchRun.createdAt, order: .reverse) private var runs: [ResearchRun]
     @State private var path: [UUID] = []
@@ -28,6 +29,11 @@ struct PaperListView: View {
                                     paperCard(for: paper)
                                 }
                                 .buttonStyle(.plain)
+                                .contextMenu {
+                                    Button("Delete", role: .destructive) {
+                                        delete(paper)
+                                    }
+                                }
                             }
                         }
                         .padding(.horizontal, 20)
@@ -124,6 +130,11 @@ struct PaperListView: View {
         .glassCard(padding: 14)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("paper.card.\(paper.id.uuidString)")
+    }
+
+    private func delete(_ paper: Paper) {
+        try? ContentDeletionService.deletePaper(paper, modelContext: modelContext)
+        path.removeAll { $0 == paper.id }
     }
 
     @ViewBuilder
