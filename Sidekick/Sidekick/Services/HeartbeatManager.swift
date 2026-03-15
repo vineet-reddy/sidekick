@@ -389,6 +389,21 @@ final class HeartbeatManager: ObservableObject {
                 return
             }
 
+            if run.activeTaskID == nil, shouldRetryResponsesFallback(for: run) {
+                do {
+                    try await performInspectResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        incrementAttempt: false
+                    )
+                } catch {
+                    handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                }
+                return
+            }
+
             try await executeInspectStage(run, paper: paper, notes: notes, plan: plan)
 
         case .analyze:
@@ -415,6 +430,22 @@ final class HeartbeatManager: ObservableObject {
             ) else {
                 run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
                 try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            if run.activeTaskID == nil, shouldRetryResponsesFallback(for: run) {
+                do {
+                    try await performAnalyzeResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        inspection: inspection,
+                        incrementAttempt: false
+                    )
+                } catch {
+                    handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                }
                 return
             }
 
@@ -599,12 +630,48 @@ final class HeartbeatManager: ObservableObject {
             switch result {
             case let .waiting(snapshot):
                 persistTaskProgress(snapshot)
-                let message = snapshot.latestEventText ?? ResearchRunStage.inspect.title
+                let message = snapshot.latestEventText
+                    ?? run.latestProgressMessage
+                    ?? ResearchRunStage.inspect.title
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
+
+                if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
+                    print("[Heartbeat]   -> Inspect stage is attached to an incompatible repo environment; switching to responses fallback.")
+                    run.activeTaskID = nil
+
+                    do {
+                        try await performInspectResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                    }
+                    return
+                }
 
                 if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .inspect) {
                     print("[Heartbeat]   -> Inspect stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
+
+                    if shouldUseResponsesFallback(for: snapshot) {
+                        do {
+                            try await performInspectResponsesFallback(
+                                run,
+                                paper: paper,
+                                notes: notes,
+                                plan: plan,
+                                incrementAttempt: true
+                            )
+                        } catch {
+                            handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                        }
+                        return
+                    }
+
                     try await startResearchInspectionTask(run, paper: paper, notes: notes, plan: plan)
                 }
 
@@ -665,6 +732,21 @@ final class HeartbeatManager: ObservableObject {
             run.updateProgress(message: "Remote dataset inspection is running.", at: .now)
             print("[Heartbeat]   -> Inspect task started as \(taskID)")
         } catch {
+            if shouldUseResponsesFallback(after: error) {
+                do {
+                    try await performInspectResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        incrementAttempt: false
+                    )
+                } catch {
+                    handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                }
+                return
+            }
+
             handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
         }
     }
@@ -682,12 +764,50 @@ final class HeartbeatManager: ObservableObject {
             switch result {
             case let .waiting(snapshot):
                 persistTaskProgress(snapshot)
-                let message = snapshot.latestEventText ?? ResearchRunStage.analyze.title
+                let message = snapshot.latestEventText
+                    ?? run.latestProgressMessage
+                    ?? ResearchRunStage.analyze.title
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
+
+                if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
+                    print("[Heartbeat]   -> Analysis stage is attached to an incompatible repo environment; switching to responses fallback.")
+                    run.activeTaskID = nil
+
+                    do {
+                        try await performAnalyzeResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                    }
+                    return
+                }
 
                 if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .analyze) {
                     print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
+
+                    if shouldUseResponsesFallback(for: snapshot) {
+                        do {
+                            try await performAnalyzeResponsesFallback(
+                                run,
+                                paper: paper,
+                                notes: notes,
+                                plan: plan,
+                                inspection: inspection,
+                                incrementAttempt: true
+                            )
+                        } catch {
+                            handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                        }
+                        return
+                    }
+
                     try await startResearchAnalysisTask(
                         run,
                         paper: paper,
@@ -768,6 +888,22 @@ final class HeartbeatManager: ObservableObject {
             run.updateProgress(message: "Remote analysis is running.", at: .now)
             print("[Heartbeat]   -> Analysis task started as \(taskID)")
         } catch {
+            if shouldUseResponsesFallback(after: error) {
+                do {
+                    try await performAnalyzeResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        inspection: inspection,
+                        incrementAttempt: false
+                    )
+                } catch {
+                    handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                }
+                return
+            }
+
             handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
         }
     }
@@ -890,6 +1026,117 @@ final class HeartbeatManager: ObservableObject {
         print("[Heartbeat]   -> Research run complete for \(run.runID)")
     }
 
+    private func performInspectResponsesFallback(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact,
+        incrementAttempt: Bool
+    ) async throws {
+        if incrementAttempt {
+            guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
+                markResearchRunFailed(
+                    run,
+                    paper: paper,
+                    message: "Dataset inspection exceeded the retry budget."
+                )
+                return
+            }
+            run.incrementAttempt(for: .inspect)
+        }
+
+        run.activeTaskID = nil
+        run.markRunning(stage: .inspect, message: "Inspecting the cohort via staged responses fallback.")
+
+        do {
+            let artifact = try await openAI.runResearchInspectionFallback(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                datasetIDs: run.datasetIDs,
+                plan: plan
+            )
+
+            try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
+            run.activeTaskID = nil
+            run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+            print("[Heartbeat]   -> Inspect fallback completed for \(run.runID)")
+            try await advanceResearchRun(run, paper: paper, notes: notes)
+        } catch {
+            guard shouldUseBundledResearchTaskFallback(after: error) else {
+                throw error
+            }
+
+            let taskID = try await openAI.startBundledResearchInspectionTask(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                datasetIDs: run.datasetIDs,
+                plan: plan
+            )
+            run.activeTaskID = taskID
+            run.updateProgress(message: "Remote bundled inspection is running.", at: .now)
+            print("[Heartbeat]   -> Inspect bundled fallback task started as \(taskID)")
+        }
+    }
+
+    private func performAnalyzeResponsesFallback(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact,
+        incrementAttempt: Bool
+    ) async throws {
+        if incrementAttempt {
+            guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
+                markResearchRunFailed(
+                    run,
+                    paper: paper,
+                    message: "Analysis exceeded the retry budget."
+                )
+                return
+            }
+            run.incrementAttempt(for: .analyze)
+        }
+
+        run.activeTaskID = nil
+        run.markRunning(stage: .analyze, message: "Running analysis via staged responses fallback.")
+
+        do {
+            let artifact = try await openAI.runResearchAnalysisFallback(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                datasetIDs: run.datasetIDs,
+                plan: plan,
+                inspection: inspection
+            )
+
+            try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
+            run.activeTaskID = nil
+            run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+            print("[Heartbeat]   -> Analysis fallback completed for \(run.runID)")
+            try await advanceResearchRun(run, paper: paper, notes: notes)
+        } catch {
+            guard shouldUseBundledResearchTaskFallback(after: error) else {
+                throw error
+            }
+
+            let taskID = try await openAI.startBundledResearchAnalysisTask(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                datasetIDs: run.datasetIDs,
+                plan: plan,
+                inspection: inspection
+            )
+            run.activeTaskID = taskID
+            run.updateProgress(message: "Remote bundled analysis is running.", at: .now)
+            print("[Heartbeat]   -> Analysis bundled fallback task started as \(taskID)")
+        }
+    }
+
     private func shouldRestartResearchTask(
         run: ResearchRun,
         snapshot: PaperTaskProgressSnapshot,
@@ -913,6 +1160,68 @@ final class HeartbeatManager: ObservableObject {
 
         return taskAge >= remoteRetryGracePeriod
             && (snapshot.outputCharacterCount == 0 || progressAge >= stalledEventGracePeriod)
+    }
+
+    private func shouldUseResponsesFallback(for snapshot: PaperTaskProgressSnapshot) -> Bool {
+        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let normalizedStatus = snapshot.status.lowercased()
+
+        return ["pending", "queued", "in_progress", "incomplete"].contains(normalizedStatus)
+            && snapshot.outputCharacterCount == 0
+            && latestEvent.isEmpty
+    }
+
+    private func shouldUseResponsesFallbackImmediately(
+        run: ResearchRun,
+        snapshot: PaperTaskProgressSnapshot
+    ) -> Bool {
+        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let normalizedLabel = snapshot.environmentLabel?.lowercased() ?? ""
+        let normalizedStatus = snapshot.status.lowercased()
+        let latestProgress = run.latestProgressMessage?.lowercased() ?? ""
+
+        return ["pending", "queued", "in_progress", "incomplete"].contains(normalizedStatus)
+            && snapshot.outputCharacterCount == 0
+            && latestEvent.isEmpty
+            && normalizedLabel.contains("/")
+            && !normalizedLabel.contains("sidekick")
+            && !latestProgress.contains("bundled")
+    }
+
+    private func shouldUseResponsesFallback(after error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        let indicators = [
+            "no usable codex cloud environment",
+            "repo_not_accessible",
+            "repository is not accessible"
+        ]
+
+        return indicators.contains(where: message.contains)
+    }
+
+    private func shouldRetryResponsesFallback(for run: ResearchRun) -> Bool {
+        let message = run.lastError?.lowercased() ?? ""
+        let indicators = [
+            "unsupported tool type: code_interpreter",
+            "not found",
+            "missing scopes: api.responses.write",
+            "insufficient permissions",
+            "prompt exceeds 100000 characters"
+        ]
+
+        return indicators.contains(where: message.contains)
+    }
+
+    private func shouldUseBundledResearchTaskFallback(after error: Error) -> Bool {
+        let message = error.localizedDescription.lowercased()
+        let indicators = [
+            "unsupported tool type: code_interpreter",
+            "missing scopes: api.responses.write",
+            "insufficient permissions",
+            "not found"
+        ]
+
+        return indicators.contains(where: message.contains)
     }
 
     private func handleResearchStageError(

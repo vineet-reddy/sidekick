@@ -46,10 +46,12 @@ final class OpenAIService: ObservableObject {
     private let auth: AuthService
     private let session: URLSession
     private let backendBaseURL = URL(string: "https://chatgpt.com/backend-api")!
+    private let apiBaseURL = URL(string: "https://api.openai.com/v1")!
     private let originator = "codex_cli_rs"
     private let modelRouter = OpenAIModelRouter()
     private let environmentRouter = OpenAIEnvironmentRouter()
     private let trustedDatasets: TrustedDatasetRegistry
+    private let stageFallback: ResearchStageFallbackService
 
     init(
         auth: AuthService,
@@ -60,6 +62,7 @@ final class OpenAIService: ObservableObject {
         self.session = session
         let registry = trustedDatasets ?? TrustedDatasetRegistry(session: session)
         self.trustedDatasets = registry
+        stageFallback = ResearchStageFallbackService(session: session)
 
         Task {
             await registry.refreshIfNeeded()
@@ -414,6 +417,171 @@ final class OpenAIService: ObservableObject {
         return try await createTask(prompt: prompt)
     }
 
+    func runResearchInspectionFallback(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        plan: ResearchPlanArtifact
+    ) async throws -> ResearchInspectionArtifact {
+        let noteTexts = notes.map(\.content)
+        guard let fallback = try await stageFallback.inspectionInput(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            theme: theme
+        ) else {
+            throw ServiceError.taskFailed("No staged responses fallback is available for this dataset slice yet.")
+        }
+
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            limit: 4
+        )
+        let datasetCards = selectedDatasets.isEmpty
+            ? "- No trusted dataset cards were resolved for this run."
+            : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .inspect)
+        let notesBody = notes.map { note in
+            "- [\(note.id.uuidString)] \(note.content)"
+        }.joined(separator: "\n\n")
+
+        let instructions = """
+        You are a research scientist using Code Interpreter.
+        A thin local orchestrator has already fetched a narrow public cohort slice from a trusted source.
+        Inspect only that supplied bundle. Do not widen the cohort, do not switch studies, and do not run the final analysis yet.
+
+        Return strict JSON only with this exact shape:
+        {
+          "dataset_manifest": {
+            "primary_dataset_ids": ["trusted-dataset-id"],
+            "data_sources": ["string"],
+            "sample_description": "string",
+            "row_count": 123,
+            "selected_variables": ["string"],
+            "quality_notes": ["string"]
+          },
+          "access_notes": "string",
+          "quality_checks": ["string"],
+          "analysis_checklist": ["string"]
+        }
+
+        Requirements:
+        - Use Code Interpreter to validate and summarize the supplied bundle only.
+        - Keep the manifest anchored to the exact study ID, coverage counts, and variables present in the bundle.
+        - Prefer the strongest honest reachable slice over the broader original ambition.
+        - If MGMT is only available as continuous methylation values, state that explicitly rather than inventing a binary promoter annotation.
+        - `selected_variables` must contain exact field names from the supplied bundle.
+        - The final assistant message must contain only the JSON object and nothing before or after it.
+        """
+
+        let input = """
+        Suggested title: \(title)
+        Theme: \(theme)
+
+        Trusted dataset cards:
+        \(datasetCards)
+
+        Dataset-specific execution guardrails:
+        \(datasetGuidance)
+
+        Notes:
+        \(notesBody)
+
+        Research plan JSON:
+        \(prettyJSONString(plan))
+
+        Resolved public cohort bundle (\(fallback.providerLabel)) JSON:
+        \(fallback.promptJSON)
+        """
+
+        let response = try await createResponse(
+            for: .researchStageFallback,
+            tools: codeInterpreterTools(),
+            toolChoice: "required",
+            responseBaseURL: apiBaseURL,
+            instructions: instructions,
+            input: input
+        )
+
+        return try decodeStructuredPayload(ResearchInspectionArtifact.self, from: response.outputText)
+    }
+
+    func startBundledResearchInspectionTask(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        plan: ResearchPlanArtifact
+    ) async throws -> String {
+        let noteTexts = notes.map(\.content)
+        guard let fallback = try await stageFallback.inspectionInput(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            theme: theme
+        ) else {
+            throw ServiceError.taskFailed("No staged remote fallback is available for this inspection slice yet.")
+        }
+
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            limit: 4
+        )
+        let datasetCards = selectedDatasets.isEmpty
+            ? "- No trusted dataset cards were resolved for this run."
+            : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .inspect)
+        let notesBody = notes.map { note in
+            "- [\(note.id.uuidString)] \(note.content)"
+        }.joined(separator: "\n\n")
+
+        let prompt = """
+        You are a research scientist working inside a Codex task with Python available.
+        A thin local coordinator already fetched a narrow trusted public cohort bundle. Use only that supplied bundle.
+
+        Requirements:
+        1. Do not rely on repository files or repository context; the repo is irrelevant to this task.
+        2. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
+        3. Inspect the supplied bundle only and return strict JSON only with this exact shape:
+           {
+             "dataset_manifest": {
+               "primary_dataset_ids": ["trusted-dataset-id"],
+               "data_sources": ["string"],
+               "sample_description": "string",
+               "row_count": 123,
+               "selected_variables": ["string"],
+               "quality_notes": ["string"]
+             },
+             "access_notes": "string",
+             "quality_checks": ["string"],
+             "analysis_checklist": ["string"]
+           }
+        4. If MGMT is only available as continuous methylation values, say that explicitly instead of inventing a binary promoter status field.
+        5. The final assistant message must contain only the JSON object and nothing before or after it.
+
+        Suggested title: \(title)
+        Theme: \(theme)
+
+        Trusted dataset cards:
+        \(datasetCards)
+
+        Dataset-specific execution guardrails:
+        \(datasetGuidance)
+
+        Notes:
+        \(notesBody)
+
+        Research plan JSON:
+        \(prettyJSONString(plan))
+
+        Resolved public cohort bundle (\(fallback.providerLabel)) JSON:
+        \(fallback.promptJSON)
+        """
+
+        return try await createTask(prompt: prompt, preference: .selfContainedBundle)
+    }
+
     func startResearchInspectionTask(
         notes: [Note],
         title: String,
@@ -523,6 +691,224 @@ final class OpenAIService: ObservableObject {
 
         let artifact = try decodeStructuredPayload(ResearchAnalysisArtifact.self, from: task.outputText)
         return .completed(snapshot, artifact)
+    }
+
+    func runResearchAnalysisFallback(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact
+    ) async throws -> ResearchAnalysisArtifact {
+        let noteTexts = notes.map(\.content)
+        guard let fallback = try await stageFallback.bundledAnalysisInput(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            theme: theme
+        ) else {
+            throw ServiceError.taskFailed("No staged responses fallback is available for this analysis slice yet.")
+        }
+
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            limit: 4
+        )
+        let datasetCards = selectedDatasets.isEmpty
+            ? "- No trusted dataset cards were resolved for this run."
+            : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .analyze)
+        let notesBody = notes.map { note in
+            "- [\(note.id.uuidString)] \(note.content)"
+        }.joined(separator: "\n\n")
+
+        let instructions = """
+        You are a research scientist using Code Interpreter.
+        A thin local orchestrator has already fetched a narrow trusted public cohort slice and checkpointed the inspection artifact.
+        Analyze only the supplied cohort bundle. Do not widen the dataset, do not invent extra variables, and do not write the paper yet.
+
+        Return strict JSON only with this exact shape:
+        {
+          "dataset_manifest": {
+            "primary_dataset_ids": ["trusted-dataset-id"],
+            "data_sources": ["string"],
+            "sample_description": "string",
+            "row_count": 123,
+            "selected_variables": ["string"],
+            "quality_notes": ["string"]
+          },
+          "narrative_summary": "string",
+          "findings": [
+            {
+              "claim": "string",
+              "estimate": "string",
+              "uncertainty": "string",
+              "evidence": "string",
+              "supports_hypothesis": true
+            }
+          ],
+          "tables": [
+            {
+              "identifier": "table_1",
+              "title": "string",
+              "columns": ["string"],
+              "rows": [["string"]],
+              "notes": "string"
+            }
+          ],
+          "figures": [
+            {
+              "filename": "figure_1.png",
+              "caption": "string",
+              "mime_type": "image/png",
+              "base64_data": "base64 png bytes"
+            }
+          ],
+          "limitations": ["string"],
+          "provenance": {
+            "used_dataset_ids": ["trusted-dataset-id"],
+            "accessed_domains": ["domain"],
+            "left_trusted_set": false,
+            "external_sources": ["optional domain or source name"],
+            "notes": "short summary of data access and limits"
+          }
+        }
+
+        Requirements:
+        - Use Code Interpreter to analyze only the supplied bundle and generate any figure bytes included in the final JSON.
+        - Prefer one concrete public cohort analysis over speculative multi-source synthesis.
+        - Treat MGMT measurements exactly as represented in the bundle; do not relabel continuous methylation values as binary promoter status unless the data justify it.
+        - If the strongest trustworthy result is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
+        - `findings[].evidence` must cite exact counts, field names, subgroup definitions, or figure/table identifiers from this run.
+        - The final assistant message must contain only the JSON object and nothing before or after it.
+        """
+
+        let input = """
+        Suggested title: \(title)
+        Theme: \(theme)
+
+        Trusted dataset cards:
+        \(datasetCards)
+
+        Dataset-specific execution guardrails:
+        \(datasetGuidance)
+
+        Notes:
+        \(notesBody)
+
+        Research plan JSON:
+        \(prettyJSONString(plan))
+
+        Research inspection JSON:
+        \(stringify(inspectionPromptPayload(from: inspection)))
+
+        Resolved public cohort bundle (\(fallback.providerLabel)) JSON:
+        \(fallback.promptJSON)
+        """
+
+        let response = try await createResponse(
+            for: .researchStageFallback,
+            tools: codeInterpreterTools(),
+            toolChoice: "required",
+            responseBaseURL: apiBaseURL,
+            instructions: instructions,
+            input: input
+        )
+
+        return try decodeStructuredPayload(ResearchAnalysisArtifact.self, from: response.outputText)
+    }
+
+    func startBundledResearchAnalysisTask(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact
+    ) async throws -> String {
+        let noteTexts = notes.map(\.content)
+        guard let fallback = try await stageFallback.bundledAnalysisInput(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            theme: theme
+        ) else {
+            throw ServiceError.taskFailed("No staged remote fallback is available for this analysis slice yet.")
+        }
+
+        let compactHypotheses = plan.hypotheses.prefix(2).joined(separator: " | ")
+        let compactChecklist = inspection.analysisChecklist.prefix(4).joined(separator: " | ")
+
+        let prompt = """
+        You are a research scientist working inside a Codex task with Python available.
+        A thin local coordinator already fetched a narrow trusted public cohort bundle and checkpointed the inspection artifact. Analyze only that supplied bundle.
+
+        Requirements:
+        1. Do not rely on repository files or repository context; the repo is irrelevant to this task.
+        2. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
+        3. Use Python or equivalent computation inside the task to decode the supplied base64+zlib CSV payload and analyze that cohort only.
+        4. Return strict JSON only with this exact shape:
+           {
+             "dataset_manifest": {
+               "primary_dataset_ids": ["trusted-dataset-id"],
+               "data_sources": ["string"],
+               "sample_description": "string",
+               "row_count": 123,
+               "selected_variables": ["string"],
+               "quality_notes": ["string"]
+             },
+             "narrative_summary": "string",
+             "findings": [
+               {
+                 "claim": "string",
+                 "estimate": "string",
+                 "uncertainty": "string",
+                 "evidence": "string",
+                 "supports_hypothesis": true
+               }
+             ],
+             "tables": [
+               {
+                 "identifier": "table_1",
+                 "title": "string",
+                 "columns": ["string"],
+                 "rows": [["string"]],
+                 "notes": "string"
+               }
+             ],
+             "figures": [
+               {
+                 "filename": "figure_1.png",
+                 "caption": "string",
+                 "mime_type": "image/png",
+                 "base64_data": "base64 png bytes"
+               }
+             ],
+             "limitations": ["string"],
+             "provenance": {
+               "used_dataset_ids": ["trusted-dataset-id"],
+               "accessed_domains": ["domain"],
+               "left_trusted_set": false,
+               "external_sources": ["optional domain or source name"],
+               "notes": "short summary of data access and limits"
+             }
+           }
+        5. Treat MGMT measurements exactly as represented in the supplied bundle. Do not relabel continuous methylation values as a binary promoter status unless the data justify it.
+        6. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
+        7. The final assistant message must contain only the JSON object and nothing before or after it.
+
+        Suggested title: \(title)
+        Theme: \(theme)
+        Study question: \(plan.question)
+        Key hypotheses: \(compactHypotheses)
+        Inspection checklist: \(compactChecklist)
+
+        Resolved public cohort bundle (\(fallback.providerLabel)):
+        \(fallback.promptJSON)
+        """
+
+        log("startBundledResearchAnalysisTask prompt chars=\(prompt.count)")
+        return try await createTask(prompt: prompt, preference: .selfContainedBundle)
     }
 
     func verifyResearchAnalysis(
@@ -911,6 +1297,8 @@ final class OpenAIService: ObservableObject {
     private func createResponse(
         for workload: OpenAIWorkload,
         tools: [[String: Any]],
+        toolChoice: String = "auto",
+        responseBaseURL: URL? = nil,
         instructions: String,
         input: String
     ) async throws -> ResponseEnvelope {
@@ -925,7 +1313,7 @@ final class OpenAIService: ObservableObject {
                 "store": false,
                 "stream": true,
                 "tools": tools,
-                "tool_choice": "auto",
+                "tool_choice": toolChoice,
                 "parallel_tool_calls": false,
                 "include": [],
                 "input": [
@@ -943,6 +1331,7 @@ final class OpenAIService: ObservableObject {
 
             do {
                 let response = try await sendJSONRequest(
+                    baseURL: responseBaseURL ?? codexBaseURL,
                     pathComponents: ["responses"],
                     method: "POST",
                     body: body,
@@ -967,8 +1356,11 @@ final class OpenAIService: ObservableObject {
         )
     }
 
-    private func createTask(prompt: String) async throws -> String {
-        let environments = try await candidateEnvironments()
+    private func createTask(
+        prompt: String,
+        preference: CloudTaskEnvironmentPreference = .repositoryBound
+    ) async throws -> String {
+        let environments = try await candidateEnvironments(for: preference)
         let branch = resolvedTaskBranch()
         var lastError: Error?
         var skippedLabels: [String] = []
@@ -1058,17 +1450,29 @@ final class OpenAIService: ObservableObject {
         return environments
     }
 
-    private func candidateEnvironments() async throws -> [CloudTaskEnvironment] {
+    private func candidateEnvironments(
+        for preference: CloudTaskEnvironmentPreference
+    ) async throws -> [CloudTaskEnvironment] {
         let environments = try await fetchEnvironments()
-        let networkEnabled = environments.filter { $0.agentNetworkAccess?.mode?.lowercased() != "off" }
+        let candidates: [CloudTaskEnvironment]
 
-        var candidates = (networkEnabled.isEmpty ? environments : networkEnabled)
-            .sorted { environmentPriority($0) > environmentPriority($1) }
+        switch preference {
+        case .repositoryBound:
+            let networkEnabled = environments.filter { $0.agentNetworkAccess?.mode?.lowercased() != "off" }
+            var prioritized = (networkEnabled.isEmpty ? environments : networkEnabled)
+                .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
 
-        if let remembered = await environmentRouter.cached(),
-           let index = candidates.firstIndex(where: { $0.id == remembered.id }) {
-            let cached = candidates.remove(at: index)
-            candidates.insert(cached, at: 0)
+            if let remembered = await environmentRouter.cached(),
+               let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
+                let cached = prioritized.remove(at: index)
+                prioritized.insert(cached, at: 0)
+            }
+
+            candidates = prioritized
+
+        case .selfContainedBundle:
+            candidates = environments
+                .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
         }
 
         return candidates
@@ -1103,8 +1507,11 @@ final class OpenAIService: ObservableObject {
         return "main"
     }
 
-    private func environmentPriority(_ environment: CloudTaskEnvironment) -> Int {
-        var score = environment.taskCount ?? 0
+    private func environmentPriority(
+        _ environment: CloudTaskEnvironment,
+        for preference: CloudTaskEnvironmentPreference
+    ) -> Int {
+        var score = 0
 
         if environment.isPinned == true {
             score += 10_000
@@ -1112,27 +1519,40 @@ final class OpenAIService: ObservableObject {
 
         let mode = environment.agentNetworkAccess?.mode?.lowercased()
         if mode == "on" {
-            score += 1_000
+            score += preference == .repositoryBound ? 1_000 : 100
+        } else if mode == "off", preference == .selfContainedBundle {
+            score += 500
         }
 
         let preset = environment.agentNetworkAccess?.presetAllowlist?.lowercased()
-        if preset == "all" {
-            score += 100
-        } else if preset == "codex" {
-            score += 10
+        if preference == .repositoryBound {
+            if preset == "all" {
+                score += 100
+            } else if preset == "codex" {
+                score += 10
+            }
         }
+
+        let label = environment.label ?? ""
+        if preference == .selfContainedBundle, !label.contains("/") {
+            score += 5_000
+        }
+
+        // Prefer less-loaded environments when the coarse capabilities are otherwise similar.
+        score -= environment.taskCount ?? 0
 
         return score
     }
 
     private func sendJSONRequest(
+        baseURL: URL,
         pathComponents: [String],
         method: String,
         body: [String: Any]?,
         responseMode: ResponseStreamMode = .completed
     ) async throws -> ResponseEnvelope {
         let token = try await auth.validToken()
-        var request = URLRequest(url: endpoint(baseURL: codexBaseURL, path: pathComponents))
+        var request = URLRequest(url: endpoint(baseURL: baseURL, path: pathComponents))
         request.httpMethod = method
         applyAuthHeaders(to: &request, token: token)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -1511,6 +1931,17 @@ final class OpenAIService: ObservableObject {
         }
 
         return string
+    }
+
+    private func codeInterpreterTools() -> [[String: Any]] {
+        [
+            [
+                "type": "code_interpreter",
+                "container": [
+                    "type": "auto"
+                ]
+            ]
+        ]
     }
 
     private func decodeStructuredPayload<T: Decodable>(_ type: T.Type, from raw: String) throws -> T {
@@ -2009,6 +2440,7 @@ private enum ResponseStreamMode {
 private enum OpenAIWorkload {
     case noteAssessment
     case paperGeneration
+    case researchStageFallback
 
     nonisolated var description: String {
         switch self {
@@ -2016,6 +2448,8 @@ private enum OpenAIWorkload {
             return "note assessment"
         case .paperGeneration:
             return "paper generation"
+        case .researchStageFallback:
+            return "research stage fallback"
         }
     }
 
@@ -2025,6 +2459,8 @@ private enum OpenAIWorkload {
             return "noteAssessment"
         case .paperGeneration:
             return "paperGeneration"
+        case .researchStageFallback:
+            return "researchStageFallback"
         }
     }
 
@@ -2046,8 +2482,20 @@ private enum OpenAIWorkload {
                 "gpt-5.1-codex",
                 "gpt-5.4"
             ]
+        case .researchStageFallback:
+            return [
+                "gpt-5.4",
+                "gpt-5.1",
+                "gpt-5",
+                "gpt-5-mini"
+            ]
         }
     }
+}
+
+private enum CloudTaskEnvironmentPreference {
+    case repositoryBound
+    case selfContainedBundle
 }
 
 private struct BackendRequestFailure: LocalizedError {
