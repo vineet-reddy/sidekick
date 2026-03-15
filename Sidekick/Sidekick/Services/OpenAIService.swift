@@ -86,22 +86,47 @@ final class OpenAIService: ObservableObject {
         }
         let shortlistedDatasets = await trustedDatasets.assessmentShortlist(
             noteTexts: notes.map(\.content),
-            limit: 10
+            limit: 32
         )
         let datasetGuide = shortlistedDatasets.isEmpty
             ? "- No trusted dataset cards are currently loaded."
             : shortlistedDatasets.map { $0.assessmentLine() }.joined(separator: "\n")
 
         let systemInstructions = """
-        You are a research assistant. Group these notes into thematic clusters.
+        You are a research assistant. Group these notes into thematic research clusters.
         Be eager with clustering, but conservative about automatic paper generation.
 
+        Important note behavior assumptions:
+        - The notes may be fragmented, typo-heavy, rushed, half-written, or internally inconsistent.
+        - A single note may be too incomplete to stand alone but still become meaningful in combination with other notes.
+        - Infer the latent scientific question from the combination of notes rather than requiring one polished note.
+        - Do not require the notes to name a repository, portal, or dataset explicitly before choosing a fitting trusted dataset card.
+        - Treat speculative fragments like "maybe", "not sure", or rough confounder ideas as hints rather than mandatory title text.
+        - Prefer clusters that combine complementary fragments into one coherent empirical question.
+        - Avoid redundant singleton clusters when a stronger multi-note cluster captures the same idea.
+        - Each note should belong to at most one cluster unless a small overlap is truly indispensable; overlapping trusted_ready clusters are usually a mistake.
+        - Do not create multiple trusted_ready clusters from the same note pocket with only minor wording differences or alternate sub-questions.
+        - If one cluster already captures a note set, fold alternate angles into that cluster's question, methods, or hypotheses rather than spawning a second runnable cluster.
+        - If the inbox spans multiple unrelated domains, preserve them as separate clusters rather than collapsing everything into one dominant topic.
+        - Aim to account for the full inbox; unless notes are clearly redundant or uninterpretable, do not leave a coherent topical pocket unclustered.
+        - When one note gives the outcome and nearby notes add confounders, subgroup ideas, or practical constraints, prefer one richer multi-note cluster over multiple singleton clusters.
+        - A realistic scientist inbox often stores context across several messy notes; preserve that context inside the cluster instead of forcing every paper to map to one note.
+        - Prefer a single primary trusted dataset card when one card is sufficient for a strong first-pass paper; only include multiple dataset_ids when the notes clearly require cross-source validation or one source alone cannot answer the question.
+
         Readiness modes:
-        - trusted_ready: at least one trusted dataset card clearly fits; set is_ready to true
+        - trusted_ready: at least one trusted dataset card clearly fits and the notes support a bounded first-pass empirical analysis; set is_ready to true
         - trusted_partial: trusted data exists but the paper would be weak or incomplete; set is_ready to false
         - exploratory_ready: the idea likely needs unvetted external data; set is_ready to false
 
-        Use only dataset_ids from the trusted dataset cards below. Prefer at most 3 dataset_ids per cluster.
+        A cluster can still be trusted_ready when the notes are rough if a single trusted dataset card clearly supports a manageable study-, cohort-, atlas-, survey-, or table-level question.
+        A biology or neuroscience atlas cluster can still be trusted_ready when two or more messy notes jointly point to a concrete labeled-cell comparison, even if no single note is polished.
+
+        Use only dataset_ids from the trusted dataset cards below. Prefer at most 3 dataset_ids per cluster, and prefer 1 when possible.
+        `theme` and `suggestedTitle` should name the scientific question, variables, cohort, organism, or phenomenon.
+        Do not default to repository or dataset-brand names in `theme` or `suggestedTitle` unless they are genuinely required for clarity.
+        `suggestedTitle` should read like a plausible paper title or strong working title, not a dataset lookup or a literal note dump.
+        Keep `suggestedTitle` compact. Avoid exhaustive comma-separated covariate lists and avoid naming more than 3 speculative variables in the title.
+        When rushed notes mention a grab-bag of possible covariates, use an umbrella phrase such as clinical factors, functional measures, atlas composition, or observation metadata instead of echoing every candidate variable.
 
         Return strict JSON only with this shape:
         {
@@ -188,41 +213,6 @@ final class OpenAIService: ObservableObject {
         let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
         let registryVersion = await trustedDatasets.registryVersion()
 
-        if let localArtifacts = try await LocalPaperGenerationService.generateIfSupported(
-            title: title,
-            theme: theme,
-            noteTexts: noteTexts,
-            selectedDatasets: selectedDatasets,
-            session: session
-        ) {
-            return ResearchRunPreparation(
-                selectedDatasetIDs: selectedDatasets.map(\.id),
-                allowedDomains: allowedDomains,
-                registryVersion: registryVersion,
-                planArtifact: localPlanArtifact(
-                    title: title,
-                    theme: theme,
-                    selectedDatasets: selectedDatasets
-                ),
-                inspectionArtifact: localInspectionArtifact(
-                    selectedDatasets: selectedDatasets,
-                    artifacts: localArtifacts
-                ),
-                analysisArtifact: localAnalysisArtifact(
-                    selectedDatasets: selectedDatasets,
-                    artifacts: localArtifacts
-                ),
-                verificationArtifact: localVerificationArtifact(
-                    selectedDatasets: selectedDatasets,
-                    artifacts: localArtifacts
-                ),
-                draftArtifact: ResearchDraftArtifact(
-                    title: localArtifacts.title,
-                    markdown: localArtifacts.markdown
-                )
-            )
-        }
-
         return ResearchRunPreparation(
             selectedDatasetIDs: selectedDatasets.map(\.id),
             allowedDomains: allowedDomains,
@@ -249,6 +239,7 @@ final class OpenAIService: ObservableObject {
         let datasetCards = selectedDatasets.isEmpty
             ? "- No trusted dataset cards were resolved for this run."
             : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .plan)
         let notesBody = notes.map { note in
             [
                 "id": note.id.uuidString,
@@ -284,7 +275,13 @@ final class OpenAIService: ObservableObject {
 
         Requirements:
         - Use only the provided notes and trusted dataset cards.
-        - Keep the plan concise, empirical, and executable.
+        - The notes may be typo-heavy, fragmented, or only meaningful in combination; infer the strongest coherent empirical question from the whole note set rather than waiting for polished wording.
+        - Keep the plan concise, empirical, and executable on a first pass.
+        - Dataset-specific planning guardrails below are binding. If a guardrail says a variable, design element, or comparison must be confirmed first, keep it as a contingent risk or inspection target rather than committing to it in the main question, hypotheses, methods, or figure titles.
+        - Prefer one primary trusted dataset card when it is enough for a credible first-pass paper.
+        - When the notes imply a broader mechanistic ambition than the reachable slice supports, rewrite the plan around the strongest honest first-pass empirical question the dataset can really answer.
+        - Candidate methods must match the likely reachable slice; do not default to raw-data pipelines, large matrix reprocessing, or advanced models unless the trusted slice clearly supports them.
+        - Planned figures should be real figures that the expected slice can support now, not wishlist figures for a later deeper analysis.
         - Do not write the paper yet.
         """
 
@@ -294,6 +291,9 @@ final class OpenAIService: ObservableObject {
 
         Trusted dataset cards:
         \(datasetCards)
+
+        Dataset-specific planning guardrails:
+        \(datasetGuidance)
 
         Notes:
         \(stringify(notesBody))
@@ -319,6 +319,55 @@ final class OpenAIService: ObservableObject {
         inspection: ResearchInspectionArtifact,
         revisionRequest: ResearchVerificationArtifact? = nil
     ) async throws -> String {
+        let prompt = await researchAnalysisTaskPrompt(
+            notes: notes,
+            title: title,
+            theme: theme,
+            datasetIDs: datasetIDs,
+            allowedDomains: allowedDomains,
+            plan: plan,
+            inspection: inspection,
+            revisionRequest: revisionRequest
+        )
+
+        return try await createTask(prompt: prompt, preference: .networkedSelfContained)
+    }
+
+    func runNetworkedResearchAnalysisResponse(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        allowedDomains: [String],
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact? = nil
+    ) async throws -> ResearchAnalysisArtifact {
+        let prompt = await researchAnalysisTaskPrompt(
+            notes: notes,
+            title: title,
+            theme: theme,
+            datasetIDs: datasetIDs,
+            allowedDomains: allowedDomains,
+            plan: plan,
+            inspection: inspection,
+            revisionRequest: revisionRequest
+        )
+        let response = try await createResearchStageDirectResponse(prompt: prompt)
+        let artifact = try decodeStructuredPayload(ResearchAnalysisArtifact.self, from: response.outputText)
+        return try normalizedResearchAnalysisArtifact(artifact)
+    }
+
+    private func researchAnalysisTaskPrompt(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        allowedDomains: [String],
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact? = nil
+    ) async -> String {
         let selectedDatasets = await trustedDatasets.taskDatasetSelection(
             datasetIDs: datasetIDs,
             noteTexts: notes.map(\.content),
@@ -333,7 +382,7 @@ final class OpenAIService: ObservableObject {
             "- [\(note.id.uuidString)] \(note.content)"
         }.joined(separator: "\n\n")
 
-        let prompt = """
+        return """
         You are a research scientist using Code Interpreter.
         Run the empirical analysis only. The dataset inspection checkpoint has already happened. Do not write the paper yet.
 
@@ -397,6 +446,8 @@ final class OpenAIService: ObservableObject {
         12. The final assistant message must contain only the JSON object and nothing before or after it.
         13. If verification guidance is supplied below, address every required revision directly in the returned findings, tables, or limitations.
         14. Report sex distributions or explicitly explain why the supplied bundle cannot support them.
+        15. Do not abandon the inspected primary trusted source just because one access method failed; retry the same approved source with an alternate approved-domain client or endpoint before declaring it blocked.
+        16. If multiple trusted dataset cards are listed, keep one primary source and use a supporting source only if the inspected primary slice already yielded real usable data and a small targeted cross-check is genuinely necessary.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -422,8 +473,6 @@ final class OpenAIService: ObservableObject {
         \(stringify(verificationPromptPayload(from: $0)))
         """ } ?? "")
         """
-
-        return try await createTask(prompt: prompt)
     }
 
     func quarantineSelfContainedBundleEnvironment(_ environmentID: String?) async {
@@ -435,12 +484,33 @@ final class OpenAIService: ObservableObject {
         await environmentRouter.quarantine(environmentID, for: .selfContainedBundle)
     }
 
+    func quarantineNetworkedSelfContainedEnvironment(_ environmentID: String?) async {
+        guard let environmentID,
+              !environmentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        await environmentRouter.quarantine(environmentID, for: .networkedSelfContained)
+    }
+
     func supportsBundledResearchFallback(
         datasetIDs: [String],
         noteTexts: [String],
         theme: String
     ) async -> Bool {
         await stageFallback.supportsFallback(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            theme: theme
+        )
+    }
+
+    func prefersBundledResearchFallback(
+        datasetIDs: [String],
+        noteTexts: [String],
+        theme: String
+    ) async -> Bool {
+        await stageFallback.prefersPrimaryFallback(
             datasetIDs: datasetIDs,
             noteTexts: noteTexts,
             theme: theme
@@ -478,8 +548,8 @@ final class OpenAIService: ObservableObject {
 
         let instructions = """
         You are a research scientist using Code Interpreter.
-        A thin local orchestrator has already fetched a narrow public cohort slice from a trusted source.
-        Inspect only that supplied bundle. Do not widen the cohort, do not switch studies, and do not run the final analysis yet.
+        A thin local orchestrator has already fetched a narrow public research slice from a trusted source.
+        Inspect only that supplied bundle. Do not widen the slice, do not switch studies or collections, and do not run the final analysis yet.
 
         Return strict JSON only with this exact shape:
         {
@@ -497,12 +567,7 @@ final class OpenAIService: ObservableObject {
         }
 
         Requirements:
-        - Use Code Interpreter to validate and summarize the supplied bundle only.
-        - Keep the manifest anchored to the exact study ID, coverage counts, and variables present in the bundle.
-        - Prefer the strongest honest reachable slice over the broader original ambition.
-        - If MGMT is only available as continuous methylation values, state that explicitly rather than inventing a binary promoter annotation.
-        - `selected_variables` must contain exact field names from the supplied bundle.
-        - The final assistant message must contain only the JSON object and nothing before or after it.
+        \(bulletList(stagedFallbackInspectionRequirements(for: fallback.kind)))
         """
 
         let input = """
@@ -521,7 +586,7 @@ final class OpenAIService: ObservableObject {
         Research plan JSON:
         \(prettyJSONString(plan))
 
-        Resolved public cohort bundle (\(fallback.providerLabel)) JSON:
+        Resolved public research bundle (\(fallback.providerLabel)) JSON:
         \(fallback.promptJSON)
         """
 
@@ -541,6 +606,8 @@ final class OpenAIService: ObservableObject {
         plan: ResearchPlanArtifact
     ) async throws -> String {
         let noteTexts = notes.map(\.content)
+        let fallbackStart = Date()
+        log("startBundledResearchInspectionTask resolving fallback input. dataset_ids=\(datasetIDs)")
         guard let fallback = try await stageFallback.inspectionInput(
             datasetIDs: datasetIDs,
             noteTexts: noteTexts,
@@ -548,6 +615,11 @@ final class OpenAIService: ObservableObject {
         ) else {
             throw ServiceError.taskFailed("No staged remote fallback is available for this inspection slice yet.")
         }
+        let fallbackSeconds = Date().timeIntervalSince(fallbackStart)
+        log(
+            "startBundledResearchInspectionTask resolved fallback kind=\(fallback.kind.rawValue) " +
+                "bundle_chars=\(fallback.promptJSON.count) resolve_seconds=\(String(format: "%.2f", fallbackSeconds))"
+        )
 
         let selectedDatasets = await trustedDatasets.taskDatasetSelection(
             datasetIDs: datasetIDs,
@@ -564,31 +636,16 @@ final class OpenAIService: ObservableObject {
 
         let prompt = """
         You are a research scientist working inside a Codex task with Python available.
-        A thin local coordinator already fetched a narrow trusted public cohort bundle. Use only that supplied bundle.
+        A thin local coordinator already fetched a narrow trusted public research bundle. Use only that supplied bundle.
         Treat network access as unavailable for this task even if the environment technically exposes it.
 
         Requirements:
-        1. Do not rely on repository files or repository context; the repo is irrelevant to this task.
-        2. Do not make network requests, browse for external data, or hit live APIs. The supplied bundle is authoritative for this task.
-        3. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
-        4. Inspect the supplied bundle only and return strict JSON only with this exact shape:
-           {
-             "dataset_manifest": {
-               "primary_dataset_ids": ["trusted-dataset-id"],
-               "data_sources": ["string"],
-               "sample_description": "string",
-               "row_count": 123,
-               "selected_variables": ["string"],
-               "quality_notes": ["string"]
-             },
-             "access_notes": "string",
-             "quality_checks": ["string"],
-             "analysis_checklist": ["string"]
-           }
-        5. If MGMT is only available as continuous methylation values, say that explicitly instead of inventing a binary promoter status field.
-        6. If the supplied bundle lacks something you wanted to inspect, record that limitation in `quality_checks` instead of trying to fetch replacement data.
-        7. The final assistant message must contain only the JSON object and nothing before or after it.
+        \(numberedList(stagedFallbackBundledInspectionRequirements(for: fallback.kind, title: title, theme: theme), startingAt: 1))
 
+        \(stagedFallbackStructuredInspectionShape())
+        """
+
+        let input = """
         Suggested title: \(title)
         Theme: \(theme)
 
@@ -604,11 +661,13 @@ final class OpenAIService: ObservableObject {
         Research plan JSON:
         \(prettyJSONString(plan))
 
-        Resolved public cohort bundle (\(fallback.providerLabel)) JSON:
+        Resolved public research bundle (\(fallback.providerLabel)) JSON:
         \(fallback.promptJSON)
         """
 
-        return try await createTask(prompt: prompt, preference: .selfContainedBundle)
+        let fullPrompt = prompt + "\n\n" + input
+        log("startBundledResearchInspectionTask creating task prompt_chars=\(fullPrompt.count)")
+        return try await createTask(prompt: fullPrompt, preference: .selfContainedBundle)
     }
 
     func startResearchInspectionTask(
@@ -619,6 +678,46 @@ final class OpenAIService: ObservableObject {
         allowedDomains: [String],
         plan: ResearchPlanArtifact
     ) async throws -> String {
+        let prompt = await researchInspectionTaskPrompt(
+            notes: notes,
+            title: title,
+            theme: theme,
+            datasetIDs: datasetIDs,
+            allowedDomains: allowedDomains,
+            plan: plan
+        )
+
+        return try await createTask(prompt: prompt, preference: .networkedSelfContained)
+    }
+
+    func runNetworkedResearchInspectionResponse(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        allowedDomains: [String],
+        plan: ResearchPlanArtifact
+    ) async throws -> ResearchInspectionArtifact {
+        let prompt = await researchInspectionTaskPrompt(
+            notes: notes,
+            title: title,
+            theme: theme,
+            datasetIDs: datasetIDs,
+            allowedDomains: allowedDomains,
+            plan: plan
+        )
+        let response = try await createResearchStageDirectResponse(prompt: prompt)
+        return try decodeStructuredPayload(ResearchInspectionArtifact.self, from: response.outputText)
+    }
+
+    private func researchInspectionTaskPrompt(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        allowedDomains: [String],
+        plan: ResearchPlanArtifact
+    ) async -> String {
         let selectedDatasets = await trustedDatasets.taskDatasetSelection(
             datasetIDs: datasetIDs,
             noteTexts: notes.map(\.content),
@@ -633,7 +732,7 @@ final class OpenAIService: ObservableObject {
             "- [\(note.id.uuidString)] \(note.content)"
         }.joined(separator: "\n\n")
 
-        let prompt = """
+        return """
         You are a research scientist using Code Interpreter.
         Resolve the best reachable dataset slice and inspect it only. Do not run the final analysis yet.
 
@@ -660,7 +759,9 @@ final class OpenAIService: ObservableObject {
         7. Return exact dataset slice identifiers, study IDs, project IDs, collection IDs, or table names whenever the source exposes them.
         8. `selected_variables` must name real fields, endpoints, or metadata keys that were actually inspected.
         9. If the preferred source is only partially reachable, keep the strongest narrow slice from that source instead of switching domains silently.
-        10. The final assistant message must contain only the JSON object and nothing before or after it.
+        10. If the first HTTP client or shell tool hits a tunnel, proxy, or CONNECT-style denial, retry the same approved source with at least one alternate approved-domain access method before concluding the source is blocked.
+        11. If multiple trusted dataset cards are listed, choose one primary slice first and stay with it unless the notes explicitly require cross-source validation.
+        12. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -678,8 +779,6 @@ final class OpenAIService: ObservableObject {
         Research plan JSON:
         \(prettyJSONString(plan))
         """
-
-        return try await createTask(prompt: prompt)
     }
 
     func checkResearchInspectionTask(_ taskID: String) async throws -> ResearchInspectionTaskCheckResult {
@@ -755,8 +854,8 @@ final class OpenAIService: ObservableObject {
 
         let instructions = """
         You are a research scientist using Code Interpreter.
-        A thin local orchestrator has already fetched a narrow trusted public cohort slice and checkpointed the inspection artifact.
-        Analyze only the supplied cohort bundle. Do not widen the dataset, do not invent extra variables, do not make network requests, and do not write the paper yet.
+        A thin local orchestrator has already fetched a narrow trusted public research slice and checkpointed the inspection artifact.
+        Analyze only the supplied bundle. Do not widen the dataset slice, do not invent extra variables, do not make network requests, and do not write the paper yet.
 
         Return strict JSON only with this exact shape:
         {
@@ -806,31 +905,7 @@ final class OpenAIService: ObservableObject {
         }
 
         Requirements:
-        - Use Code Interpreter to decode and analyze only the supplied bundle and generate any figure bytes included in the final JSON.
-        - Do not contact GDC, cBioPortal, or any other external service. The supplied bundle is authoritative for this analysis pass.
-        - Prefer one concrete public cohort analysis over speculative multi-source synthesis.
-        - Treat MGMT measurements exactly as represented in the bundle; do not relabel continuous methylation values as binary promoter status unless the data justify it.
-        - If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png` with the corresponding risk table rendered beneath each requested panel when the cohort supports it; do not substitute a bar chart or median-only graphic.
-        - Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.
-        - The caption for `figure_1.png` must explicitly name the plotted stratifications and state whether the saved figure includes the risk table, so downstream verification can confirm the requirement from the checkpointed artifact.
-        - Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.
-        - Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
-        - Include a table or table note that reports the exact number of patients contributing to every Kaplan-Meier stratum shown in the saved figure and the exact complete-case sample size used for the Cox model.
-        - If HM27 and HM450 MGMT measurements are both present, report the exact count available from each assay and the exact merge rule used in the model.
-        - If the study question or verification guidance asks about sex-specific survival differences, sex distributions alone are insufficient; report an explicit sex effect estimate and/or a sex-stratified survival comparison from the supplied cohort.
-        - If harmonized MGMT measurements are available for the modeled cohort, include the harmonized MGMT term in the Cox model or report the exact complete-case loss and scientific reason that forced exclusion.
-        - Findings and results text must address every requested predictor that is available in the supplied bundle, including IDH1, EGFR, MGMT, age, and sex, or explicitly explain any omission in `limitations` or `quality_notes`.
-        - For each hazard ratio, make the modeled contrast explicit in the table or narrative. For sex and other binary predictors, name the reference group and ensure the interpretation matches the reported hazard ratio direction.
-        - If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
-        - If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
-        - If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
-        - Keep narrative claims directionally consistent with the reported estimates and confidence intervals; do not describe an effect as harmful or protective if the estimate and uncertainty do not support that wording.
-        - When a subgroup is small or the confidence interval is wide, qualify the claim explicitly in the narrative and limitations instead of stating a definitive benefit or harm.
-        - If the strongest trustworthy result is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        - `findings[].evidence` must cite exact counts, field names, subgroup definitions, or figure/table identifiers from this run.
-        - If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
-        - Report sex distributions or state explicitly why the supplied fields cannot support them.
-        - The final assistant message must contain only the JSON object and nothing before or after it.
+        \(bulletList(stagedFallbackAnalysisRequirements(for: fallback.kind)))
         """
 
         let input = """
@@ -857,7 +932,7 @@ final class OpenAIService: ObservableObject {
         \(stringify(verificationPromptPayload(from: $0)))
         """ } ?? "")
 
-        Resolved public cohort bundle (\(fallback.providerLabel)) JSON:
+        Resolved public research bundle (\(fallback.providerLabel)) JSON:
         \(fallback.promptJSON)
         """
 
@@ -893,84 +968,13 @@ final class OpenAIService: ObservableObject {
 
         let prompt = """
         You are a research scientist working inside a Codex task with Python available.
-        A thin local coordinator already fetched a narrow trusted public cohort bundle and checkpointed the inspection artifact. Analyze only that supplied bundle.
+        A thin local coordinator already fetched a narrow trusted public research bundle and checkpointed the inspection artifact. Analyze only that supplied bundle.
         Treat network access as unavailable for this task even if the environment technically exposes it.
 
         Requirements:
-        1. Do not rely on repository files or repository context; the repo is irrelevant to this task.
-        2. Do not make network requests, browse for external data, or hit live APIs. Do not contact GDC, cBioPortal, or any other external domain.
-        3. Do not widen the cohort, switch studies, or browse for replacement data unless the supplied bundle is malformed.
-        4. Use Python or equivalent computation inside the task to decode the supplied base64+zlib CSV payload and analyze that cohort only.
-        5. Return strict JSON only with this exact shape:
-           {
-             "dataset_manifest": {
-               "primary_dataset_ids": ["trusted-dataset-id"],
-               "data_sources": ["string"],
-               "sample_description": "string",
-               "row_count": 123,
-               "selected_variables": ["string"],
-               "quality_notes": ["string"]
-             },
-             "narrative_summary": "string",
-             "findings": [
-               {
-                 "claim": "string",
-                 "estimate": "string",
-                 "uncertainty": "string",
-                 "evidence": "string",
-                 "supports_hypothesis": true
-               }
-             ],
-             "tables": [
-               {
-                 "identifier": "table_1",
-                 "title": "string",
-                 "columns": ["string"],
-                 "rows": [["string"]],
-                 "notes": "string"
-               }
-             ],
-             "figures": [
-               {
-                 "filename": "figure_1.png",
-                 "caption": "string",
-                 "mime_type": "image/png",
-                 "base64_data": "base64 png bytes"
-               }
-             ],
-             "limitations": ["string"],
-             "provenance": {
-               "used_dataset_ids": ["trusted-dataset-id"],
-               "accessed_domains": ["domain"],
-               "left_trusted_set": false,
-               "external_sources": ["optional domain or source name"],
-               "notes": "short summary of data access and limits"
-             }
-           }
-        6. Treat MGMT measurements exactly as represented in the supplied bundle. Do not relabel continuous methylation values as a binary promoter status unless the data justify it.
-        7. If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png` with the corresponding risk table rendered beneath each requested panel when the cohort supports it; do not substitute a bar chart or median-only graphic.
-        8. Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.
-        9. The caption for `figure_1.png` must explicitly name the plotted stratifications and state whether the saved figure includes the risk table, so downstream verification can confirm the requirement from the checkpointed artifact.
-        10. Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.
-        11. Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
-        12. Include a table or table note that reports the exact number of patients contributing to every Kaplan-Meier stratum shown in the saved figure and the exact complete-case sample size used for the Cox model.
-        13. If HM27 and HM450 MGMT measurements are both present, report the exact count available from each assay and the exact merge rule used in the model.
-        14. If the study question or verification guidance asks about sex-specific survival differences, sex distributions alone are insufficient; report an explicit sex effect estimate and/or a sex-stratified survival comparison from the supplied cohort.
-        15. If harmonized MGMT measurements are available for the modeled cohort, include the harmonized MGMT term in the Cox model or report the exact complete-case loss and scientific reason that forced exclusion.
-        16. Findings and results text must address every requested predictor that is available in the supplied bundle, including IDH1, EGFR, MGMT, age, and sex, or explicitly explain any omission in `limitations` or `quality_notes`.
-        17. For each hazard ratio, make the modeled contrast explicit in the table or narrative. For sex and other binary predictors, name the reference group and ensure the interpretation matches the reported hazard ratio direction.
-        18. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
-        19. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
-        20. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
-        21. Keep narrative claims directionally consistent with the reported estimates and confidence intervals; do not describe an effect as harmful or protective if the estimate and uncertainty do not support that wording.
-        22. When a subgroup is small or the confidence interval is wide, qualify the claim explicitly in the narrative and limitations instead of stating a definitive benefit or harm.
-        23. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        24. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
-        25. Report sex distributions or explicitly explain why the supplied fields cannot support them.
-        26. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
-        27. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
-        28. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
-        29. The final assistant message must contain only the JSON object and nothing before or after it.
+        \(numberedList(stagedFallbackBundledAnalysisRequirements(for: fallback.kind), startingAt: 1))
+
+        \(stagedFallbackStructuredAnalysisShape())
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -983,7 +987,7 @@ final class OpenAIService: ObservableObject {
         \(stringify(verificationPromptPayload(from: $0)))
         """ } ?? "")
 
-        Resolved public cohort bundle (\(fallback.providerLabel)):
+        Resolved public research bundle (\(fallback.providerLabel)):
         \(fallback.promptJSON)
         """
 
@@ -1148,22 +1152,6 @@ final class OpenAIService: ObservableObject {
         let registryVersion = await trustedDatasets.registryVersion()
         let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
 
-        if let localArtifacts = try await LocalPaperGenerationService.generateIfSupported(
-            title: title,
-            theme: theme,
-            noteTexts: notes.map(\.content),
-            selectedDatasets: selectedDatasets,
-            session: session
-        ) {
-            return PaperTaskSubmission(
-                taskID: "local-\(UUID().uuidString)",
-                selectedDatasetIDs: selectedDatasets.map(\.id),
-                allowedDomains: allowedDomains,
-                registryVersion: registryVersion,
-                precomputedArtifacts: localArtifacts
-            )
-        }
-
         let systemInstructions = """
         You are a research scientist using Code Interpreter.
         Create a real research paper from the notes below.
@@ -1231,29 +1219,7 @@ final class OpenAIService: ObservableObject {
             taskID: taskID,
             selectedDatasetIDs: selectedDatasets.map(\.id),
             allowedDomains: allowedDomains,
-            registryVersion: registryVersion,
-            precomputedArtifacts: nil
-        )
-    }
-
-    func generateLocalPaperIfSupported(
-        title: String,
-        theme: String,
-        noteTexts: [String],
-        datasetIDs: [String]
-    ) async throws -> PaperArtifacts? {
-        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
-            datasetIDs: datasetIDs,
-            noteTexts: noteTexts,
-            limit: 4
-        )
-
-        return try await LocalPaperGenerationService.generateIfSupported(
-            title: title,
-            theme: theme,
-            noteTexts: noteTexts,
-            selectedDatasets: selectedDatasets,
-            session: session
+            registryVersion: registryVersion
         )
     }
 
@@ -1454,49 +1420,73 @@ final class OpenAIService: ObservableObject {
     ) async throws -> ResponseEnvelope {
         let candidates = await modelRouter.candidates(for: workload)
         var unsupportedMessages: [String] = []
+        let retryDelays: [Duration] = [.seconds(1), .seconds(2)]
 
         for model in candidates {
-            log("createResponse starting. workload=\(workload.description) model=\(model) tool_count=\(tools.count)")
-            let body: [String: Any] = [
-                "model": model,
-                "instructions": instructions,
-                "store": false,
-                "stream": true,
-                "tools": tools,
-                "tool_choice": toolChoice,
-                "parallel_tool_calls": false,
-                "include": [],
-                "input": [
-                    [
-                        "role": "user",
-                        "content": [
-                            [
-                                "type": "input_text",
-                                "text": input
+            for attempt in 0 ... retryDelays.count {
+                log(
+                    "createResponse starting. workload=\(workload.description) model=\(model) " +
+                        "tool_count=\(tools.count) attempt=\(attempt + 1)"
+                )
+                let body: [String: Any] = [
+                    "model": model,
+                    "instructions": instructions,
+                    "store": false,
+                    "stream": true,
+                    "tools": tools,
+                    "tool_choice": toolChoice,
+                    "parallel_tool_calls": false,
+                    "include": [],
+                    "input": [
+                        [
+                            "role": "user",
+                            "content": [
+                                [
+                                    "type": "input_text",
+                                    "text": input
+                                ]
                             ]
                         ]
                     ]
                 ]
-            ]
 
-            do {
-                let response = try await sendJSONRequest(
-                    baseURL: responseBaseURL ?? codexBaseURL,
-                    pathComponents: ["responses"],
-                    method: "POST",
-                    body: body,
-                    responseMode: .completed
-                )
-                log("createResponse succeeded. workload=\(workload.description) model=\(model) status=\(response.status)")
-                await modelRouter.remember(model: model, for: workload)
-                return response
-            } catch {
-                log("createResponse failed. workload=\(workload.description) model=\(model) error=\(String(describing: error))")
-                guard let retryMessage = retryableModelSelectionMessage(from: error) else {
-                    throw error
+                do {
+                    let response = try await sendJSONRequest(
+                        baseURL: responseBaseURL ?? codexBaseURL,
+                        pathComponents: ["responses"],
+                        method: "POST",
+                        body: body,
+                        responseMode: .completed
+                    )
+                    log(
+                        "createResponse succeeded. workload=\(workload.description) model=\(model) " +
+                            "status=\(response.status) attempt=\(attempt + 1)"
+                    )
+                    await modelRouter.remember(model: model, for: workload)
+                    return response
+                } catch {
+                    log(
+                        "createResponse failed. workload=\(workload.description) model=\(model) " +
+                            "attempt=\(attempt + 1) error=\(String(describing: error))"
+                    )
+                    if let retryMessage = retryableModelSelectionMessage(from: error) {
+                        unsupportedMessages.append("\(model): \(retryMessage)")
+                        break
+                    }
+
+                    guard attempt < retryDelays.count,
+                          shouldRetryCreateResponse(after: error) else {
+                        throw error
+                    }
+
+                    let delay = retryDelays[attempt]
+                    log(
+                        "createResponse retrying same model after transient failure. " +
+                            "workload=\(workload.description) model=\(model) " +
+                            "next_attempt=\(attempt + 2) delay_seconds=\(delay.components.seconds)"
+                    )
+                    try? await Task.sleep(for: delay)
                 }
-
-                unsupportedMessages.append("\(model): \(retryMessage)")
             }
         }
 
@@ -1559,12 +1549,49 @@ final class OpenAIService: ObservableObject {
         }
     }
 
+    private func createResearchStageDirectResponse(prompt: String) async throws -> ResponseEnvelope {
+        let instructions = """
+        You are a research scientist using Code Interpreter.
+        Follow the full user specification exactly.
+        Return only the requested structured JSON artifact and nothing else.
+        """
+
+        do {
+            return try await createResponse(
+                for: .researchStageFallback,
+                tools: codeInterpreterTools(),
+                toolChoice: "required",
+                responseBaseURL: apiBaseURL,
+                instructions: instructions,
+                input: prompt
+            )
+        } catch {
+            guard shouldRetryResearchStageFallbackResponse(after: error) else {
+                throw error
+            }
+
+            log(
+                "createResearchStageDirectResponse retrying via ChatGPT backend /codex/responses " +
+                    "after api failure: \(String(describing: error))"
+            )
+
+            return try await createResponse(
+                for: .researchStageFallback,
+                tools: codeInterpreterTools(),
+                toolChoice: "required",
+                responseBaseURL: codexBaseURL,
+                instructions: instructions,
+                input: prompt
+            )
+        }
+    }
+
     private func createTask(
         prompt: String,
         preference: CloudTaskEnvironmentPreference = .repositoryBound
     ) async throws -> String {
         let environments = try await candidateEnvironments(for: preference)
-        let branch = resolvedTaskBranch()
+        let branch = taskBranch(for: preference)
         var lastError: Error?
         var skippedLabels: [String] = []
 
@@ -1623,6 +1650,11 @@ final class OpenAIService: ObservableObject {
         }
 
         throw lastError ?? ServiceError.missingTaskID
+    }
+
+    private func taskBranch(for _: CloudTaskEnvironmentPreference) -> String {
+        // The current task backend requires a branch for every task creation request.
+        return resolvedTaskBranch()
     }
 
     private func fetchTask(taskID: String) async throws -> CloudTaskDetails {
@@ -1691,6 +1723,19 @@ final class OpenAIService: ObservableObject {
             }
 
             candidates = prioritized
+
+        case .networkedSelfContained:
+            let networkEnabled = environmentPool.filter { $0.agentNetworkAccess?.mode?.lowercased() == "on" }
+            var prioritized = (networkEnabled.isEmpty ? environmentPool : networkEnabled)
+                .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
+
+            if let remembered = await environmentRouter.cached(for: preference),
+               let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
+                let cached = prioritized.remove(at: index)
+                prioritized.insert(cached, at: 0)
+            }
+
+            candidates = prioritized
         }
 
         return candidates
@@ -1739,7 +1784,8 @@ final class OpenAIService: ObservableObject {
         let preset = environment.agentNetworkAccess?.presetAllowlist?.lowercased()
         let label = environment.label ?? ""
 
-        if preference == .repositoryBound {
+        switch preference {
+        case .repositoryBound:
             if mode == "on" {
                 score += 1_000
             }
@@ -1748,7 +1794,8 @@ final class OpenAIService: ObservableObject {
             } else if preset == "codex" {
                 score += 10
             }
-        } else {
+
+        case .selfContainedBundle:
             if environment.hasPythonRuntime {
                 score += 5_000
             } else {
@@ -1771,6 +1818,31 @@ final class OpenAIService: ObservableObject {
                 score -= 100
             } else {
                 score += 25
+            }
+
+        case .networkedSelfContained:
+            if environment.hasPythonRuntime {
+                score += 7_000
+            } else {
+                score -= 7_000
+            }
+
+            if mode == "on" {
+                score += 8_000
+            } else if mode == "off" {
+                score -= 8_000
+            }
+
+            if preset == "all" {
+                score += 150
+            } else if preset == "codex" {
+                score += 75
+            }
+
+            if label.contains("/") {
+                score -= 250
+            } else {
+                score += 50
             }
         }
 
@@ -1942,9 +2014,7 @@ final class OpenAIService: ObservableObject {
         let events = try decodeStreamedEvents(from: dataLines, joinedPayload: payload)
 
         for event in events {
-            if event.type == "response.output_text.delta" {
-                log("stream event=response.output_text.delta chars=\(event.delta?.count ?? 0)")
-            } else {
+            if event.type != "response.output_text.delta" {
                 log("stream event=\(event.type)")
             }
 
@@ -2239,151 +2309,6 @@ final class OpenAIService: ObservableObject {
         }
     }
 
-    private func localPlanArtifact(
-        title: String,
-        theme: String,
-        selectedDatasets: [TrustedDataset]
-    ) -> ResearchPlanArtifact {
-        let datasetNeeds = selectedDatasets.map { dataset in
-            ResearchDatasetNeed(
-                datasetID: dataset.id,
-                role: "primary",
-                variables: ["Diabetes_012", "HighBP", "BMI", "PhysActivity", "GenHlth"],
-                rationale: "The BRFSS validation slice uses this trusted dataset for diabetes prevalence summaries and logistic regression."
-            )
-        }
-
-        return ResearchPlanArtifact(
-            question: theme.isEmpty ? title : theme,
-            hypotheses: [
-                "The note cluster can be evaluated with a BRFSS-based empirical wedge.",
-                "Cardiometabolic and self-reported health measures should explain meaningful variation in diagnosed diabetes."
-            ],
-            datasetNeeds: datasetNeeds,
-            candidateMethods: [
-                "Cross-sectional prevalence summaries.",
-                "Logistic regression for diagnosed diabetes using hypertension, BMI, physical activity, and general health."
-            ],
-            plannedFigures: [
-                ResearchFigurePlan(
-                    identifier: "figure_1",
-                    title: "Diabetes prevalence by BMI category",
-                    purpose: "Show the cross-sectional relationship between BMI strata and diagnosed diabetes."
-                ),
-                ResearchFigurePlan(
-                    identifier: "figure_2",
-                    title: "Adjusted odds ratios from logistic regression",
-                    purpose: "Summarize the multivariable regression estimates."
-                )
-            ],
-            risks: [
-                "The local BRFSS slice is a validation wedge, not the intended general-purpose architecture."
-            ],
-            executionNotes: "Used the trusted BRFSS slice to preserve the working empirical loop while staged remote runs are introduced."
-        )
-    }
-
-    private func localInspectionArtifact(
-        selectedDatasets: [TrustedDataset],
-        artifacts: PaperArtifacts
-    ) -> ResearchInspectionArtifact {
-        let analysis = localAnalysisArtifact(selectedDatasets: selectedDatasets, artifacts: artifacts)
-
-        return ResearchInspectionArtifact(
-            datasetManifest: analysis.datasetManifest,
-            accessNotes: artifacts.provenance?.notes ?? "The trusted BRFSS mirror was resolved locally and inspected before the validation analysis.",
-            qualityChecks: [
-                "The local validation wedge resolved one trusted public-health dataset and a compact predictor set.",
-                "This manifest is synthesized from the local BRFSS path so the staged pipeline keeps a consistent checkpoint shape."
-            ],
-            analysisChecklist: [
-                "Quantify sample size and prevalence across the selected outcome and predictor strata.",
-                "Fit the planned regression model and carry the finished figures into the final paper bundle."
-            ]
-        )
-    }
-
-    private func localAnalysisArtifact(
-        selectedDatasets: [TrustedDataset],
-        artifacts: PaperArtifacts
-    ) -> ResearchAnalysisArtifact {
-        let figures = artifacts.figures.enumerated().map { index, figureData in
-            ResearchFigureArtifact(
-                filename: "figure_\(index + 1).png",
-                caption: "Local BRFSS validation figure \(index + 1)",
-                mimeType: "image/png",
-                base64Data: figureData.base64EncodedString()
-            )
-        }
-
-        return ResearchAnalysisArtifact(
-            datasetManifest: ResearchDatasetManifest(
-                primaryDatasetIDs: selectedDatasets.map(\.id),
-                dataSources: selectedDatasets.map(\.title),
-                sampleDescription: artifacts.provenance?.notes ?? "Local BRFSS validation slice executed successfully.",
-                rowCount: nil,
-                selectedVariables: ["Diabetes_012", "HighBP", "BMI", "PhysActivity", "GenHlth"],
-                qualityNotes: [
-                    "The local BRFSS wedge stores the finished figures and paper artifact first; typed coefficient tables can be expanded later."
-                ]
-            ),
-            narrativeSummary: "A trusted BRFSS dataset was analyzed locally to preserve the working empirical slice while the staged remote architecture is introduced.",
-            findings: [
-                ResearchFinding(
-                    claim: "The BRFSS validation wedge completed successfully.",
-                    estimate: "See the finalized paper body for computed estimates.",
-                    uncertainty: "The finished paper reports the uncertainty directly.",
-                    evidence: "The local fallback generated a ready paper and figures from trusted data.",
-                    supportsHypothesis: nil
-                )
-            ],
-            tables: [],
-            figures: figures,
-            limitations: [
-                "The local fallback remains BRFSS-specific and should not become the primary architecture.",
-                "This first staged version persists the finished local artifact bundle before exposing richer typed local tables."
-            ],
-            provenance: artifacts.provenance ?? TaskOutputProvenance(
-                usedDatasetIDs: selectedDatasets.map(\.id),
-                accessedDomains: TrustedDatasetRegistry.allowedDomains(for: selectedDatasets),
-                leftTrustedSet: false,
-                externalSources: [],
-                notes: "Local BRFSS validation slice."
-            )
-        )
-    }
-
-    private func localVerificationArtifact(
-        selectedDatasets: [TrustedDataset],
-        artifacts: PaperArtifacts
-    ) -> ResearchVerificationArtifact {
-        let figureChecks = artifacts.figures.enumerated().map { index, _ in
-            ResearchFigureSanityCheck(
-                filename: "figure_\(index + 1).png",
-                status: "ok",
-                issue: "The local BRFSS validation path produced this figure successfully."
-            )
-        }
-
-        return ResearchVerificationArtifact(
-            decision: .proceed,
-            summary: "The BRFSS validation wedge produced a coherent dataset manifest, completed analysis artifact, and reusable figures, so drafting can proceed.",
-            supportedClaims: [
-                "The BRFSS validation wedge completed an empirical analysis using a trusted public dataset.",
-                "The finalized paper may report prevalence and regression outputs that are already grounded in the stored BRFSS artifacts."
-            ],
-            weakOrUnsupportedClaims: [
-                "This local validation path should not be generalized as the long-term architecture for non-BRFSS datasets."
-            ],
-            figureSanityChecks: figureChecks,
-            modelWarnings: [
-                "The local BRFSS wedge remains a validation slice and does not replace staged remote dataset execution."
-            ],
-            sampleWarnings: [],
-            requiredRevisions: []
-        )
-    }
-
     private func inspectionPromptPayload(from inspection: ResearchInspectionArtifact) -> [String: Any] {
         [
             "dataset_manifest": [
@@ -2512,6 +2437,9 @@ final class OpenAIService: ObservableObject {
 
         if !datasetIDs.isDisjoint(with: ["nci-gdc-api", "cbioportal-public"]) {
             switch stage {
+            case .plan:
+                lines.append("- For neuro-oncology or glioblastoma notes, keep the first-pass plan inside one public cohort such as TCGA-GBM or one public cBioPortal GBM study.")
+                lines.append("- Phrase the question around cohort-level survival associations, molecular subgroup coverage, or clinical covariates that the public slice can really support on a first pass.")
             case .inspect:
                 lines.append("- For neuro-oncology or glioblastoma notes, prefer one public cohort only: TCGA-GBM in GDC or one public GBM study in cBioPortal.")
                 lines.append("- Return the exact project ID or study ID you inspected, plus the clinical, mutation, expression, or survival fields that were actually reachable.")
@@ -2525,23 +2453,60 @@ final class OpenAIService: ObservableObject {
 
         if !datasetIDs.isDisjoint(with: ["dandi-api", "allen-brain-atlas-api", "neuromorpho-api", "cellxgene-discover"]) {
             switch stage {
+            case .plan:
+                lines.append("- For neuroscience atlas or single-cell notes, rewrite broad mechanistic ideas into the strongest first-pass question that curated metadata, labeled cell populations, donor counts, and study-level fields can support.")
+                lines.append("- Do not plan differential expression, pathway enrichment, or latent-module work unless the reachable slice clearly includes ready-to-analyze expression statistics; atlas composition, lineage coverage, and timepoint coverage are safer first-pass questions.")
             case .inspect:
                 lines.append("- Choose one dandiset, atlas, morphology slice, or single-cell collection and return the exact collection identifier or atlas family you inspected.")
                 lines.append("- Inspect only manageable metadata or study-level fields first; do not imply that large raw NWB matrices or image volumes were downloaded.")
+                lines.append("- If only collection metadata and schema labels are reachable, make that explicit and keep the run grounded in donor, cell-count, lineage-label, tissue, and timepoint coverage.")
             case .analyze:
                 lines.append("- Keep neuroscience analyses at the study, cohort, cell-type, brain-region, or collection level unless the inspected slice clearly supports more.")
                 lines.append("- Report concrete counts such as donors, cells, reconstructions, sessions, or assets before making functional claims.")
+                lines.append("- Do not claim differential expression, shared programs, or pathway enrichment from CELLxGENE metadata-only slices unless the inspected artifact actually contains those statistics.")
+            }
+        }
+
+        if datasetIDs.contains("cellxgene-discover") {
+            switch stage {
+            case .plan:
+                lines.append("- For CELLxGENE specifically, do not assume that per-cell tables, lesion-edge covariates, or donor-level paired statistics are reachable before inspection resolves one concrete collection and confirms those fields.")
+                lines.append("- Until inspection confirms richer fields, phrase the first pass as atlas composition, label coverage, injury-related annotation coverage, or lineage representation rather than pseudo cell-level reanalysis.")
+            case .inspect:
+                lines.append("- For CELLxGENE, explicitly record whether lesion or edge labels, donor identifiers, injury timepoints, and glial subtype labels are present in the resolved collection.")
+                lines.append("- If the reachable slice is only collection metadata plus schema categories, say so plainly and do not imply hidden per-cell tables.")
+            case .analyze:
+                lines.append("- For CELLxGENE rescue analyses, keep claims at the collection, subdataset, schema-label, or atlas-composition level unless inspection proved that richer per-cell metadata were actually available.")
             }
         }
 
         if !datasetIDs.isDisjoint(with: ["mast-observations", "nasa-exoplanet-archive"]) {
             switch stage {
+            case .plan:
+                lines.append("- For astronomy archive notes, keep the first-pass plan at the observation metadata or catalog-table level: filter names, exposure times, proposal counts, targets, missions, or table summaries.")
+                lines.append("- Do not plan raw-image reduction, photometric extraction, or bespoke calibration pipelines unless the inspected slice explicitly supports them.")
             case .inspect:
                 lines.append("- Resolve one archive table, mission, target set, or observation slice and return its exact name in the manifest.")
                 lines.append("- Keep the inspection to catalog metadata, observation summaries, or mission-linked tables rather than broad archive crawling.")
+                lines.append("- Preserve proposal, instrument, filter, exposure-time, and target fields when they are available because they often become the actual first-pass analysis surface.")
             case .analyze:
                 lines.append("- Favor mission-scoped catalog summaries, transit/host-star comparisons, or observation-count analyses with explicit row counts.")
                 lines.append("- Avoid implying custom raw-image or pixel-level reduction pipelines unless the inspected slice explicitly supported them.")
+                lines.append("- Proposal-level or table-level summaries are acceptable when they preserve the contextual variables needed for the actual question.")
+            }
+        }
+
+        if datasetIDs.contains("brfss-2015-github-mirror") {
+            switch stage {
+            case .plan:
+                lines.append("- For the BRFSS diabetes mirror, keep the first pass inside one cross-sectional public mirror and phrase the question around likely reachable variables such as diabetes diagnosis, BMI, hypertension, self-rated health, physical activity, difficulty walking, age, sex, education, and income.")
+                lines.append("- Do not commit to sleep analyses, survey-weighted design inference, race or geography effects, or year trends before inspection confirms those columns.")
+            case .inspect:
+                lines.append("- Inspect the exact mirror columns and outcome coding first, then report only the variables that are actually reachable.")
+                lines.append("- Explicitly record whether sleep, survey weights, PSU or strata fields, race or ethnicity, geography, and year are absent so later stages do not imply them.")
+            case .analyze:
+                lines.append("- Keep the analysis cross-sectional and restricted to variables confirmed during inspection.")
+                lines.append("- If sleep or survey-design fields are absent, prefer unweighted models or descriptive comparisons using the confirmed subset rather than pretending those fields existed.")
             }
         }
 
@@ -2550,6 +2515,192 @@ final class OpenAIService: ObservableObject {
         }
 
         return lines.joined(separator: "\n")
+    }
+
+    private func stagedFallbackInspectionRequirements(
+        for kind: ResearchStageFallbackKind
+    ) -> [String] {
+        var lines = [
+            "Use Code Interpreter to validate and summarize the supplied bundle only.",
+            "Keep the manifest anchored to the exact study, collection, archive slice, coverage counts, and variables present in the bundle.",
+            "Prefer the strongest honest reachable slice over the broader original ambition.",
+            "If the supplied bundle lacks something you wanted to inspect, record that limitation in `quality_checks` instead of trying to fetch replacement data.",
+            "`selected_variables` must contain exact field names from the supplied bundle.",
+            "The final assistant message must contain only the JSON object and nothing before or after it."
+        ]
+
+        switch kind {
+        case .gbmCBioPortal:
+            lines.append("If MGMT is only available as continuous methylation values, state that explicitly rather than inventing a binary promoter annotation.")
+        case .mastObservations:
+            lines.append("Treat the supplied proposal, filter, exposure-time, and preview metadata as the authoritative MAST slice; do not imply raw image downloads or pixel-level reduction.")
+            lines.append("Keep `analysis_checklist` focused on exposure-time comparisons, filter-band coverage, proposal context, and any missing proposal or target metadata.")
+        case .cellxgeneAtlas:
+            lines.append("Treat the supplied collection metadata, subdataset counts, and schema categories as authoritative for this inspection pass.")
+            lines.append("Do not claim gene-level differential expression, module discovery, or pathway enrichment unless the bundle explicitly includes those statistics.")
+            lines.append("Keep `analysis_checklist` focused on atlas composition, donor coverage, injury timepoints, lineage labels, and other metadata-level comparisons that the bundle can support.")
+        }
+
+        return lines
+    }
+
+    private func stagedFallbackBundledInspectionRequirements(
+        for kind: ResearchStageFallbackKind,
+        title _: String,
+        theme _: String
+    ) -> [String] {
+        var lines = [
+            "Do not rely on repository files or repository context; the repo is irrelevant to this task.",
+            "Do not make network requests, browse for external data, or hit live APIs. The supplied bundle is authoritative for this task.",
+            "Do not widen the slice, switch studies or collections, or browse for replacement data unless the supplied bundle is malformed.",
+            "Inspect the supplied bundle only and follow the structured JSON schema below."
+        ]
+        lines.append(contentsOf: stagedFallbackInspectionRequirements(for: kind))
+        return lines
+    }
+
+    private func stagedFallbackAnalysisRequirements(
+        for kind: ResearchStageFallbackKind
+    ) -> [String] {
+        var lines = [
+            "Use Code Interpreter to decode and analyze only the supplied bundle and generate any figure bytes included in the final JSON.",
+            "Do not contact external services. The supplied bundle is authoritative for this analysis pass.",
+            "Prefer one concrete public dataset slice analysis over speculative multi-source synthesis.",
+            "Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.",
+            "Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.",
+            "Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.",
+            "`findings[].evidence` must cite exact counts, field names, subgroup definitions, or figure/table identifiers from this run.",
+            "If the strongest trustworthy result is descriptive or limited, return that instead of stalling.",
+            "If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.",
+            "If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.",
+            "The final assistant message must contain only the JSON object and nothing before or after it."
+        ]
+
+        switch kind {
+        case .gbmCBioPortal:
+            lines.append("Treat MGMT measurements exactly as represented in the bundle; do not relabel continuous methylation values as a binary promoter status unless the data justify it.")
+            lines.append("If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png` with the corresponding risk table rendered beneath each requested panel when the cohort supports it; do not substitute a bar chart or median-only graphic.")
+            lines.append("The caption for `figure_1.png` must explicitly name the plotted stratifications and state whether the saved figure includes the risk table, so downstream verification can confirm the requirement from the checkpointed artifact.")
+            lines.append("Include a table or table note that reports the exact number of patients contributing to every Kaplan-Meier stratum shown in the saved figure and the exact complete-case sample size used for the Cox model.")
+            lines.append("If HM27 and HM450 MGMT measurements are both present, report the exact count available from each assay and the exact merge rule used in the model.")
+            lines.append("If the study question or verification guidance asks about sex-specific survival differences, sex distributions alone are insufficient; report an explicit sex effect estimate and/or a sex-stratified survival comparison from the supplied cohort.")
+            lines.append("Findings and results text must address every requested predictor that is available in the supplied bundle, including IDH1, EGFR, MGMT, age, and sex, or explicitly explain any omission in `limitations` or `quality_notes`.")
+            lines.append("For each hazard ratio, make the modeled contrast explicit in the table or narrative. For sex and other binary predictors, name the reference group and ensure the interpretation matches the reported hazard ratio direction.")
+            lines.append("If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.")
+            lines.append("If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.")
+            lines.append("If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.")
+            lines.append("Keep narrative claims directionally consistent with the reported estimates and confidence intervals; do not describe an effect as harmful or protective if the estimate and uncertainty do not support that wording.")
+        case .mastObservations:
+            lines.append("Analyze the supplied proposal-filter summary table and preview metadata only; do not imply raw-image downloads or pixel-level reduction.")
+            lines.append("Treat F225W, F275W, and F336W as ultraviolet filters and F438W, F555W, F606W, and F814W as optical filters unless the supplied bundle explicitly says otherwise.")
+            lines.append("Generate a real `figure_1.png` comparing ultraviolet and optical exposure-time distributions or proposal-level medians from the supplied metadata.")
+            lines.append("Report exact observation counts, proposal counts, and exposure summaries by filter band and by filter when the bundle supports them.")
+            lines.append("If proposal-level summaries are available, prefer proposal-aware comparisons over naive pooled statements; if proposal IDs are missing, quantify that limitation.")
+            lines.append("Keep astronomy claims associative and metadata-based; do not turn archive exposure-time differences into causal instrument-performance claims.")
+        case .cellxgeneAtlas:
+            lines.append("Analyze the supplied collection metadata, subdataset counts, and schema categories only; do not download matrices or claim gene-level differential expression, shared transcriptional programs, or pathway enrichment unless the bundle explicitly includes those statistics.")
+            lines.append("Frame the first-pass result as atlas composition or coverage: donor count, disease labels, injury timepoints, subdataset cell counts, and glial label availability.")
+            lines.append("Generate a real `figure_1.png` summarizing atlas composition or glial coverage from the supplied counts or category lists.")
+            lines.append("Report exact counts for major subdatasets and note the presence of reactive astrocyte and oligodendrocyte-lineage labels and injury timepoints when they are present.")
+            lines.append("If the notes ask about shared glial programs, state clearly that the metadata slice supports comparative atlas coverage but not direct program quantification.")
+        }
+
+        return lines
+    }
+
+    private func stagedFallbackBundledAnalysisRequirements(
+        for kind: ResearchStageFallbackKind
+    ) -> [String] {
+        var lines = [
+            "Do not rely on repository files or repository context; the repo is irrelevant to this task.",
+            "Do not make network requests, browse for external data, or hit live APIs. The supplied bundle is authoritative for this task.",
+            "Do not widen the slice, switch studies or collections, or browse for replacement data unless the supplied bundle is malformed.",
+            "Use Python or equivalent computation inside the task to decode and analyze the supplied bundle, including any base64+zlib CSV payloads when present.",
+            "Return strict JSON only with the exact shape shown below.",
+            "Set `provenance.accessed_domains` and `provenance.external_sources` to empty lists unless you truly used an external domain, which you must not do in this task."
+        ]
+        lines.append(contentsOf: stagedFallbackAnalysisRequirements(for: kind))
+        return lines
+    }
+
+    private func stagedFallbackStructuredInspectionShape() -> String {
+        """
+        Return strict JSON only with this exact shape:
+        {
+          "dataset_manifest": {
+            "primary_dataset_ids": ["trusted-dataset-id"],
+            "data_sources": ["string"],
+            "sample_description": "string",
+            "row_count": 123,
+            "selected_variables": ["string"],
+            "quality_notes": ["string"]
+          },
+          "access_notes": "string",
+          "quality_checks": ["string"],
+          "analysis_checklist": ["string"]
+        }
+        """
+    }
+
+    private func stagedFallbackStructuredAnalysisShape() -> String {
+        """
+        Return strict JSON only with this exact shape:
+        {
+          "dataset_manifest": {
+            "primary_dataset_ids": ["trusted-dataset-id"],
+            "data_sources": ["string"],
+            "sample_description": "string",
+            "row_count": 123,
+            "selected_variables": ["string"],
+            "quality_notes": ["string"]
+          },
+          "narrative_summary": "string",
+          "findings": [
+            {
+              "claim": "string",
+              "estimate": "string",
+              "uncertainty": "string",
+              "evidence": "string",
+              "supports_hypothesis": true
+            }
+          ],
+          "tables": [
+            {
+              "identifier": "table_1",
+              "title": "string",
+              "columns": ["string"],
+              "rows": [["string"]],
+              "notes": "string"
+            }
+          ],
+          "figures": [
+            {
+              "filename": "figure_1.png",
+              "caption": "string",
+              "mime_type": "image/png",
+              "base64_data": "base64 png bytes"
+            }
+          ],
+          "limitations": ["string"],
+          "provenance": {
+            "used_dataset_ids": ["trusted-dataset-id"],
+            "accessed_domains": ["domain"],
+            "left_trusted_set": false,
+            "external_sources": ["optional domain or source name"],
+            "notes": "short summary of data access and limits"
+          }
+        }
+        """
+    }
+
+    private func bulletList(_ lines: [String]) -> String {
+        lines.map { "- \($0)" }.joined(separator: "\n")
+    }
+
+    private func numberedList(_ lines: [String], startingAt start: Int) -> String {
+        lines.enumerated()
+            .map { "\(start + $0.offset). \($0.element)" }
+            .joined(separator: "\n")
     }
 
     private func normalizedJSONData(from raw: String) -> Data? {
@@ -2652,6 +2803,39 @@ final class OpenAIService: ObservableObject {
         ]
 
         return retryableIndicators.contains(where: normalized.contains) ? message : nil
+    }
+
+    private func shouldRetryCreateResponse(after error: Error) -> Bool {
+        if error is URLError {
+            return true
+        }
+
+        guard case let ServiceError.taskFailed(message) = error else {
+            return false
+        }
+
+        let normalized = message.lowercased()
+        let retryableIndicators = [
+            "server had an error processing your request",
+            "internal server error",
+            "server error",
+            "service unavailable",
+            "temporarily unavailable",
+            "temporarily busy",
+            "overloaded",
+            "rate limit",
+            "timeout",
+            "timed out",
+            "connection reset",
+            "connection lost",
+            "network connection was lost",
+            "bad gateway",
+            "gateway timeout",
+            "openai stream closed before the response completed",
+            "openai response was incomplete"
+        ]
+
+        return retryableIndicators.contains(where: normalized.contains)
     }
 
     private func shouldRetryResearchStageFallbackResponse(after error: Error) -> Bool {
@@ -2763,6 +2947,7 @@ final class OpenAIService: ObservableObject {
 }
 
 private enum DatasetExecutionStage {
+    case plan
     case inspect
     case analyze
 }
@@ -2831,6 +3016,7 @@ private enum OpenAIWorkload {
 private enum CloudTaskEnvironmentPreference {
     case repositoryBound
     case selfContainedBundle
+    case networkedSelfContained
 }
 
 private struct BackendRequestFailure: LocalizedError {
@@ -2872,8 +3058,10 @@ private actor OpenAIModelRouter {
 private actor OpenAIEnvironmentRouter {
     private var repositoryBoundEnvironment: CloudTaskEnvironment?
     private var selfContainedBundleEnvironment: CloudTaskEnvironment?
+    private var networkedSelfContainedEnvironment: CloudTaskEnvironment?
     private var repositoryBoundQuarantine: [String: Date] = [:]
     private var selfContainedBundleQuarantine: [String: Date] = [:]
+    private var networkedSelfContainedQuarantine: [String: Date] = [:]
 
     func cached(for preference: CloudTaskEnvironmentPreference) -> CloudTaskEnvironment? {
         switch preference {
@@ -2881,6 +3069,8 @@ private actor OpenAIEnvironmentRouter {
             return repositoryBoundEnvironment
         case .selfContainedBundle:
             return selfContainedBundleEnvironment
+        case .networkedSelfContained:
+            return networkedSelfContainedEnvironment
         }
     }
 
@@ -2890,6 +3080,8 @@ private actor OpenAIEnvironmentRouter {
             repositoryBoundEnvironment = environment
         case .selfContainedBundle:
             selfContainedBundleEnvironment = environment
+        case .networkedSelfContained:
+            networkedSelfContainedEnvironment = environment
         }
     }
 
@@ -2911,6 +3103,11 @@ private actor OpenAIEnvironmentRouter {
             if selfContainedBundleEnvironment?.id == environmentID {
                 selfContainedBundleEnvironment = nil
             }
+        case .networkedSelfContained:
+            networkedSelfContainedQuarantine[environmentID] = Date().addingTimeInterval(duration)
+            if networkedSelfContainedEnvironment?.id == environmentID {
+                networkedSelfContainedEnvironment = nil
+            }
         }
     }
 
@@ -2922,12 +3119,15 @@ private actor OpenAIEnvironmentRouter {
             return Set(repositoryBoundQuarantine.keys)
         case .selfContainedBundle:
             return Set(selfContainedBundleQuarantine.keys)
+        case .networkedSelfContained:
+            return Set(networkedSelfContainedQuarantine.keys)
         }
     }
 
     private func pruneExpiredQuarantines(now: Date) {
         repositoryBoundQuarantine = repositoryBoundQuarantine.filter { $0.value > now }
         selfContainedBundleQuarantine = selfContainedBundleQuarantine.filter { $0.value > now }
+        networkedSelfContainedQuarantine = networkedSelfContainedQuarantine.filter { $0.value > now }
     }
 }
 

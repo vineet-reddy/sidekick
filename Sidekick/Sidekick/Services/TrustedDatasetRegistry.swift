@@ -11,7 +11,6 @@ nonisolated struct PaperTaskSubmission {
     let selectedDatasetIDs: [String]
     let allowedDomains: [String]
     let registryVersion: Int
-    let precomputedArtifacts: PaperArtifacts?
 }
 
 nonisolated struct TaskOutputProvenance: Codable {
@@ -246,6 +245,30 @@ actor TrustedDatasetRegistry {
         })
     }
 
+    static func semanticSimilarityScore(
+        sourceTerms: Set<String>,
+        candidateText: String,
+        exactWeight: Double = 1,
+        fuzzyWeight: Double = 0.65
+    ) -> Double {
+        semanticSimilarityScore(
+            sourceTerms: sourceTerms,
+            candidateTerms: tokenize(candidateText),
+            exactWeight: exactWeight,
+            fuzzyWeight: fuzzyWeight
+        )
+    }
+
+    static func semanticSimilarityScore(
+        sourceTerms: Set<String>,
+        candidateTerms: Set<String>,
+        exactWeight: Double = 1,
+        fuzzyWeight: Double = 0.65
+    ) -> Double {
+        let overlap = semanticOverlapBreakdown(sourceTerms: sourceTerms, candidateTerms: candidateTerms)
+        return (Double(overlap.exact) * exactWeight) + (Double(overlap.fuzzy) * fuzzyWeight)
+    }
+
     private func shortlist(noteTexts: [String], limit: Int) -> [TrustedDataset] {
         let terms = Self.tokenize(noteTexts.joined(separator: " "))
         let enrichedTerms = Self.enrichedTerms(from: terms)
@@ -284,19 +307,39 @@ actor TrustedDatasetRegistry {
         let titleTerms = Self.tokenize(entry.title)
         let disciplineTerms = Self.tokenize(entry.disciplines.joined(separator: " "))
         let searchTerms = entry.searchTerms
+        let expansionOnlyTerms = enrichedTerms.subtracting(directTerms)
 
-        let directOverlap = Double(searchTerms.intersection(directTerms).count)
-        let enrichedOverlap = Double(searchTerms.intersection(enrichedTerms).count)
-        let titleOverlap = Double(titleTerms.intersection(directTerms).count)
-        let disciplineOverlap = Double(disciplineTerms.intersection(enrichedTerms).count)
-        let expandedOnlyOverlap = max(0, enrichedOverlap - directOverlap)
+        let directSearchScore = Self.semanticSimilarityScore(
+            sourceTerms: directTerms,
+            candidateTerms: searchTerms,
+            exactWeight: 2.6,
+            fuzzyWeight: 1.55
+        )
+        let expansionSearchScore = Self.semanticSimilarityScore(
+            sourceTerms: expansionOnlyTerms,
+            candidateTerms: searchTerms,
+            exactWeight: 1.3,
+            fuzzyWeight: 0.8
+        )
+        let titleScore = Self.semanticSimilarityScore(
+            sourceTerms: directTerms,
+            candidateTerms: titleTerms,
+            exactWeight: 1.4,
+            fuzzyWeight: 0.85
+        )
+        let disciplineScore = Self.semanticSimilarityScore(
+            sourceTerms: enrichedTerms,
+            candidateTerms: disciplineTerms,
+            exactWeight: 1.1,
+            fuzzyWeight: 0.7
+        )
 
         return entry.priority
             + officialBoost(for: entry)
-            + (directOverlap * 2.6)
-            + (expandedOnlyOverlap * 1.3)
-            + (titleOverlap * 1.4)
-            + (disciplineOverlap * 1.1)
+            + directSearchScore
+            + expansionSearchScore
+            + titleScore
+            + disciplineScore
     }
 
     private func officialBoost(for entry: TrustedDataset) -> Double {
@@ -364,6 +407,98 @@ actor TrustedDatasetRegistry {
         }
 
         return expanded
+    }
+
+    private static func semanticOverlapBreakdown(
+        sourceTerms: Set<String>,
+        candidateTerms: Set<String>
+    ) -> (exact: Int, fuzzy: Int) {
+        guard !sourceTerms.isEmpty, !candidateTerms.isEmpty else {
+            return (exact: 0, fuzzy: 0)
+        }
+
+        var unmatchedCandidates = Array(candidateTerms).sorted()
+        var exact = 0
+        var fuzzy = 0
+
+        for sourceTerm in sourceTerms.sorted() {
+            if let exactIndex = unmatchedCandidates.firstIndex(of: sourceTerm) {
+                unmatchedCandidates.remove(at: exactIndex)
+                exact += 1
+                continue
+            }
+
+            guard let fuzzyIndex = unmatchedCandidates.firstIndex(where: {
+                semanticTokensLikelyMatch(sourceTerm, $0)
+            }) else {
+                continue
+            }
+
+            unmatchedCandidates.remove(at: fuzzyIndex)
+            fuzzy += 1
+        }
+
+        return (exact: exact, fuzzy: fuzzy)
+    }
+
+    private static func semanticTokensLikelyMatch(_ lhs: String, _ rhs: String) -> Bool {
+        guard lhs != rhs else {
+            return true
+        }
+
+        let shorter = lhs.count <= rhs.count ? lhs : rhs
+        let longer = lhs.count <= rhs.count ? rhs : lhs
+        guard shorter.count >= 4 else {
+            return false
+        }
+
+        if longer.hasPrefix(shorter), longer.count - shorter.count <= 6 {
+            return true
+        }
+
+        let maxDistance = shorter.count >= 8 ? 2 : 1
+        return boundedEditDistance(lhs, rhs, maxDistance: maxDistance) != nil
+    }
+
+    private static func boundedEditDistance(
+        _ lhs: String,
+        _ rhs: String,
+        maxDistance: Int
+    ) -> Int? {
+        let lhsCharacters = Array(lhs)
+        let rhsCharacters = Array(rhs)
+        guard abs(lhsCharacters.count - rhsCharacters.count) <= maxDistance else {
+            return nil
+        }
+
+        var previousRow = Array(0 ... rhsCharacters.count)
+
+        for (lhsIndex, lhsCharacter) in lhsCharacters.enumerated() {
+            var currentRow = Array(repeating: 0, count: rhsCharacters.count + 1)
+            currentRow[0] = lhsIndex + 1
+            var rowMinimum = currentRow[0]
+
+            for (rhsIndex, rhsCharacter) in rhsCharacters.enumerated() {
+                let substitutionCost = lhsCharacter == rhsCharacter ? 0 : 1
+                currentRow[rhsIndex + 1] = min(
+                    previousRow[rhsIndex + 1] + 1,
+                    min(
+                        currentRow[rhsIndex] + 1,
+                        previousRow[rhsIndex] + substitutionCost
+                    )
+                )
+                rowMinimum = min(rowMinimum, currentRow[rhsIndex + 1])
+            }
+
+            guard rowMinimum <= maxDistance else {
+                return nil
+            }
+
+            previousRow = currentRow
+        }
+
+        let distance = previousRow[rhsCharacters.count]
+        return distance <= maxDistance ? distance : nil
     }
 
     private static let termExpansions: [String: Set<String>] = [

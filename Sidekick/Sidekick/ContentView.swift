@@ -8,35 +8,80 @@ private enum AppTab: Hashable {
 }
 
 enum QAFlags {
+    private static var arguments: [String] {
+        ProcessInfo.processInfo.arguments
+    }
+
+    private static var environment: [String: String] {
+        ProcessInfo.processInfo.environment
+    }
+
     static var shouldOpenLatestPaper: Bool {
-        let arguments = ProcessInfo.processInfo.arguments
         if arguments.contains("--qa-open-latest-paper") {
             return true
         }
 
-        return ProcessInfo.processInfo.environment["SIDEKICK_QA_OPEN_LATEST_PAPER"] == "1"
+        return environment["SIDEKICK_QA_OPEN_LATEST_PAPER"] == "1"
     }
 
     static var shouldForceHeartbeatOnLaunch: Bool {
-        let arguments = ProcessInfo.processInfo.arguments
         if arguments.contains("--qa-force-heartbeat") {
             return true
         }
 
-        return ProcessInfo.processInfo.environment["SIDEKICK_QA_FORCE_HEARTBEAT"] == "1"
+        return environment["SIDEKICK_QA_FORCE_HEARTBEAT"] == "1"
     }
 
     static var shouldAutoShareLatestPaper: Bool {
-        let arguments = ProcessInfo.processInfo.arguments
         if arguments.contains("--qa-auto-share-latest-paper") {
             return true
         }
 
-        return ProcessInfo.processInfo.environment["SIDEKICK_QA_AUTO_SHARE_LATEST_PAPER"] == "1"
+        return environment["SIDEKICK_QA_AUTO_SHARE_LATEST_PAPER"] == "1"
     }
 
-    static var seedNoteContent: String? {
-        guard let raw = ProcessInfo.processInfo.environment["SIDEKICK_QA_SEED_NOTE"]?
+    static var shouldResetContentOnLaunch: Bool {
+        if arguments.contains("--qa-reset-content") {
+            return true
+        }
+
+        return environment["SIDEKICK_QA_RESET_CONTENT"] == "1"
+    }
+
+    static var seedNotes: [String] {
+        var seeded: [String] = []
+
+        if let filePath = environment["SIDEKICK_QA_SEED_NOTES_FILE"],
+           let fileContents = decodeSeedNotesFile(at: filePath) {
+            seeded.append(contentsOf: fileContents)
+        }
+
+        if let rawJSON = environment["SIDEKICK_QA_SEED_NOTES_JSON"],
+           let jsonContents = decodeSeedNotesJSON(rawJSON) {
+            seeded.append(contentsOf: jsonContents)
+        }
+
+        if let legacySingleNote = legacySeedNoteContent {
+            seeded.append(legacySingleNote)
+        }
+
+        var uniqueNotes: [String] = []
+        var seen = Set<String>()
+
+        for note in seeded {
+            let normalized = note.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, seen.insert(normalized).inserted else {
+                continue
+            }
+
+            uniqueNotes.append(note)
+        }
+
+        return uniqueNotes
+    }
+
+    private static var legacySeedNoteContent: String? {
+        guard let raw = environment["SIDEKICK_QA_SEED_NOTE"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
             return nil
@@ -44,14 +89,65 @@ enum QAFlags {
 
         return raw
     }
+
+    private static func decodeSeedNotesFile(at path: String) -> [String]? {
+        let trimmedPath = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedPath.isEmpty else {
+            return nil
+        }
+
+        let url = URL(fileURLWithPath: trimmedPath)
+        guard let data = try? Data(contentsOf: url),
+              let raw = String(data: data, encoding: .utf8) else {
+            return nil
+        }
+
+        return decodeSeedNotesJSON(raw)
+    }
+
+    private static func decodeSeedNotesJSON(_ raw: String) -> [String]? {
+        guard let data = raw.data(using: .utf8),
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            return nil
+        }
+
+        if let strings = json as? [String] {
+            return strings
+        }
+
+        if let wrapped = json as? [String: Any],
+           let notes = wrapped["notes"] {
+            return decodeSeedNotesPayload(notes)
+        }
+
+        return decodeSeedNotesPayload(json)
+    }
+
+    private static func decodeSeedNotesPayload(_ payload: Any) -> [String]? {
+        if let strings = payload as? [String] {
+            return strings
+        }
+
+        if let noteObjects = payload as? [[String: Any]] {
+            let notes = noteObjects.compactMap { object in
+                object["content"] as? String
+            }
+            return notes.isEmpty ? nil : notes
+        }
+
+        return nil
+    }
 }
 
 struct AppShellView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
+    @Query(sort: \Paper.updatedAt, order: .reverse) private var papers: [Paper]
 
     @EnvironmentObject private var heartbeat: HeartbeatManager
     @EnvironmentObject private var notifications: NotificationService
+
+    private let foregroundHeartbeatInterval: Duration = .seconds(30)
 
     var body: some View {
         ContentView()
@@ -60,11 +156,15 @@ struct AppShellView: View {
                     await notifications.requestAuthorization()
                 }
                 heartbeat.scheduleBackgroundRefresh()
-                seedQANoteIfNeeded(modelContext: modelContext)
+                resetQAContentIfNeeded(modelContext: modelContext)
+                seedQANotesIfNeeded(modelContext: modelContext)
+                quarantineRetiredLocalExecutionIfNeeded(modelContext: modelContext)
                 Task {
                     await preloadRecentReadyPapers(modelContext: modelContext)
                 }
                 if QAFlags.shouldForceHeartbeatOnLaunch {
+                    await heartbeat.run(modelContext: modelContext, force: true)
+                } else if inFlightPaperCount > 0 {
                     await heartbeat.run(modelContext: modelContext, force: true)
                 } else {
                     await heartbeat.runIfNeeded(modelContext: modelContext)
@@ -81,30 +181,124 @@ struct AppShellView: View {
                 }
 
                 Task {
-                    await heartbeat.runIfNeeded(modelContext: modelContext)
+                    if inFlightPaperCount > 0 {
+                        await heartbeat.run(modelContext: modelContext, force: true)
+                    } else {
+                        await heartbeat.runIfNeeded(modelContext: modelContext)
+                    }
                 }
+            }
+            .task(id: foregroundHeartbeatTaskKey) {
+                await runForegroundHeartbeatLoopIfNeeded(modelContext: modelContext)
             }
     }
 
-    private func seedQANoteIfNeeded(modelContext: ModelContext) {
-        guard let content = QAFlags.seedNoteContent else {
+    private var inFlightPaperCount: Int {
+        papers.filter { $0.status == .generating }.count
+    }
+
+    private var foregroundHeartbeatTaskKey: String {
+        "\(scenePhase == .active)-\(inFlightPaperCount)"
+    }
+
+    private func resetQAContentIfNeeded(modelContext: ModelContext) {
+        guard QAFlags.shouldResetContentOnLaunch else {
+            return
+        }
+
+        do {
+            let papers = try modelContext.fetch(FetchDescriptor<Paper>())
+            let runs = try modelContext.fetch(FetchDescriptor<ResearchRun>())
+            let notes = try modelContext.fetch(FetchDescriptor<Note>())
+
+            for paper in papers {
+                modelContext.delete(paper)
+            }
+
+            for run in runs {
+                modelContext.delete(run)
+            }
+
+            for note in notes {
+                modelContext.delete(note)
+            }
+
+            try modelContext.save()
+
+            purgeTransientQAStorage()
+
+            print("[QA] Purged \(notes.count) note(s), \(papers.count) paper(s), and \(runs.count) run(s)")
+        } catch {
+            print("[QA] Failed to purge content: \(error.localizedDescription)")
+        }
+    }
+
+    private func seedQANotesIfNeeded(modelContext: ModelContext) {
+        let notesToSeed = QAFlags.seedNotes
+        guard !notesToSeed.isEmpty else {
             return
         }
 
         do {
             let existingNotes = try modelContext.fetch(FetchDescriptor<Note>())
-            guard existingNotes.contains(where: {
-                $0.content.trimmingCharacters(in: .whitespacesAndNewlines) == content
-            }) == false else {
+            var seenContents = Set(
+                existingNotes.map { $0.content.trimmingCharacters(in: .whitespacesAndNewlines) }
+            )
+            var insertedCount = 0
+
+            for (index, content) in notesToSeed.enumerated() {
+                let normalized = content.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !normalized.isEmpty, seenContents.insert(normalized).inserted else {
+                    continue
+                }
+
+                let timestamp = Date().addingTimeInterval(TimeInterval(index))
+                let note = Note(content: content, createdAt: timestamp, updatedAt: timestamp)
+                modelContext.insert(note)
+                insertedCount += 1
+            }
+
+            guard insertedCount > 0 else {
                 return
             }
 
-            let note = Note(content: content, createdAt: .now, updatedAt: .now)
-            modelContext.insert(note)
             try modelContext.save()
-            print("[QA] Seeded note title=\"\(note.title)\"")
+            print("[QA] Seeded \(insertedCount) note(s)")
         } catch {
-            print("[QA] Failed to seed note: \(error.localizedDescription)")
+            print("[QA] Failed to seed notes: \(error.localizedDescription)")
+        }
+    }
+
+    private func quarantineRetiredLocalExecutionIfNeeded(modelContext: ModelContext) {
+        do {
+            let papers = try modelContext.fetch(FetchDescriptor<Paper>())
+            let runs = try modelContext.fetch(FetchDescriptor<ResearchRun>())
+            let localPapers = papers.filter { $0.codexTaskID.hasPrefix("local-") }
+            let localRuns = runs.filter { $0.runID.hasPrefix("local-") }
+
+            let retiredMessage = "This paper used a retired on-device validation path and must be regenerated."
+
+            for paper in localPapers {
+                paper.status = .failed
+                paper.markdown = ""
+                paper.figureData = []
+            }
+
+            for run in localRuns {
+                run.markFailed(message: retiredMessage)
+            }
+
+            if !localPapers.isEmpty || !localRuns.isEmpty {
+                try modelContext.save()
+            }
+
+            purgeRetiredLocalExecutionStorage()
+
+            if !localPapers.isEmpty || !localRuns.isEmpty {
+                print("[Migration] Quarantined \(localPapers.count) legacy local paper(s) and \(localRuns.count) local run(s)")
+            }
+        } catch {
+            print("[Migration] Failed to quarantine retired local execution artifacts: \(error.localizedDescription)")
         }
     }
 
@@ -123,6 +317,66 @@ struct AppShellView: View {
             }
         } catch {
             print("[PaperDocs] preload failed: \(error.localizedDescription)")
+        }
+    }
+
+    private func runForegroundHeartbeatLoopIfNeeded(modelContext: ModelContext) async {
+        guard scenePhase == .active, inFlightPaperCount > 0 else {
+            return
+        }
+
+        while !Task.isCancelled, scenePhase == .active, inFlightPaperCount > 0 {
+            try? await Task.sleep(for: foregroundHeartbeatInterval)
+            guard !Task.isCancelled, scenePhase == .active, inFlightPaperCount > 0 else {
+                break
+            }
+
+            await heartbeat.run(modelContext: modelContext, force: true)
+        }
+    }
+
+    private func purgeTransientQAStorage() {
+        let fileManager = FileManager.default
+
+        let applicationSupport = fileManager
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first
+
+        let paperArtifactsDirectory = applicationSupport?
+            .appendingPathComponent("PaperArtifacts", isDirectory: true)
+        let localDatasetsDirectory = applicationSupport?
+            .appendingPathComponent("LocalDatasets", isDirectory: true)
+        let exportDirectory = fileManager.temporaryDirectory
+            .appendingPathComponent("SidekickExports", isDirectory: true)
+
+        if let paperArtifactsDirectory {
+            try? fileManager.removeItem(at: paperArtifactsDirectory)
+        }
+
+        if let localDatasetsDirectory {
+            try? fileManager.removeItem(at: localDatasetsDirectory)
+        }
+
+        try? fileManager.removeItem(at: exportDirectory)
+    }
+
+    private func purgeRetiredLocalExecutionStorage() {
+        let fileManager = FileManager.default
+        let applicationSupport = fileManager
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask)
+            .first
+
+        if let paperArtifactsDirectory = applicationSupport?
+            .appendingPathComponent("PaperArtifacts", isDirectory: true),
+           let artifactKeys = try? fileManager.contentsOfDirectory(atPath: paperArtifactsDirectory.path) {
+            for key in artifactKeys where key.hasPrefix("local-") {
+                PaperArtifactStore.deleteArtifacts(for: key)
+            }
+        }
+
+        if let localDatasetsDirectory = applicationSupport?
+            .appendingPathComponent("LocalDatasets", isDirectory: true) {
+            try? fileManager.removeItem(at: localDatasetsDirectory)
         }
     }
 }

@@ -39,18 +39,19 @@ final class HeartbeatManager: ObservableObject {
     private let openAI: OpenAIService
     private let notifications: NotificationService
     private let defaults: UserDefaults
+    private var advancingResearchRunIDs = Set<String>()
 
     private let lastRunKey = "com.vineet.sidekick.lastHeartbeatAt"
     private let cooldown: TimeInterval = 20 * 60
-    private let supportedLocalRecoveryGracePeriod: TimeInterval = 3 * 60
     private let remoteRetryGracePeriod: TimeInterval = 8 * 60
-    private let bundledRemoteRetryGracePeriod: TimeInterval = 20 * 60
+    private let bundledRemoteRetryGracePeriod: TimeInterval = 5 * 60
     private let failedPaperRetryCooldown: TimeInterval = 20 * 60
     private let deadBundledTaskGracePeriod: TimeInterval = 2 * 60
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
     private let maxResearchStageAttempts = 3
     private let maxAnalysisRevisionCycles = 6
+    private let maxNoteAssessmentPasses = 3
     private let analysisRevisionCycleAttemptKey = "analysis_revision_cycle"
     private let analysisRevisionCycleLimitMessage = "Analysis revision cycles exceeded the retry budget."
 
@@ -250,12 +251,11 @@ final class HeartbeatManager: ObservableObject {
             return false
         }
 
-        let supportsLocal = LocalPaperGenerationService.supports(datasetIDs: submission.selectedDatasetIDs)
-        guard !supportsLocal, submission.attemptCount >= maxRemoteAttempts else {
+        guard submission.attemptCount >= maxRemoteAttempts else {
             return false
         }
 
-        return isStalled(snapshot: snapshot, submission: submission, supportsLocal: false)
+        return isStalled(snapshot: snapshot, submission: submission)
     }
 
     private func recoverStalledPaperIfNeeded(
@@ -268,12 +268,11 @@ final class HeartbeatManager: ObservableObject {
             return nil
         }
 
-        let supportsLocal = LocalPaperGenerationService.supports(datasetIDs: submission.selectedDatasetIDs)
-        guard force || shouldAttemptRecovery(snapshot: snapshot, submission: submission, supportsLocal: supportsLocal) else {
+        guard force || shouldAttemptRecovery(snapshot: snapshot, submission: submission) else {
             return nil
         }
 
-        guard supportsLocal || submission.attemptCount < maxRemoteAttempts else {
+        guard submission.attemptCount < maxRemoteAttempts else {
             return nil
         }
 
@@ -282,8 +281,7 @@ final class HeartbeatManager: ObservableObject {
             return nil
         }
 
-        let recoveryMode = supportsLocal ? "local recovery" : "remote retry"
-        print("[Heartbeat]   -> Triggering \(recoveryMode). \(progressDescription(snapshot))")
+        print("[Heartbeat]   -> Triggering remote retry. \(progressDescription(snapshot))")
 
         let resubmission = try await openAI.submitPaperTask(
             notes: notes,
@@ -307,30 +305,20 @@ final class HeartbeatManager: ObservableObject {
 
         paper.codexTaskID = resubmission.taskID
 
-        if let artifacts = resubmission.precomputedArtifacts {
-            return .artifacts(artifacts, source: "local recovery")
-        }
-
         return .resubmitted(resubmission.taskID)
     }
 
     private func shouldAttemptRecovery(
         snapshot: PaperTaskProgressSnapshot,
-        submission: PaperArtifactStore.PendingSubmissionSnapshot,
-        supportsLocal: Bool
+        submission: PaperArtifactStore.PendingSubmissionSnapshot
     ) -> Bool {
-        if supportsLocal {
-            return isStalled(snapshot: snapshot, submission: submission, supportsLocal: true)
-        }
-
         return submission.attemptCount < maxRemoteAttempts
-            && isStalled(snapshot: snapshot, submission: submission, supportsLocal: false)
+            && isStalled(snapshot: snapshot, submission: submission)
     }
 
     private func isStalled(
         snapshot: PaperTaskProgressSnapshot,
-        submission: PaperArtifactStore.PendingSubmissionSnapshot,
-        supportsLocal: Bool
+        submission: PaperArtifactStore.PendingSubmissionSnapshot
     ) -> Bool {
         let now = Date()
         let taskStart = snapshot.taskCreatedAt ?? snapshot.assistantTurnCreatedAt ?? submission.createdAt
@@ -338,10 +326,6 @@ final class HeartbeatManager: ObservableObject {
 
         let taskAge = now.timeIntervalSince(taskStart)
         let progressAge = now.timeIntervalSince(lastProgressAt)
-
-        if supportsLocal {
-            return taskAge >= supportedLocalRecoveryGracePeriod
-        }
 
         return taskAge >= remoteRetryGracePeriod
             && (snapshot.outputCharacterCount == 0 || progressAge >= stalledEventGracePeriod)
@@ -373,6 +357,44 @@ final class HeartbeatManager: ObservableObject {
             try persistModelChanges(in: modelContext)
         } catch {
             print("[Heartbeat]   -> Failed to save \(context): \(error.localizedDescription)")
+        }
+    }
+
+    private func withResearchRunAdvanceLock(
+        _ run: ResearchRun,
+        operation: () async throws -> Void
+    ) async throws {
+        guard advancingResearchRunIDs.insert(run.runID).inserted else {
+            print("[Heartbeat]   -> Research run \(run.runID) is already advancing; skipping duplicate trigger.")
+            return
+        }
+
+        defer {
+            advancingResearchRunIDs.remove(run.runID)
+        }
+
+        try await operation()
+    }
+
+    private func scheduleResearchRunAdvance(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note]
+    ) {
+        guard !advancingResearchRunIDs.contains(run.runID) else {
+            print("[Heartbeat]   -> Research run \(run.runID) is already advancing in the background.")
+            return
+        }
+
+        Task { @MainActor in
+            do {
+                try await self.withResearchRunAdvanceLock(run) {
+                    try await self.advanceResearchRun(run, paper: paper, notes: notes)
+                }
+            } catch {
+                let message = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+                print("[Heartbeat]   -> Background advancement failed for \(run.runID): \(message)")
+            }
         }
     }
 
@@ -417,6 +439,10 @@ final class HeartbeatManager: ObservableObject {
             paper.status = .generating
             run.resetAttemptCount(for: .verify)
             run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+        } else if shouldRetryDirectFallbackStage(for: run) {
+            paper.status = .generating
+            run.resetAttemptCount(for: run.currentStage)
+            run.status = .running
         } else if run.status == .failed, pendingAnalysisRevision(for: run.runID) != nil {
             guard run.attemptCount(forKey: analysisRevisionCycleAttemptKey) < maxAnalysisRevisionCycles else {
                 markResearchRunFailed(
@@ -442,11 +468,15 @@ final class HeartbeatManager: ObservableObject {
             return
         }
 
-        try await advanceResearchRun(run, paper: paper, notes: notes)
+        try await withResearchRunAdvanceLock(run) {
+            try await advanceResearchRun(run, paper: paper, notes: notes)
+        }
     }
 
     private func isFailedResearchRunRecoverable(_ run: ResearchRun) -> Bool {
-        pendingAnalysisRevision(for: run.runID) != nil || shouldRetryLatestVerification(for: run)
+        pendingAnalysisRevision(for: run.runID) != nil
+            || shouldRetryLatestVerification(for: run)
+            || shouldRetryDirectFallbackStage(for: run)
     }
 
     private func shouldRetryLatestVerification(for run: ResearchRun) -> Bool {
@@ -465,6 +495,16 @@ final class HeartbeatManager: ObservableObject {
         return true
     }
 
+    private func shouldRetryDirectFallbackStage(for run: ResearchRun) -> Bool {
+        guard run.status == .failed,
+              run.activeTaskID == nil,
+              run.currentStage == .inspect || run.currentStage == .analyze else {
+            return false
+        }
+
+        return shouldRetryResponsesFallback(for: run)
+    }
+
     private func advanceResearchRun(
         _ run: ResearchRun,
         paper: Paper,
@@ -481,7 +521,11 @@ final class HeartbeatManager: ObservableObject {
             try await executePlanStage(run, paper: paper, notes: notes)
 
         case .inspect:
-            if PaperArtifactStore.stageArtifact(ResearchInspectionArtifact.self, runID: run.runID, stage: .inspect) != nil {
+            if let inspection = PaperArtifactStore.stageArtifact(
+                ResearchInspectionArtifact.self,
+                runID: run.runID,
+                stage: .inspect
+            ), !inspectionArtifactIndicatesTransportBlock(inspection) {
                 run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
                 try await advanceResearchRun(run, paper: paper, notes: notes)
                 return
@@ -540,6 +584,13 @@ final class HeartbeatManager: ObservableObject {
                 stage: .inspect
             ) else {
                 run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            if inspectionArtifactIndicatesTransportBlock(inspection) {
+                run.markRunning(stage: .inspect, message: "Re-inspecting the dataset slice after incomplete source access.")
+                try persistModelChanges(in: run.modelContext)
                 try await advanceResearchRun(run, paper: paper, notes: notes)
                 return
             }
@@ -766,12 +817,32 @@ final class HeartbeatManager: ObservableObject {
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
                 try persistModelChanges(in: run.modelContext)
 
-                if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
+                if await prefersBundledResearchFallback(run: run, notes: notes),
+                   shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Inspect stage is attached to an incompatible repo environment; switching to responses fallback.")
                     run.activeTaskID = nil
 
                     do {
                         try await performInspectResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                    }
+                    return
+                }
+
+                if !(await prefersBundledResearchFallback(run: run, notes: notes)),
+                   shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
+                    print("[Heartbeat]   -> Inspect stage is attached to an incompatible repo environment; switching to direct Code Interpreter fallback.")
+                    run.activeTaskID = nil
+
+                    do {
+                        try await performInspectNetworkedResponsesFallback(
                             run,
                             paper: paper,
                             notes: notes,
@@ -808,7 +879,8 @@ final class HeartbeatManager: ObservableObject {
                     print("[Heartbeat]   -> Inspect stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
 
-                    if shouldUseResponsesFallback(for: snapshot) {
+                    if await prefersBundledResearchFallback(run: run, notes: notes),
+                       shouldUseResponsesFallback(for: snapshot) {
                         do {
                             try await performInspectResponsesFallback(
                                 run,
@@ -850,6 +922,39 @@ final class HeartbeatManager: ObservableObject {
                     return
                 }
 
+                if inspectionArtifactIndicatesTransportBlock(artifact) {
+                    guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
+                        print("[Heartbeat]   -> Inspect stage for \(run.runID) exhausted remote task retries; switching to direct Code Interpreter fallback.")
+                        do {
+                            try await performInspectNetworkedResponsesFallback(
+                                run,
+                                paper: paper,
+                                notes: notes,
+                                plan: plan,
+                                incrementAttempt: false
+                            )
+                        } catch {
+                            markResearchRunFailed(
+                                run,
+                                paper: paper,
+                                message: error.localizedDescription
+                            )
+                        }
+                        return
+                    }
+
+                    let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
+                    print("[Heartbeat]   -> Inspect stage for \(run.runID) hit approved-domain access blockers on \(environmentLabel); retrying on a different environment.")
+                    await openAI.quarantineNetworkedSelfContainedEnvironment(snapshot.environmentID)
+
+                    do {
+                        try await startResearchInspectionTask(run, paper: paper, notes: notes, plan: plan)
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                    }
+                    return
+                }
+
                 try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
                 run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
                 try persistModelChanges(in: run.modelContext)
@@ -859,6 +964,22 @@ final class HeartbeatManager: ObservableObject {
             case let .failed(snapshot, message):
                 persistTaskProgress(snapshot)
                 run.activeTaskID = nil
+
+                if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot),
+                   !(await prefersBundledResearchFallback(run: run, notes: notes)) {
+                    do {
+                        try await performInspectNetworkedResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                    }
+                    return
+                }
 
                 if run.attemptCount(for: .inspect) < maxResearchStageAttempts {
                     print("[Heartbeat]   -> Inspect stage failed for \(run.runID); retrying same stage.")
@@ -927,13 +1048,23 @@ final class HeartbeatManager: ObservableObject {
         } catch {
             if shouldUseResponsesFallback(after: error) {
                 do {
-                    try await performInspectResponsesFallback(
-                        run,
-                        paper: paper,
-                        notes: notes,
-                        plan: plan,
-                        incrementAttempt: false
-                    )
+                    if shouldUseBundledFallback {
+                        try await performInspectResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            incrementAttempt: false
+                        )
+                    } else {
+                        try await performInspectNetworkedResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            incrementAttempt: false
+                        )
+                    }
                 } catch {
                     handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
                 }
@@ -964,12 +1095,34 @@ final class HeartbeatManager: ObservableObject {
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
                 try persistModelChanges(in: run.modelContext)
 
-                if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
+                if await prefersBundledResearchFallback(run: run, notes: notes),
+                   shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Analysis stage is attached to an incompatible repo environment; switching to responses fallback.")
                     run.activeTaskID = nil
 
                     do {
                         try await performAnalyzeResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                    }
+                    return
+                }
+
+                if !(await prefersBundledResearchFallback(run: run, notes: notes)),
+                   shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
+                    print("[Heartbeat]   -> Analysis stage is attached to an incompatible repo environment; switching to direct Code Interpreter fallback.")
+                    run.activeTaskID = nil
+
+                    do {
+                        try await performAnalyzeNetworkedResponsesFallback(
                             run,
                             paper: paper,
                             notes: notes,
@@ -1010,7 +1163,8 @@ final class HeartbeatManager: ObservableObject {
                     print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
 
-                    if revisionRequest != nil {
+                    if revisionRequest != nil,
+                       await prefersBundledResearchFallback(run: run, notes: notes) {
                         do {
                             try await performAnalyzeResponsesFallback(
                                 run,
@@ -1027,7 +1181,8 @@ final class HeartbeatManager: ObservableObject {
                         return
                     }
 
-                    if shouldUseResponsesFallback(for: snapshot) {
+                    if await prefersBundledResearchFallback(run: run, notes: notes),
+                       shouldUseResponsesFallback(for: snapshot) {
                         do {
                             try await performAnalyzeResponsesFallback(
                                 run,
@@ -1080,6 +1235,71 @@ final class HeartbeatManager: ObservableObject {
                     return
                 }
 
+                if analysisArtifactIndicatesTransportBlock(artifact) {
+                    if revisionRequest != nil {
+                        guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
+                            print("[Heartbeat]   -> Analysis stage for \(run.runID) exhausted remote revision retries; switching to direct Code Interpreter fallback.")
+                            do {
+                                try await performAnalyzeNetworkedResponsesFallback(
+                                    run,
+                                    paper: paper,
+                                    notes: notes,
+                                    plan: plan,
+                                    inspection: inspection,
+                                    revisionRequest: revisionRequest,
+                                    incrementAttempt: false
+                                )
+                            } catch {
+                                markResearchRunFailed(
+                                    run,
+                                    paper: paper,
+                                    message: error.localizedDescription
+                                )
+                            }
+                            return
+                        }
+                        run.incrementAttempt(for: .analyze)
+                    } else if run.attemptCount(for: .analyze) >= maxResearchStageAttempts {
+                        print("[Heartbeat]   -> Analysis stage for \(run.runID) exhausted remote task retries; switching to direct Code Interpreter fallback.")
+                        do {
+                            try await performAnalyzeNetworkedResponsesFallback(
+                                run,
+                                paper: paper,
+                                notes: notes,
+                                plan: plan,
+                                inspection: inspection,
+                                revisionRequest: revisionRequest,
+                                incrementAttempt: false
+                            )
+                        } catch {
+                            markResearchRunFailed(
+                                run,
+                                paper: paper,
+                                message: error.localizedDescription
+                            )
+                        }
+                        return
+                    }
+
+                    let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
+                    print("[Heartbeat]   -> Analysis stage for \(run.runID) hit approved-domain access blockers on \(environmentLabel); retrying on a different environment.")
+                    await openAI.quarantineNetworkedSelfContainedEnvironment(snapshot.environmentID)
+
+                    do {
+                        try await startResearchAnalysisTask(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                    }
+                    return
+                }
+
                 try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
                 run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
                 try persistModelChanges(in: run.modelContext)
@@ -1090,7 +1310,26 @@ final class HeartbeatManager: ObservableObject {
                 persistTaskProgress(snapshot)
                 run.activeTaskID = nil
 
-                if revisionRequest != nil {
+                if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot),
+                   !(await prefersBundledResearchFallback(run: run, notes: notes)) {
+                    do {
+                        try await performAnalyzeNetworkedResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                    }
+                    return
+                }
+
+                if revisionRequest != nil,
+                   await prefersBundledResearchFallback(run: run, notes: notes) {
                     print("[Heartbeat]   -> Analysis revision stage failed for \(run.runID); retrying checkpointed analysis.")
                     do {
                         try await performAnalyzeResponsesFallback(
@@ -1105,7 +1344,7 @@ final class HeartbeatManager: ObservableObject {
                     } catch {
                         handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
                     }
-                } else if run.attemptCount(for: .analyze) < maxResearchStageAttempts {
+                } else if revisionRequest != nil || run.attemptCount(for: .analyze) < maxResearchStageAttempts {
                     print("[Heartbeat]   -> Analysis stage failed for \(run.runID); retrying same stage.")
                     try await startResearchAnalysisTask(
                         run,
@@ -1123,7 +1362,8 @@ final class HeartbeatManager: ObservableObject {
             return
         }
 
-        if revisionRequest != nil {
+        if revisionRequest != nil,
+           await prefersBundledResearchFallback(run: run, notes: notes) {
             do {
                 try await performAnalyzeResponsesFallback(
                     run,
@@ -1222,17 +1462,31 @@ final class HeartbeatManager: ObservableObject {
             try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Analysis task started as \(taskID)")
         } catch {
+            let shouldUseBundledFallback = await prefersBundledResearchFallback(run: run, notes: notes)
+
             if shouldUseResponsesFallback(after: error) {
                 do {
-                    try await performAnalyzeResponsesFallback(
-                        run,
-                        paper: paper,
-                        notes: notes,
-                        plan: plan,
-                        inspection: inspection,
-                        revisionRequest: revisionRequest,
-                        incrementAttempt: false
-                    )
+                    if shouldUseBundledFallback {
+                        try await performAnalyzeResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest,
+                            incrementAttempt: false
+                        )
+                    } else {
+                        try await performAnalyzeNetworkedResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest,
+                            incrementAttempt: false
+                        )
+                    }
                 } catch {
                     handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
                 }
@@ -1391,6 +1645,57 @@ final class HeartbeatManager: ObservableObject {
         print("[Heartbeat]   -> Research run complete for \(run.runID)")
     }
 
+    private func performInspectNetworkedResponsesFallback(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact,
+        incrementAttempt: Bool
+    ) async throws {
+        if incrementAttempt {
+            guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
+                markResearchRunFailed(
+                    run,
+                    paper: paper,
+                    message: "Dataset inspection exceeded the retry budget."
+                )
+                return
+            }
+            run.incrementAttempt(for: .inspect)
+        }
+
+        run.activeTaskID = nil
+        run.markRunning(stage: .inspect, message: "Inspecting the dataset via direct Code Interpreter fallback.")
+        try persistModelChanges(in: run.modelContext)
+
+        let artifact = try await openAI.runNetworkedResearchInspectionResponse(
+            notes: notes,
+            title: run.title,
+            theme: run.theme,
+            datasetIDs: run.datasetIDs,
+            allowedDomains: run.allowedDomains,
+            plan: plan
+        )
+
+        guard !inspectionArtifactIndicatesTransportBlock(artifact) else {
+            throw NSError(
+                domain: "com.vineet.Sidekick.HeartbeatManager",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Approved-domain access remained blocked in the direct Code Interpreter inspection fallback."
+                ]
+            )
+        }
+
+        try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
+        run.activeTaskID = nil
+        run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+        try persistModelChanges(in: run.modelContext)
+        print("[Heartbeat]   -> Inspect direct fallback completed for \(run.runID)")
+        try await advanceResearchRun(run, paper: paper, notes: notes)
+    }
+
     private func performInspectResponsesFallback(
         _ run: ResearchRun,
         paper: Paper,
@@ -1411,7 +1716,7 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.activeTaskID = nil
-        run.markRunning(stage: .inspect, message: "Inspecting the cohort via staged responses fallback.")
+        run.markRunning(stage: .inspect, message: "Inspecting the dataset via bundled Code Interpreter fallback.")
         try persistModelChanges(in: run.modelContext)
 
         do {
@@ -1423,11 +1728,22 @@ final class HeartbeatManager: ObservableObject {
                 plan: plan
             )
 
+            guard !inspectionArtifactIndicatesTransportBlock(artifact) else {
+                throw NSError(
+                    domain: "com.vineet.Sidekick.HeartbeatManager",
+                    code: 1,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Bundled Code Interpreter inspection fallback returned only transport-block diagnostics."
+                    ]
+                )
+            }
+
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
             run.activeTaskID = nil
             run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
             try persistModelChanges(in: run.modelContext)
-            print("[Heartbeat]   -> Inspect fallback completed for \(run.runID)")
+            print("[Heartbeat]   -> Inspect bundled Code Interpreter fallback completed for \(run.runID)")
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
             guard shouldUseBundledResearchTaskFallback(after: error) else {
@@ -1446,6 +1762,61 @@ final class HeartbeatManager: ObservableObject {
             try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Inspect bundled fallback task started as \(taskID)")
         }
+    }
+
+    private func performAnalyzeNetworkedResponsesFallback(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact,
+        revisionRequest: ResearchVerificationArtifact?,
+        incrementAttempt: Bool
+    ) async throws {
+        if incrementAttempt {
+            guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
+                markResearchRunFailed(
+                    run,
+                    paper: paper,
+                    message: "Analysis exceeded the retry budget."
+                )
+                return
+            }
+            run.incrementAttempt(for: .analyze)
+        }
+
+        run.activeTaskID = nil
+        run.markRunning(stage: .analyze, message: "Running analysis via direct Code Interpreter fallback.")
+        try persistModelChanges(in: run.modelContext)
+
+        let artifact = try await openAI.runNetworkedResearchAnalysisResponse(
+            notes: notes,
+            title: run.title,
+            theme: run.theme,
+            datasetIDs: run.datasetIDs,
+            allowedDomains: run.allowedDomains,
+            plan: plan,
+            inspection: inspection,
+            revisionRequest: revisionRequest
+        )
+
+        guard !analysisArtifactIndicatesTransportBlock(artifact) else {
+            throw NSError(
+                domain: "com.vineet.Sidekick.HeartbeatManager",
+                code: 2,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Approved-domain access remained blocked in the direct Code Interpreter analysis fallback."
+                ]
+            )
+        }
+
+        try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
+        run.activeTaskID = nil
+        run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+        try persistModelChanges(in: run.modelContext)
+        print("[Heartbeat]   -> Analysis direct fallback completed for \(run.runID)")
+        try await advanceResearchRun(run, paper: paper, notes: notes)
     }
 
     private func performAnalyzeResponsesFallback(
@@ -1470,7 +1841,7 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.activeTaskID = nil
-        run.markRunning(stage: .analyze, message: "Running analysis via staged responses fallback.")
+        run.markRunning(stage: .analyze, message: "Running analysis via bundled Code Interpreter fallback.")
         try persistModelChanges(in: run.modelContext)
 
         do {
@@ -1484,11 +1855,22 @@ final class HeartbeatManager: ObservableObject {
                 revisionRequest: revisionRequest
             )
 
+            guard !analysisArtifactIndicatesTransportBlock(artifact) else {
+                throw NSError(
+                    domain: "com.vineet.Sidekick.HeartbeatManager",
+                    code: 2,
+                    userInfo: [
+                        NSLocalizedDescriptionKey:
+                            "Bundled Code Interpreter analysis fallback returned only transport-block diagnostics."
+                    ]
+                )
+            }
+
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
             run.activeTaskID = nil
             run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
             try persistModelChanges(in: run.modelContext)
-            print("[Heartbeat]   -> Analysis fallback completed for \(run.runID)")
+            print("[Heartbeat]   -> Analysis bundled Code Interpreter fallback completed for \(run.runID)")
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
             guard shouldUseBundledResearchTaskFallback(after: error) else {
@@ -1555,17 +1937,16 @@ final class HeartbeatManager: ObservableObject {
         run: ResearchRun,
         snapshot: PaperTaskProgressSnapshot
     ) -> Bool {
-        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        let normalizedLabel = snapshot.environmentLabel?.lowercased() ?? ""
-        let normalizedStatus = snapshot.status.lowercased()
+        let latestEvent = snapshot.latestEventText?.lowercased() ?? ""
         let latestProgress = run.latestProgressMessage?.lowercased() ?? ""
+        let indicators = [
+            "repo_not_accessible",
+            "repository is not accessible",
+            "no usable codex cloud environment"
+        ]
 
-        return ["pending", "queued", "in_progress", "incomplete"].contains(normalizedStatus)
-            && snapshot.outputCharacterCount == 0
-            && latestEvent.isEmpty
-            && normalizedLabel.contains("/")
-            && !normalizedLabel.contains("sidekick")
-            && !latestProgress.contains("bundled")
+        return indicators.contains(where: latestEvent.contains)
+            || indicators.contains(where: latestProgress.contains)
     }
 
     private func shouldUseResponsesFallback(after error: Error) -> Bool {
@@ -1608,6 +1989,17 @@ final class HeartbeatManager: ObservableObject {
         run: ResearchRun,
         notes: [Note]
     ) async -> Bool {
+        await openAI.prefersBundledResearchFallback(
+            datasetIDs: run.datasetIDs,
+            noteTexts: notes.map(\.content),
+            theme: run.theme
+        )
+    }
+
+    private func supportsBundledResearchFallback(
+        run: ResearchRun,
+        notes: [Note]
+    ) async -> Bool {
         await openAI.supportsBundledResearchFallback(
             datasetIDs: run.datasetIDs,
             noteTexts: notes.map(\.content),
@@ -1620,11 +2012,16 @@ final class HeartbeatManager: ObservableObject {
         run: ResearchRun,
         notes: [Note]
     ) async -> Bool {
-        guard await prefersBundledResearchFallback(run: run, notes: notes),
-              (artifact.datasetManifest.rowCount ?? 0) == 0 else {
+        guard await supportsBundledResearchFallback(run: run, notes: notes) else {
             return false
         }
 
+        return inspectionArtifactIndicatesTransportBlock(artifact)
+    }
+
+    private func inspectionArtifactIndicatesTransportBlock(
+        _ artifact: ResearchInspectionArtifact
+    ) -> Bool {
         let evidence = [
             artifact.accessNotes,
             artifact.datasetManifest.sampleDescription
@@ -1634,7 +2031,36 @@ final class HeartbeatManager: ObservableObject {
             + artifact.datasetManifest.dataSources
             + artifact.datasetManifest.selectedVariables
 
-        return artifactTextIndicatesTransportBlock(evidence)
+        if artifactTextIndicatesTransportBlock(evidence) {
+            return true
+        }
+
+        let selectedVariableSet = Set(artifact.datasetManifest.selectedVariables.map { $0.lowercased() })
+        let looksLikeCardMetadataOnly = [
+            "id",
+            "disciplines",
+            "use",
+            "avoid",
+            "access",
+            "sample",
+            "domains",
+            "example"
+        ].allSatisfy(selectedVariableSet.contains)
+
+        let cardOnlyIndicators = [
+            "trusted dataset card:",
+            "trusted dataset card metadata",
+            "vetted in-prompt card metadata only",
+            "card metadata only",
+            "no live collection_id",
+            "no live dataset_id",
+            "no live study_id",
+            "could not be inspected from live source"
+        ]
+        let combinedEvidence = evidence.joined(separator: " ").lowercased()
+
+        return looksLikeCardMetadataOnly
+            || cardOnlyIndicators.contains(where: combinedEvidence.contains)
     }
 
     private func shouldRerouteAnalysisArtifactToBundledFallback(
@@ -1642,12 +2068,16 @@ final class HeartbeatManager: ObservableObject {
         run: ResearchRun,
         notes: [Note]
     ) async -> Bool {
-        guard await prefersBundledResearchFallback(run: run, notes: notes),
-              (artifact.datasetManifest.rowCount ?? 0) == 0,
-              artifact.figures.isEmpty else {
+        guard await supportsBundledResearchFallback(run: run, notes: notes) else {
             return false
         }
 
+        return analysisArtifactIndicatesTransportBlock(artifact)
+    }
+
+    private func analysisArtifactIndicatesTransportBlock(
+        _ artifact: ResearchAnalysisArtifact
+    ) -> Bool {
         let findingEvidence = artifact.findings.flatMap { finding in
             [finding.claim, finding.estimate, finding.uncertainty, finding.evidence]
         }
@@ -1662,7 +2092,38 @@ final class HeartbeatManager: ObservableObject {
         + artifact.datasetManifest.selectedVariables
         + findingEvidence
 
-        return artifactTextIndicatesTransportBlock(evidence)
+        if (artifact.datasetManifest.rowCount ?? 0) == 0,
+           artifact.figures.isEmpty,
+           artifactTextIndicatesTransportBlock(evidence) {
+            return true
+        }
+
+        let selectedVariableSet = Set(artifact.datasetManifest.selectedVariables.map { $0.lowercased() })
+        let looksLikeCardMetadataOnly = [
+            "id",
+            "disciplines",
+            "use",
+            "avoid",
+            "access",
+            "sample",
+            "domains",
+            "example"
+        ].allSatisfy(selectedVariableSet.contains)
+        let cardOnlyIndicators = [
+            "trusted dataset card:",
+            "trusted dataset card metadata",
+            "vetted in-prompt card metadata only",
+            "card metadata only",
+            "no live collection_id",
+            "no live dataset_id",
+            "no live study_id",
+            "could not be inspected from live source"
+        ]
+        let combinedEvidence = evidence.joined(separator: " ").lowercased()
+
+        return artifact.figures.isEmpty
+            && (looksLikeCardMetadataOnly
+                || cardOnlyIndicators.contains(where: combinedEvidence.contains))
     }
 
     private func artifactTextIndicatesTransportBlock(_ parts: [String]) -> Bool {
@@ -1840,14 +2301,98 @@ final class HeartbeatManager: ObservableObject {
 
     private func applyRecovery(_ recovery: RecoveryResult, to paper: Paper) async throws {
         switch recovery {
-        case let .artifacts(artifacts, source):
-            applyArtifacts(artifacts, to: paper)
-            await PaperDocumentService.precomputeIfNeeded(for: paper)
-            print("[Heartbeat]   -> Recovered via \(source): \"\(artifacts.title)\"")
-
         case let .resubmitted(taskID):
             print("[Heartbeat]   -> Resubmitted task as \(taskID)")
         }
+    }
+
+    private func isPromotableTrustedPartialCluster(_ cluster: NoteCluster) -> Bool {
+        guard cluster.readinessMode == .trustedPartial,
+              !cluster.datasetIDs.isEmpty else {
+            return false
+        }
+
+        return Set(cluster.noteIDs).count >= 2
+    }
+
+    private func isSubmissionCandidate(_ cluster: NoteCluster) -> Bool {
+        cluster.isAutomaticallyRunnable || isPromotableTrustedPartialCluster(cluster)
+    }
+
+    private func selectedSubmissionClusters(from clusters: [NoteCluster]) -> [NoteCluster] {
+        let candidates = clusters
+            .filter(isSubmissionCandidate)
+            .sorted { lhs, rhs in
+                let lhsPriority = submissionPriorityScore(for: lhs)
+                let rhsPriority = submissionPriorityScore(for: rhs)
+                if lhsPriority != rhsPriority {
+                    return lhsPriority > rhsPriority
+                }
+
+                let lhsNoteCount = Set(lhs.noteIDs).count
+                let rhsNoteCount = Set(rhs.noteIDs).count
+                if lhsNoteCount != rhsNoteCount {
+                    return lhsNoteCount > rhsNoteCount
+                }
+
+                if lhs.isAutomaticallyRunnable != rhs.isAutomaticallyRunnable {
+                    return lhs.isAutomaticallyRunnable && !rhs.isAutomaticallyRunnable
+                }
+
+                let lhsDatasetCount = Set(lhs.datasetIDs).count
+                let rhsDatasetCount = Set(rhs.datasetIDs).count
+                if lhsDatasetCount != rhsDatasetCount {
+                    return lhsDatasetCount < rhsDatasetCount
+                }
+
+                return lhs.suggestedTitle < rhs.suggestedTitle
+            }
+
+        var selected: [NoteCluster] = []
+
+        for cluster in candidates {
+            let noteSet = Set(cluster.noteIDs)
+            guard !noteSet.isEmpty else {
+                continue
+            }
+
+            let overlapsExistingSelection = selected.contains { existing in
+                let existingNoteSet = Set(existing.noteIDs)
+                let sharedCount = noteSet.intersection(existingNoteSet).count
+                guard sharedCount > 0 else {
+                    return false
+                }
+
+                let smallerClusterSize = min(noteSet.count, existingNoteSet.count)
+                let overlapRatio = Double(sharedCount) / Double(smallerClusterSize)
+                let sharesDatasetFamily = !Set(cluster.datasetIDs).isDisjoint(with: Set(existing.datasetIDs))
+
+                return overlapRatio >= 0.75 || (sharesDatasetFamily && overlapRatio >= 0.5)
+            }
+
+            guard !overlapsExistingSelection else {
+                print("[Heartbeat]   Skipping overlapping cluster \"\(cluster.suggestedTitle)\" to avoid duplicate auto-runs.")
+                continue
+            }
+
+            if isPromotableTrustedPartialCluster(cluster) && !cluster.isAutomaticallyRunnable {
+                print("[Heartbeat]   Promoting trusted-partial cluster \"\(cluster.suggestedTitle)\" for a first-pass run.")
+            }
+
+            selected.append(cluster)
+        }
+
+        return selected
+    }
+
+    private func submissionPriorityScore(for cluster: NoteCluster) -> Double {
+        let noteCount = Double(Set(cluster.noteIDs).count)
+        let datasetCount = Double(Set(cluster.datasetIDs).count)
+        let readinessBonus: Double = cluster.isAutomaticallyRunnable ? 40 : 30
+        let noteCoverageBonus = min(noteCount, 4.0) * 12
+        let datasetPenalty = max(0, datasetCount - 1) * 2
+
+        return readinessBonus + noteCoverageBonus - datasetPenalty
     }
 
     @discardableResult
@@ -1862,16 +2407,26 @@ final class HeartbeatManager: ObservableObject {
             return 0
         }
 
-        print("[Heartbeat] Calling OpenAI assessNotes API...")
-        let clusters = try await openAI.assessNotes(notes)
-        print("[Heartbeat] Got \(clusters.count) cluster(s). Auto-runnable: \(clusters.filter(\.isAutomaticallyRunnable).count)")
-
         let existingPapers = try modelContext.fetch(
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
 
+        guard shouldAssessNotes(notes: notes, existingPapers: existingPapers) else {
+            print("[Heartbeat] All current notes are already covered by non-failed papers; skipping reassessment.")
+            return 0
+        }
+
+        let clusters = try await assessNotesWithRescue(notes)
+        let runnableClusters = selectedSubmissionClusters(from: clusters)
+        let promotedClusters = runnableClusters.filter { isPromotableTrustedPartialCluster($0) && !$0.isAutomaticallyRunnable }
+        print(
+            "[Heartbeat] Got \(clusters.count) cluster(s). " +
+                "Submission candidates: \(runnableClusters.count). " +
+                "Promoted partial clusters: \(promotedClusters.count)"
+        )
+
         var submitted = 0
-        for cluster in clusters where cluster.isAutomaticallyRunnable {
+        for cluster in runnableClusters {
             let clusterNotes = notes.filter { cluster.noteIDs.contains($0.id) }
             guard !clusterNotes.isEmpty else {
                 continue
@@ -1919,6 +2474,75 @@ final class HeartbeatManager: ObservableObject {
         }
 
         return submitted
+    }
+
+    private func shouldAssessNotes(notes: [Note], existingPapers: [Paper]) -> Bool {
+        let trackedPapers = existingPapers.filter { $0.status != .failed }
+        guard !trackedPapers.isEmpty else {
+            return true
+        }
+
+        for note in notes {
+            let coveringPapers = trackedPapers.filter { $0.sourceNoteIDs.contains(note.id) }
+            guard let latestCoverageAt = coveringPapers.map(\.updatedAt).max() else {
+                return true
+            }
+
+            if latestCoverageAt < note.updatedAt {
+                return true
+            }
+        }
+
+        return false
+    }
+
+    private func assessNotesWithRescue(_ notes: [Note]) async throws -> [NoteCluster] {
+        var allClusters: [NoteCluster] = []
+        var remainingNotes = notes
+        var coveredNoteIDs = Set<UUID>()
+
+        for pass in 1 ... maxNoteAssessmentPasses {
+            guard !remainingNotes.isEmpty else {
+                break
+            }
+
+            let isRescuePass = pass > 1
+            if isRescuePass {
+                print("[Heartbeat] Calling OpenAI assessNotes API for rescue pass \(pass - 1) on \(remainingNotes.count) leftover note(s)...")
+            } else {
+                print("[Heartbeat] Calling OpenAI assessNotes API...")
+            }
+
+            let passClusters = try await openAI.assessNotes(remainingNotes)
+            allClusters.append(contentsOf: passClusters)
+
+            let newlyCoveredNoteIDs = Set(
+                selectedSubmissionClusters(from: passClusters)
+                    .flatMap(\.noteIDs)
+            )
+            let previousCoverageCount = coveredNoteIDs.count
+            coveredNoteIDs.formUnion(newlyCoveredNoteIDs)
+
+            if coveredNoteIDs.count == previousCoverageCount {
+                if isRescuePass {
+                    print("[Heartbeat] Rescue pass \(pass - 1) found no additional runnable or promotable clusters.")
+                }
+                break
+            }
+
+            let nextRemainingNotes = notes.filter { !coveredNoteIDs.contains($0.id) }
+            if nextRemainingNotes.count == remainingNotes.count {
+                break
+            }
+
+            if !nextRemainingNotes.isEmpty {
+                print("[Heartbeat] \(nextRemainingNotes.count) note(s) still uncovered after pass \(pass); keeping them for another clustering pass.")
+            }
+
+            remainingNotes = nextRemainingNotes
+        }
+
+        return allClusters
     }
 
     private func beginResearchRun(
@@ -1980,12 +2604,17 @@ final class HeartbeatManager: ObservableObject {
         }
 
         print("[Heartbeat]   -> Research run ID: \(runID)")
-        try await advanceResearchRun(run, paper: paper, notes: notes)
+        if preparation.draftArtifact == nil {
+            scheduleResearchRunAdvance(run, paper: paper, notes: notes)
+        } else {
+            try await withResearchRunAdvanceLock(run) {
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+            }
+        }
     }
 }
 
 private enum RecoveryResult {
-    case artifacts(PaperArtifacts, source: String)
     case resubmitted(String)
 }
 
