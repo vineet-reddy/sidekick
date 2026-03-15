@@ -208,6 +208,10 @@ final class OpenAIService: ObservableObject {
                     selectedDatasets: selectedDatasets,
                     artifacts: localArtifacts
                 ),
+                verificationArtifact: localVerificationArtifact(
+                    selectedDatasets: selectedDatasets,
+                    artifacts: localArtifacts
+                ),
                 draftArtifact: ResearchDraftArtifact(
                     title: localArtifacts.title,
                     markdown: localArtifacts.markdown
@@ -222,6 +226,7 @@ final class OpenAIService: ObservableObject {
             planArtifact: nil,
             inspectionArtifact: nil,
             analysisArtifact: nil,
+            verificationArtifact: nil,
             draftArtifact: nil
         )
     }
@@ -317,6 +322,7 @@ final class OpenAIService: ObservableObject {
         let datasetCards = selectedDatasets.isEmpty
             ? "- No trusted dataset cards were resolved for this run."
             : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .analyze)
         let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
         let notesBody = notes.map { note in
             "- [\(note.id.uuidString)] \(note.content)"
@@ -379,7 +385,11 @@ final class OpenAIService: ObservableObject {
            }
         6. Include concrete estimates, diagnostics, sample sizes, and uncertainty whenever the data support them.
         7. If the analysis cannot be completed, maximize the structured evidence you can deliver instead of returning a memo.
-        8. The final assistant message must contain only the JSON object and nothing before or after it.
+        8. Name the exact public cohort, project, study, collection, archive table, or mission slice you analyzed in `dataset_manifest`.
+        9. Keep the run inside one public dataset slice unless a hard blocker forces a narrow adjacent fallback.
+        10. `findings[].evidence` must cite concrete observed counts, variables, subgroup definitions, or figure/table identifiers from this run.
+        11. If a full inferential model is not supportable, return the strongest trustworthy descriptive cohort analysis you can instead of stalling.
+        12. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -387,6 +397,9 @@ final class OpenAIService: ObservableObject {
 
         Trusted dataset cards:
         \(datasetCards)
+
+        Dataset-specific execution guardrails:
+        \(datasetGuidance)
 
         Notes:
         \(notesBody)
@@ -417,6 +430,7 @@ final class OpenAIService: ObservableObject {
         let datasetCards = selectedDatasets.isEmpty
             ? "- No trusted dataset cards were resolved for this run."
             : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .inspect)
         let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
         let notesBody = notes.map { note in
             "- [\(note.id.uuidString)] \(note.content)"
@@ -446,7 +460,10 @@ final class OpenAIService: ObservableObject {
            }
         5. Prefer a small, concrete, trustworthy slice over a broad speculative one.
         6. Capture any blockers or limitations you uncovered during inspection in `quality_checks`.
-        7. The final assistant message must contain only the JSON object and nothing before or after it.
+        7. Return exact dataset slice identifiers, study IDs, project IDs, collection IDs, or table names whenever the source exposes them.
+        8. `selected_variables` must name real fields, endpoints, or metadata keys that were actually inspected.
+        9. If the preferred source is only partially reachable, keep the strongest narrow slice from that source instead of switching domains silently.
+        10. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -454,6 +471,9 @@ final class OpenAIService: ObservableObject {
 
         Trusted dataset cards:
         \(datasetCards)
+
+        Dataset-specific execution guardrails:
+        \(datasetGuidance)
 
         Notes:
         \(notesBody)
@@ -505,12 +525,86 @@ final class OpenAIService: ObservableObject {
         return .completed(snapshot, artifact)
     }
 
+    func verifyResearchAnalysis(
+        notes: [Note],
+        title: String,
+        theme: String,
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact,
+        analysis: ResearchAnalysisArtifact
+    ) async throws -> ResearchVerificationArtifact {
+        let noteSummaries = notes.map { note in
+            [
+                "id": note.id.uuidString,
+                "content": note.content
+            ]
+        }
+
+        let instructions = """
+        You are verifying whether a scientific paper can be drafted from checkpointed empirical artifacts.
+        Use only the supplied notes, plan, inspection artifact, and analysis artifact. Do not invent new results or new data access.
+
+        Return strict JSON only with this exact shape:
+        {
+          "decision": "proceed or revise_analysis or blocked",
+          "summary": "string",
+          "supported_claims": ["string"],
+          "weak_or_unsupported_claims": ["string"],
+          "figure_sanity_checks": [
+            {
+              "filename": "figure_1.png",
+              "status": "ok or warning or missing",
+              "issue": "string"
+            }
+          ],
+          "model_warnings": ["string"],
+          "sample_warnings": ["string"],
+          "required_revisions": ["string"]
+        }
+
+        Requirements:
+        - Set `decision` to `proceed` only when the analysis artifact is sufficient for a concise honest paper.
+        - Set `decision` to `revise_analysis` when the question is still viable but the analysis is missing key sample sizes, uncertainty, figure integrity, cohort definition, or claim support.
+        - Set `decision` to `blocked` when the inspected dataset slice does not support the intended paper.
+        - Put any claim that must not appear in Results into `weak_or_unsupported_claims`.
+        - Use `required_revisions` for concrete stage-local corrections only.
+        - Keep the verification terse, specific, and scientifically conservative.
+        """
+
+        let input = """
+        Suggested title: \(title)
+        Theme: \(theme)
+
+        Notes:
+        \(stringify(noteSummaries))
+
+        Research plan JSON:
+        \(prettyJSONString(plan))
+
+        Research inspection JSON:
+        \(stringify(inspectionPromptPayload(from: inspection)))
+
+        Research analysis JSON:
+        \(stringify(analysisPromptPayload(from: analysis)))
+        """
+
+        let response = try await createResponse(
+            for: .paperGeneration,
+            tools: [],
+            instructions: instructions,
+            input: input
+        )
+
+        return try decodeStructuredPayload(ResearchVerificationArtifact.self, from: response.outputText)
+    }
+
     func writeResearchPaper(
         notes: [Note],
         title: String,
         theme: String,
         plan: ResearchPlanArtifact,
-        analysis: ResearchAnalysisArtifact
+        analysis: ResearchAnalysisArtifact,
+        verification: ResearchVerificationArtifact
     ) async throws -> ResearchDraftArtifact {
         let noteSummaries = notes.map { note in
             [
@@ -521,7 +615,7 @@ final class OpenAIService: ObservableObject {
 
         let instructions = """
         You are writing a concise professional paper from verified research artifacts.
-        Use the supplied plan and analysis only. Do not invent new results.
+        Use the supplied plan, analysis, and verification only. Do not invent new results.
 
         Return strict JSON only with this exact shape:
         {
@@ -533,6 +627,8 @@ final class OpenAIService: ObservableObject {
         - Write a compact empirical paper, not a planning memo.
         - Prefer standard sections such as Abstract, Introduction, Data, Methods, Results, Discussion, and References when they fit.
         - When referencing figures, use bare filenames like `figure_1.png`.
+        - Only state empirical results that are supported by `supported_claims`.
+        - Treat `weak_or_unsupported_claims`, `model_warnings`, and `sample_warnings` as limitations, caveats, or omissions rather than results.
         - Do not include tool traces, logs, reproducibility checklists, repo paths, or app-meta commentary.
         """
 
@@ -548,6 +644,9 @@ final class OpenAIService: ObservableObject {
 
         Analysis JSON:
         \(stringify(analysisPromptPayload(from: analysis)))
+
+        Verification JSON:
+        \(stringify(verificationPromptPayload(from: verification)))
         """
 
         let response = try await createResponse(
@@ -1542,6 +1641,37 @@ final class OpenAIService: ObservableObject {
         )
     }
 
+    private func localVerificationArtifact(
+        selectedDatasets: [TrustedDataset],
+        artifacts: PaperArtifacts
+    ) -> ResearchVerificationArtifact {
+        let figureChecks = artifacts.figures.enumerated().map { index, _ in
+            ResearchFigureSanityCheck(
+                filename: "figure_\(index + 1).png",
+                status: "ok",
+                issue: "The local BRFSS validation path produced this figure successfully."
+            )
+        }
+
+        return ResearchVerificationArtifact(
+            decision: .proceed,
+            summary: "The BRFSS validation wedge produced a coherent dataset manifest, completed analysis artifact, and reusable figures, so drafting can proceed.",
+            supportedClaims: [
+                "The BRFSS validation wedge completed an empirical analysis using a trusted public dataset.",
+                "The finalized paper may report prevalence and regression outputs that are already grounded in the stored BRFSS artifacts."
+            ],
+            weakOrUnsupportedClaims: [
+                "This local validation path should not be generalized as the long-term architecture for non-BRFSS datasets."
+            ],
+            figureSanityChecks: figureChecks,
+            modelWarnings: [
+                "The local BRFSS wedge remains a validation slice and does not replace staged remote dataset execution."
+            ],
+            sampleWarnings: [],
+            requiredRevisions: []
+        )
+    }
+
     private func inspectionPromptPayload(from inspection: ResearchInspectionArtifact) -> [String: Any] {
         [
             "dataset_manifest": [
@@ -1602,6 +1732,74 @@ final class OpenAIService: ObservableObject {
                 "notes": analysis.provenance.notes
             ]
         ]
+    }
+
+    private func verificationPromptPayload(from verification: ResearchVerificationArtifact) -> [String: Any] {
+        [
+            "decision": verification.decision.rawValue,
+            "summary": verification.summary,
+            "supported_claims": verification.supportedClaims,
+            "weak_or_unsupported_claims": verification.weakOrUnsupportedClaims,
+            "figure_sanity_checks": verification.figureSanityChecks.map { check in
+                [
+                    "filename": check.filename,
+                    "status": check.status,
+                    "issue": check.issue
+                ]
+            },
+            "model_warnings": verification.modelWarnings,
+            "sample_warnings": verification.sampleWarnings,
+            "required_revisions": verification.requiredRevisions
+        ]
+    }
+
+    private func datasetExecutionGuidance(
+        for selectedDatasets: [TrustedDataset],
+        stage: DatasetExecutionStage
+    ) -> String {
+        var lines: [String] = []
+        let datasetIDs = Set(selectedDatasets.map(\.id))
+
+        if !datasetIDs.isDisjoint(with: ["nci-gdc-api", "cbioportal-public"]) {
+            switch stage {
+            case .inspect:
+                lines.append("- For neuro-oncology or glioblastoma notes, prefer one public cohort only: TCGA-GBM in GDC or one public GBM study in cBioPortal.")
+                lines.append("- Return the exact project ID or study ID you inspected, plus the clinical, mutation, expression, or survival fields that were actually reachable.")
+                lines.append("- Avoid controlled-access files, raw sequencing workflows, and broad pan-cancer sweeps.")
+            case .analyze:
+                lines.append("- Keep the analysis inside the exact GDC project or cBioPortal study resolved during inspection.")
+                lines.append("- Prefer trustworthy cohort-level survival summaries, mutation frequencies, and clinical subgroup comparisons with exact sample counts.")
+                lines.append("- If inferential modeling is thin, fall back to descriptive cohort comparisons rather than broad mechanistic or pan-cancer claims.")
+            }
+        }
+
+        if !datasetIDs.isDisjoint(with: ["dandi-api", "allen-brain-atlas-api", "neuromorpho-api", "cellxgene-discover"]) {
+            switch stage {
+            case .inspect:
+                lines.append("- Choose one dandiset, atlas, morphology slice, or single-cell collection and return the exact collection identifier or atlas family you inspected.")
+                lines.append("- Inspect only manageable metadata or study-level fields first; do not imply that large raw NWB matrices or image volumes were downloaded.")
+            case .analyze:
+                lines.append("- Keep neuroscience analyses at the study, cohort, cell-type, brain-region, or collection level unless the inspected slice clearly supports more.")
+                lines.append("- Report concrete counts such as donors, cells, reconstructions, sessions, or assets before making functional claims.")
+            }
+        }
+
+        if !datasetIDs.isDisjoint(with: ["mast-observations", "nasa-exoplanet-archive"]) {
+            switch stage {
+            case .inspect:
+                lines.append("- Resolve one archive table, mission, target set, or observation slice and return its exact name in the manifest.")
+                lines.append("- Keep the inspection to catalog metadata, observation summaries, or mission-linked tables rather than broad archive crawling.")
+            case .analyze:
+                lines.append("- Favor mission-scoped catalog summaries, transit/host-star comparisons, or observation-count analyses with explicit row counts.")
+                lines.append("- Avoid implying custom raw-image or pixel-level reduction pipelines unless the inspected slice explicitly supported them.")
+            }
+        }
+
+        if lines.isEmpty {
+            return "- Stay narrow, name the exact public dataset slice, and prefer conservative empirical claims over broad speculative ones."
+        }
+
+        return lines.joined(separator: "\n")
     }
 
     private func normalizedJSONData(from raw: String) -> Data? {
@@ -1796,6 +1994,11 @@ final class OpenAIService: ObservableObject {
             url.appendingPathComponent(component)
         }
     }
+}
+
+private enum DatasetExecutionStage {
+    case inspect
+    case analyze
 }
 
 private enum ResponseStreamMode {

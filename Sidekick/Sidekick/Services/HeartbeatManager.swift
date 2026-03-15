@@ -393,7 +393,7 @@ final class HeartbeatManager: ObservableObject {
 
         case .analyze:
             if PaperArtifactStore.stageArtifact(ResearchAnalysisArtifact.self, runID: run.runID, stage: .analyze) != nil {
-                run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+                run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
                 try await advanceResearchRun(run, paper: paper, notes: notes)
                 return
             }
@@ -426,7 +426,77 @@ final class HeartbeatManager: ObservableObject {
                 inspection: inspection
             )
 
+        case .verify:
+            if let verification = PaperArtifactStore.stageArtifact(
+                ResearchVerificationArtifact.self,
+                runID: run.runID,
+                stage: .verify
+            ) {
+                guard verification.allowsWriting else {
+                    markResearchRunFailed(run, paper: paper, message: verification.blockingMessage)
+                    return
+                }
+
+                run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            guard let plan = PaperArtifactStore.stageArtifact(
+                ResearchPlanArtifact.self,
+                runID: run.runID,
+                stage: .plan
+            ) else {
+                run.markRunning(stage: .plan, message: ResearchRunStage.plan.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            guard let inspection = PaperArtifactStore.stageArtifact(
+                ResearchInspectionArtifact.self,
+                runID: run.runID,
+                stage: .inspect
+            ) else {
+                run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            guard let analysis = PaperArtifactStore.stageArtifact(
+                ResearchAnalysisArtifact.self,
+                runID: run.runID,
+                stage: .analyze
+            ) else {
+                run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            try await executeVerifyStage(
+                run,
+                paper: paper,
+                notes: notes,
+                plan: plan,
+                inspection: inspection,
+                analysis: analysis
+            )
+
         case .write:
+            guard let verification = PaperArtifactStore.stageArtifact(
+                ResearchVerificationArtifact.self,
+                runID: run.runID,
+                stage: .verify
+            ) else {
+                run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            guard verification.allowsWriting else {
+                markResearchRunFailed(run, paper: paper, message: verification.blockingMessage)
+                return
+            }
+
             guard let analysis = PaperArtifactStore.stageArtifact(
                 ResearchAnalysisArtifact.self,
                 runID: run.runID,
@@ -456,7 +526,14 @@ final class HeartbeatManager: ObservableObject {
                 return
             }
 
-            try await executeWriteStage(run, paper: paper, notes: notes, plan: plan, analysis: analysis)
+            try await executeWriteStage(
+                run,
+                paper: paper,
+                notes: notes,
+                plan: plan,
+                analysis: analysis,
+                verification: verification
+            )
 
         case .typeset:
             guard let analysis = PaperArtifactStore.stageArtifact(
@@ -624,7 +701,7 @@ final class HeartbeatManager: ObservableObject {
                 persistTaskProgress(snapshot)
                 try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
                 run.activeTaskID = nil
-                run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+                run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
                 print("[Heartbeat]   -> Analysis stage completed for \(run.runID)")
                 try await advanceResearchRun(run, paper: paper, notes: notes)
 
@@ -695,12 +772,58 @@ final class HeartbeatManager: ObservableObject {
         }
     }
 
+    private func executeVerifyStage(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact,
+        inspection: ResearchInspectionArtifact,
+        analysis: ResearchAnalysisArtifact
+    ) async throws {
+        guard run.attemptCount(for: .verify) < maxResearchStageAttempts else {
+            markResearchRunFailed(
+                run,
+                paper: paper,
+                message: "Verification exceeded the retry budget."
+            )
+            return
+        }
+
+        run.incrementAttempt(for: .verify)
+        run.markRunning(stage: .verify, message: "Verifying that the saved artifacts support a publishable paper.")
+
+        do {
+            let verification = try await openAI.verifyResearchAnalysis(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                plan: plan,
+                inspection: inspection,
+                analysis: analysis
+            )
+            try PaperArtifactStore.persistStageArtifact(verification, runID: run.runID, stage: .verify)
+
+            guard verification.allowsWriting else {
+                print("[Heartbeat]   -> Verification blocked drafting for \(run.runID)")
+                markResearchRunFailed(run, paper: paper, message: verification.blockingMessage)
+                return
+            }
+
+            run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+            print("[Heartbeat]   -> Verify stage completed for \(run.runID)")
+            try await advanceResearchRun(run, paper: paper, notes: notes)
+        } catch {
+            handleResearchStageError(error, run: run, paper: paper, stage: .verify)
+        }
+    }
+
     private func executeWriteStage(
         _ run: ResearchRun,
         paper: Paper,
         notes: [Note],
         plan: ResearchPlanArtifact,
-        analysis: ResearchAnalysisArtifact
+        analysis: ResearchAnalysisArtifact,
+        verification: ResearchVerificationArtifact
     ) async throws {
         guard run.attemptCount(for: .write) < maxResearchStageAttempts else {
             markResearchRunFailed(
@@ -720,7 +843,8 @@ final class HeartbeatManager: ObservableObject {
                 title: run.title,
                 theme: run.theme,
                 plan: plan,
-                analysis: analysis
+                analysis: analysis,
+                verification: verification
             )
             try PaperArtifactStore.persistStageArtifact(draft, runID: run.runID, stage: .write)
             run.markRunning(stage: .typeset, message: ResearchRunStage.typeset.title)
@@ -937,6 +1061,10 @@ final class HeartbeatManager: ObservableObject {
 
         if let analysis = preparation.analysisArtifact {
             try PaperArtifactStore.persistStageArtifact(analysis, runID: runID, stage: .analyze)
+        }
+
+        if let verification = preparation.verificationArtifact {
+            try PaperArtifactStore.persistStageArtifact(verification, runID: runID, stage: .verify)
         }
 
         if let draft = preparation.draftArtifact {

@@ -5,6 +5,7 @@ enum ResearchRunStage: String, Codable, CaseIterable {
     case plan
     case inspect
     case analyze
+    case verify
     case write
     case typeset
 
@@ -16,6 +17,8 @@ enum ResearchRunStage: String, Codable, CaseIterable {
             return "Inspecting data"
         case .analyze:
             return "Running analysis"
+        case .verify:
+            return "Verifying evidence"
         case .write:
             return "Drafting paper"
         case .typeset:
@@ -414,6 +417,65 @@ nonisolated struct ResearchAnalysisArtifact: Codable {
     }
 }
 
+nonisolated enum ResearchVerificationDecision: String, Codable {
+    case proceed
+    case reviseAnalysis = "revise_analysis"
+    case blocked
+
+    var allowsWriting: Bool {
+        self == .proceed
+    }
+}
+
+nonisolated struct ResearchFigureSanityCheck: Codable {
+    let filename: String
+    let status: String
+    let issue: String
+}
+
+nonisolated struct ResearchVerificationArtifact: Codable {
+    let decision: ResearchVerificationDecision
+    let summary: String
+    let supportedClaims: [String]
+    let weakOrUnsupportedClaims: [String]
+    let figureSanityChecks: [ResearchFigureSanityCheck]
+    let modelWarnings: [String]
+    let sampleWarnings: [String]
+    let requiredRevisions: [String]
+
+    enum CodingKeys: String, CodingKey {
+        case decision
+        case summary
+        case supportedClaims = "supported_claims"
+        case weakOrUnsupportedClaims = "weak_or_unsupported_claims"
+        case figureSanityChecks = "figure_sanity_checks"
+        case modelWarnings = "model_warnings"
+        case sampleWarnings = "sample_warnings"
+        case requiredRevisions = "required_revisions"
+    }
+
+    var allowsWriting: Bool {
+        decision.allowsWriting
+    }
+
+    var blockingMessage: String {
+        let summaryText = summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !summaryText.isEmpty {
+            return summaryText
+        }
+
+        if let revision = requiredRevisions.first, !revision.isEmpty {
+            return revision
+        }
+
+        if let weakClaim = weakOrUnsupportedClaims.first, !weakClaim.isEmpty {
+            return weakClaim
+        }
+
+        return "Verification did not approve paper drafting from the current artifacts."
+    }
+}
+
 nonisolated struct ResearchDraftArtifact: Codable {
     let title: String
     let markdown: String
@@ -426,6 +488,7 @@ nonisolated struct ResearchRunPreparation {
     let planArtifact: ResearchPlanArtifact?
     let inspectionArtifact: ResearchInspectionArtifact?
     let analysisArtifact: ResearchAnalysisArtifact?
+    let verificationArtifact: ResearchVerificationArtifact?
     let draftArtifact: ResearchDraftArtifact?
 }
 

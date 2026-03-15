@@ -219,10 +219,9 @@ actor TrustedDatasetRegistry {
 
         let resolved = datasetIDs.compactMap { directByID[$0] }
         if !resolved.isEmpty {
-            let extras = shortlist(noteTexts: noteTexts, limit: limit)
-                .filter { candidate in !resolved.contains(where: { $0.id == candidate.id }) }
-
-            return Array((resolved + extras).prefix(limit))
+            // Once a run has selected explicit trusted dataset IDs, keep execution scoped to those cards.
+            // Injecting shortlist extras here can silently widen domains or trigger unrelated local fallbacks.
+            return Array(resolved.prefix(limit))
         }
 
         return shortlist(noteTexts: noteTexts, limit: limit)

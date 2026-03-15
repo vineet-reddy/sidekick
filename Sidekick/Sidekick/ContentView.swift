@@ -16,6 +16,15 @@ enum QAFlags {
 
         return ProcessInfo.processInfo.environment["SIDEKICK_QA_OPEN_LATEST_PAPER"] == "1"
     }
+
+    static var shouldForceHeartbeatOnLaunch: Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--qa-force-heartbeat") {
+            return true
+        }
+
+        return ProcessInfo.processInfo.environment["SIDEKICK_QA_FORCE_HEARTBEAT"] == "1"
+    }
 }
 
 struct AppShellView: View {
@@ -35,7 +44,11 @@ struct AppShellView: View {
                 Task {
                     await preloadRecentReadyPapers(modelContext: modelContext)
                 }
-                await heartbeat.runIfNeeded(modelContext: modelContext)
+                if QAFlags.shouldForceHeartbeatOnLaunch {
+                    await heartbeat.run(modelContext: modelContext, force: true)
+                } else {
+                    await heartbeat.runIfNeeded(modelContext: modelContext)
+                }
                 BackgroundHeartbeatScheduler.shared.runner = {
                     await preloadRecentReadyPapers(modelContext: modelContext)
                     await heartbeat.run(modelContext: modelContext, force: true)
