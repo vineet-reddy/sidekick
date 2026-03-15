@@ -3,6 +3,7 @@ import SwiftUI
 
 struct PaperListView: View {
     @Query(sort: \Paper.createdAt, order: .reverse) private var papers: [Paper]
+    @Query(sort: \ResearchRun.createdAt, order: .reverse) private var runs: [ResearchRun]
     @State private var path: [UUID] = []
     @State private var hasAutoOpenedLatestReadyPaper = false
 
@@ -62,6 +63,10 @@ struct PaperListView: View {
             .foregroundStyle(.secondary)
     }
 
+    private var runsByPaperID: [UUID: ResearchRun] {
+        Dictionary(uniqueKeysWithValues: runs.map { ($0.paperID, $0) })
+    }
+
     private func autoOpenLatestReadyPaperIfNeeded() {
         guard shouldAutoOpenLatestReadyPaper, !hasAutoOpenedLatestReadyPaper else {
             return
@@ -76,7 +81,9 @@ struct PaperListView: View {
     }
 
     private func paperCard(for paper: Paper) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        let run = runsByPaperID[paper.id]
+
+        return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
                 Text(paper.title.isEmpty ? "Untitled paper" : paper.title)
                     .font(.headline)
@@ -86,9 +93,7 @@ struct PaperListView: View {
 
                 Spacer()
 
-                if paper.status == .generating {
-                    StatusPill(title: "Generating...", tint: SidekickTheme.accent)
-                }
+                statusPill(for: paper, run: run)
             }
 
             HStack {
@@ -106,10 +111,34 @@ struct PaperListView: View {
                     .lineLimit(2)
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
+
+            if let run, paper.status != .ready {
+                Text(run.latestProgressMessage ?? run.currentStageTitle)
+                    .font(.caption)
+                    .foregroundStyle(run.status == .failed ? .red : .secondary)
+                    .lineLimit(2)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(padding: 14)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("paper.card.\(paper.id.uuidString)")
+    }
+
+    @ViewBuilder
+    private func statusPill(for paper: Paper, run: ResearchRun?) -> some View {
+        switch paper.status {
+        case .ready:
+            EmptyView()
+        case .generating:
+            if let run {
+                StatusPill(title: run.listStatusLabel, tint: SidekickTheme.accent)
+            } else {
+                StatusPill(title: "Generating...", tint: SidekickTheme.accent)
+            }
+        case .failed:
+            StatusPill(title: "Needs retry", tint: .red)
+        }
     }
 }

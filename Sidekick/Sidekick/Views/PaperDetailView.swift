@@ -1,7 +1,9 @@
 import PDFKit
+import SwiftData
 import SwiftUI
 
 struct PaperDetailView: View {
+    @Query(sort: \ResearchRun.createdAt, order: .reverse) private var runs: [ResearchRun]
     @State private var shareItem: ShareItem?
     @State private var exportError: String?
     @State private var isShowingExportError = false
@@ -19,13 +21,15 @@ struct PaperDetailView: View {
                     readyPaperView
                 case .generating:
                     progressCard(
-                        title: "Sidekick is writing",
-                        message: "This paper is still running in the background. The app will notify you when it lands."
+                        title: researchRun?.currentStageTitle ?? "Sidekick is working",
+                        message: researchRun?.latestProgressMessage
+                            ?? "This paper is still running in the background. The app will notify you when it lands."
                     )
                 case .failed:
                     progressCard(
                         title: "The paper stalled",
-                        message: "Something went wrong during generation. Sidekick will retry automatically on the next cycle."
+                        message: researchRun?.lastError
+                            ?? "Something went wrong during generation. Sidekick will retry automatically on the next cycle."
                     )
                 }
             }
@@ -83,6 +87,10 @@ struct PaperDetailView: View {
         }
     }
 
+    private var researchRun: ResearchRun? {
+        runs.first(where: { $0.paperID == paper.id })
+    }
+
     private func progressCard(title: String, message: String) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title)
@@ -94,6 +102,16 @@ struct PaperDetailView: View {
             if paper.status == .generating || documentState == .loading {
                 ProgressView()
                     .tint(SidekickTheme.accent)
+            }
+
+            if let run = researchRun {
+                Divider()
+
+                VStack(alignment: .leading, spacing: 10) {
+                    ForEach(ResearchRunStage.allCases, id: \.self) { stage in
+                        pipelineRow(stage: stage, state: run.pipelineState(for: stage))
+                    }
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -126,6 +144,63 @@ struct PaperDetailView: View {
             documentState = .ready(url)
         } catch {
             documentState = .failed(error.localizedDescription)
+        }
+    }
+
+    private func pipelineRow(stage: ResearchRunStage, state: ResearchRunPipelineStepState) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: symbolName(for: state))
+                .foregroundStyle(color(for: state))
+                .font(.system(size: 12, weight: .semibold))
+
+            Text(stage.title)
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+
+            Spacer()
+
+            Text(label(for: state))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private func symbolName(for state: ResearchRunPipelineStepState) -> String {
+        switch state {
+        case .pending:
+            return "circle"
+        case .active:
+            return "clock"
+        case .completed:
+            return "checkmark.circle.fill"
+        case .failed:
+            return "exclamationmark.triangle.fill"
+        }
+    }
+
+    private func color(for state: ResearchRunPipelineStepState) -> Color {
+        switch state {
+        case .pending:
+            return .secondary.opacity(0.5)
+        case .active:
+            return SidekickTheme.accent
+        case .completed:
+            return .green
+        case .failed:
+            return .red
+        }
+    }
+
+    private func label(for state: ResearchRunPipelineStepState) -> String {
+        switch state {
+        case .pending:
+            return "Pending"
+        case .active:
+            return "Active"
+        case .completed:
+            return "Done"
+        case .failed:
+            return "Failed"
         }
     }
 }

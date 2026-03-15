@@ -126,6 +126,22 @@ enum PaperArtifactStore {
         load(PaperTaskProgressSnapshot.self, from: statusURL(for: taskID))
     }
 
+    static func persistStageArtifact<T: Encodable>(
+        _ artifact: T,
+        runID: String,
+        stage: ResearchRunStage
+    ) throws {
+        try write(artifact, to: stageArtifactURL(for: runID, stage: stage))
+    }
+
+    static func stageArtifact<T: Decodable>(
+        _ type: T.Type,
+        runID: String,
+        stage: ResearchRunStage
+    ) -> T? {
+        load(type, from: stageArtifactURL(for: runID, stage: stage))
+    }
+
     static func renderedBundle(for taskID: String, fingerprint: String) -> RenderedPaperBundle? {
         let manifestURL = renderManifestURL(for: taskID)
         guard let manifest = load(RenderedPaperManifest.self, from: manifestURL),
@@ -206,6 +222,10 @@ enum PaperArtifactStore {
 
     private static func renderManifestURL(for taskID: String) -> URL {
         directoryURL(for: taskID).appendingPathComponent("rendered.json")
+    }
+
+    private static func stageArtifactURL(for runID: String, stage: ResearchRunStage) -> URL {
+        directoryURL(for: runID).appendingPathComponent("stage-\(stage.rawValue).json")
     }
 
     private static func directoryURL(for taskID: String) -> URL {

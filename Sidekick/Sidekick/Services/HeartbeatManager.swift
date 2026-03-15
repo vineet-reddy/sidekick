@@ -19,7 +19,7 @@ enum HeartbeatPhase: Equatable {
         case .assessingNotes:
             return "Reading your notes..."
         case let .submittingPaper(title):
-            return "Writing \"\(title)\"..."
+            return "Planning \"\(title)\"..."
         case let .done(count):
             if count == 0 {
                 return "All caught up."
@@ -46,6 +46,7 @@ final class HeartbeatManager: ObservableObject {
     private let remoteRetryGracePeriod: TimeInterval = 8 * 60
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
+    private let maxResearchStageAttempts = 3
 
     init(
         openAI: OpenAIService,
@@ -126,6 +127,10 @@ final class HeartbeatManager: ObservableObject {
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
         .filter { $0.status == .generating }
+        let runs = try modelContext.fetch(
+            FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+        )
+        let runsByPaperID = Dictionary(uniqueKeysWithValues: runs.map { ($0.paperID, $0) })
         let notes = try modelContext.fetch(FetchDescriptor<Note>())
         let notesByID = Dictionary(uniqueKeysWithValues: notes.map { ($0.id, $0) })
 
@@ -133,6 +138,15 @@ final class HeartbeatManager: ObservableObject {
 
         for paper in papers {
             print("[Heartbeat]   Checking task \(paper.codexTaskID) for \"\(paper.title)\"...")
+
+            if let run = runsByPaperID[paper.id] {
+                do {
+                    try await resolveResearchRun(run, paper: paper, notesByID: notesByID)
+                } catch {
+                    print("[Heartbeat]   -> Research run error: \(error.localizedDescription)")
+                }
+                continue
+            }
 
             do {
                 let result = try await openAI.checkTask(paper.codexTaskID)
@@ -325,6 +339,349 @@ final class HeartbeatManager: ObservableObject {
             "latest_event=\"\(latestEvent)\""
     }
 
+    private func resolveResearchRun(
+        _ run: ResearchRun,
+        paper: Paper,
+        notesByID: [UUID: Note]
+    ) async throws {
+        let notes = run.sourceNoteIDs.compactMap { notesByID[$0] }
+        guard !notes.isEmpty else {
+            markResearchRunFailed(
+                run,
+                paper: paper,
+                message: "The source notes for this research run could not be found."
+            )
+            return
+        }
+
+        try await advanceResearchRun(run, paper: paper, notes: notes)
+    }
+
+    private func advanceResearchRun(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note]
+    ) async throws {
+        switch run.currentStage {
+        case .plan:
+            if PaperArtifactStore.stageArtifact(ResearchPlanArtifact.self, runID: run.runID, stage: .plan) != nil {
+                run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            try await executePlanStage(run, paper: paper, notes: notes)
+
+        case .analyze:
+            if PaperArtifactStore.stageArtifact(ResearchAnalysisArtifact.self, runID: run.runID, stage: .analyze) != nil {
+                run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            guard let plan = PaperArtifactStore.stageArtifact(
+                ResearchPlanArtifact.self,
+                runID: run.runID,
+                stage: .plan
+            ) else {
+                run.markRunning(stage: .plan, message: ResearchRunStage.plan.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            try await executeAnalyzeStage(run, paper: paper, notes: notes, plan: plan)
+
+        case .write:
+            guard let analysis = PaperArtifactStore.stageArtifact(
+                ResearchAnalysisArtifact.self,
+                runID: run.runID,
+                stage: .analyze
+            ) else {
+                run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            if let draft = PaperArtifactStore.stageArtifact(
+                ResearchDraftArtifact.self,
+                runID: run.runID,
+                stage: .write
+            ) {
+                try await finalizeResearchRun(run, paper: paper, analysis: analysis, draft: draft)
+                return
+            }
+
+            guard let plan = PaperArtifactStore.stageArtifact(
+                ResearchPlanArtifact.self,
+                runID: run.runID,
+                stage: .plan
+            ) else {
+                run.markRunning(stage: .plan, message: ResearchRunStage.plan.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            try await executeWriteStage(run, paper: paper, notes: notes, plan: plan, analysis: analysis)
+
+        case .typeset:
+            guard let analysis = PaperArtifactStore.stageArtifact(
+                ResearchAnalysisArtifact.self,
+                runID: run.runID,
+                stage: .analyze
+            ), let draft = PaperArtifactStore.stageArtifact(
+                ResearchDraftArtifact.self,
+                runID: run.runID,
+                stage: .write
+            ) else {
+                run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+                return
+            }
+
+            try await finalizeResearchRun(run, paper: paper, analysis: analysis, draft: draft)
+        }
+    }
+
+    private func executePlanStage(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note]
+    ) async throws {
+        guard run.attemptCount(for: .plan) < maxResearchStageAttempts else {
+            markResearchRunFailed(
+                run,
+                paper: paper,
+                message: "Planning exceeded the retry budget."
+            )
+            return
+        }
+
+        run.incrementAttempt(for: .plan)
+        run.markRunning(stage: .plan, message: "Planning the study from notes and trusted datasets.")
+
+        do {
+            let artifact = try await openAI.createResearchPlan(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                datasetIDs: run.datasetIDs
+            )
+            try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .plan)
+            print("[Heartbeat]   -> Plan stage completed for \(run.runID)")
+            run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+            try await advanceResearchRun(run, paper: paper, notes: notes)
+        } catch {
+            handleResearchStageError(error, run: run, paper: paper, stage: .plan)
+        }
+    }
+
+    private func executeAnalyzeStage(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact
+    ) async throws {
+        if let taskID = run.activeTaskID, !taskID.isEmpty {
+            let result = try await openAI.checkResearchAnalysisTask(taskID)
+
+            switch result {
+            case let .waiting(snapshot):
+                persistTaskProgress(snapshot)
+                let message = snapshot.latestEventText ?? ResearchRunStage.analyze.title
+                run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
+
+                if shouldRestartResearchAnalysis(run: run, snapshot: snapshot) {
+                    print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
+                    run.activeTaskID = nil
+                    try await startResearchAnalysisTask(run, paper: paper, notes: notes, plan: plan)
+                }
+
+            case let .completed(snapshot, artifact):
+                persistTaskProgress(snapshot)
+                try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
+                run.activeTaskID = nil
+                run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+                print("[Heartbeat]   -> Analysis stage completed for \(run.runID)")
+                try await advanceResearchRun(run, paper: paper, notes: notes)
+
+            case let .failed(snapshot, message):
+                persistTaskProgress(snapshot)
+                run.activeTaskID = nil
+
+                if run.attemptCount(for: .analyze) < maxResearchStageAttempts {
+                    print("[Heartbeat]   -> Analysis stage failed for \(run.runID); retrying same stage.")
+                    try await startResearchAnalysisTask(run, paper: paper, notes: notes, plan: plan)
+                } else {
+                    markResearchRunFailed(run, paper: paper, message: message)
+                }
+            }
+
+            return
+        }
+
+        try await startResearchAnalysisTask(run, paper: paper, notes: notes, plan: plan)
+    }
+
+    private func startResearchAnalysisTask(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact
+    ) async throws {
+        guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
+            markResearchRunFailed(
+                run,
+                paper: paper,
+                message: "Analysis exceeded the retry budget."
+            )
+            return
+        }
+
+        run.incrementAttempt(for: .analyze)
+        run.markRunning(stage: .analyze, message: "Starting remote analysis task.")
+
+        do {
+            let taskID = try await openAI.startResearchAnalysisTask(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                datasetIDs: run.datasetIDs,
+                allowedDomains: run.allowedDomains,
+                plan: plan
+            )
+            run.activeTaskID = taskID
+            run.updateProgress(message: "Remote analysis is running.", at: .now)
+            print("[Heartbeat]   -> Analysis task started as \(taskID)")
+        } catch {
+            handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+        }
+    }
+
+    private func executeWriteStage(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact,
+        analysis: ResearchAnalysisArtifact
+    ) async throws {
+        guard run.attemptCount(for: .write) < maxResearchStageAttempts else {
+            markResearchRunFailed(
+                run,
+                paper: paper,
+                message: "Paper drafting exceeded the retry budget."
+            )
+            return
+        }
+
+        run.incrementAttempt(for: .write)
+        run.markRunning(stage: .write, message: "Drafting the paper from checkpointed analysis.")
+
+        do {
+            let draft = try await openAI.writeResearchPaper(
+                notes: notes,
+                title: run.title,
+                theme: run.theme,
+                plan: plan,
+                analysis: analysis
+            )
+            try PaperArtifactStore.persistStageArtifact(draft, runID: run.runID, stage: .write)
+            run.markRunning(stage: .typeset, message: ResearchRunStage.typeset.title)
+            print("[Heartbeat]   -> Write stage completed for \(run.runID)")
+            try await finalizeResearchRun(run, paper: paper, analysis: analysis, draft: draft)
+        } catch {
+            handleResearchStageError(error, run: run, paper: paper, stage: .write)
+        }
+    }
+
+    private func finalizeResearchRun(
+        _ run: ResearchRun,
+        paper: Paper,
+        analysis: ResearchAnalysisArtifact,
+        draft: ResearchDraftArtifact
+    ) async throws {
+        run.markRunning(stage: .typeset, message: "Preparing the final PDF bundle.")
+        paper.title = draft.title
+        paper.markdown = draft.markdown
+        paper.figureData = analysis.figureData
+        paper.codexTaskID = run.runID
+        paper.status = .ready
+        run.title = draft.title
+
+        do {
+            try PaperArtifactStore.finalizeProvenance(
+                taskID: run.runID,
+                title: draft.title,
+                modelProvenance: analysis.provenance
+            )
+        } catch {
+            print("[Heartbeat]   -> Failed to persist staged provenance: \(error.localizedDescription)")
+        }
+
+        await PaperDocumentService.precomputeIfNeeded(for: paper)
+
+        if paper.lastNotifiedAt == nil {
+            notifications.notify(paper: paper)
+            paper.lastNotifiedAt = .now
+        }
+
+        run.markCompleted(message: "Paper ready.")
+        print("[Heartbeat]   -> Research run complete for \(run.runID)")
+    }
+
+    private func shouldRestartResearchAnalysis(
+        run: ResearchRun,
+        snapshot: PaperTaskProgressSnapshot
+    ) -> Bool {
+        guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
+            return false
+        }
+
+        let now = Date()
+        let taskStart = snapshot.taskCreatedAt
+            ?? snapshot.assistantTurnCreatedAt
+            ?? run.currentStageStartedAt
+            ?? run.updatedAt
+        let lastProgress = snapshot.latestEventAt
+            ?? snapshot.assistantTurnCreatedAt
+            ?? taskStart
+
+        let taskAge = now.timeIntervalSince(taskStart)
+        let progressAge = now.timeIntervalSince(lastProgress)
+
+        return taskAge >= remoteRetryGracePeriod
+            && (snapshot.outputCharacterCount == 0 || progressAge >= stalledEventGracePeriod)
+    }
+
+    private func handleResearchStageError(
+        _ error: Error,
+        run: ResearchRun,
+        paper: Paper,
+        stage: ResearchRunStage
+    ) {
+        let message = error.localizedDescription
+
+        if run.attemptCount(for: stage) >= maxResearchStageAttempts {
+            markResearchRunFailed(run, paper: paper, message: message)
+            return
+        }
+
+        run.status = .running
+        run.activeTaskID = nil
+        run.lastError = message
+        run.updateProgress(message: "Retrying \(stage.title.lowercased()) soon: \(message)")
+        print("[Heartbeat]   -> Stage \(stage.rawValue) failed for \(run.runID): \(message)")
+    }
+
+    private func markResearchRunFailed(
+        _ run: ResearchRun,
+        paper: Paper,
+        message: String
+    ) {
+        run.markFailed(message: message)
+        paper.status = .failed
+        print("[Heartbeat]   -> Research run failed for \(run.runID): \(message)")
+    }
+
     private func applyRecovery(_ recovery: RecoveryResult, to paper: Paper) async throws {
         switch recovery {
         case let .artifacts(artifacts, source):
@@ -382,64 +739,70 @@ final class HeartbeatManager: ObservableObject {
             }
 
             phase = .submittingPaper(cluster.suggestedTitle)
-            print("[Heartbeat]   Submitting paper task: \"\(cluster.suggestedTitle)\"...")
-
-            let submission = try await openAI.submitPaperTask(
+            print("[Heartbeat]   Starting staged research run: \"\(cluster.suggestedTitle)\"...")
+            try await beginResearchRun(
+                cluster: cluster,
                 notes: clusterNotes,
-                title: cluster.suggestedTitle,
-                theme: cluster.theme,
-                datasetIDs: cluster.datasetIDs
+                modelContext: modelContext
             )
-            print("[Heartbeat]   -> Task ID: \(submission.taskID)")
-
-            do {
-                try PaperArtifactStore.persistPendingSubmission(
-                    submission,
-                    title: cluster.suggestedTitle,
-                    theme: cluster.theme
-                )
-            } catch {
-                print("[Heartbeat]   -> Failed to persist submission metadata: \(error.localizedDescription)")
-            }
-
-            if let artifacts = submission.precomputedArtifacts {
-                let paper = Paper(
-                    title: artifacts.title,
-                    markdown: artifacts.markdown,
-                    status: .ready,
-                    codexTaskID: submission.taskID,
-                    sourceNoteIDs: cluster.noteIDs,
-                    figureData: artifacts.figures,
-                    lastNotifiedAt: .now
-                )
-                modelContext.insert(paper)
-
-                do {
-                    try PaperArtifactStore.finalizeProvenance(
-                        taskID: submission.taskID,
-                        title: artifacts.title,
-                        modelProvenance: artifacts.provenance
-                    )
-                } catch {
-                    print("[Heartbeat]   -> Failed to finalize local provenance: \(error.localizedDescription)")
-                }
-
-                await PaperDocumentService.precomputeIfNeeded(for: paper)
-                notifications.notify(paper: paper)
-            } else {
-                let paper = Paper(
-                    title: cluster.suggestedTitle,
-                    status: .generating,
-                    codexTaskID: submission.taskID,
-                    sourceNoteIDs: cluster.noteIDs
-                )
-                modelContext.insert(paper)
-            }
 
             submitted += 1
         }
 
         return submitted
+    }
+
+    private func beginResearchRun(
+        cluster: NoteCluster,
+        notes: [Note],
+        modelContext: ModelContext
+    ) async throws {
+        let preparation = try await openAI.prepareResearchRun(
+            notes: notes,
+            title: cluster.suggestedTitle,
+            theme: cluster.theme,
+            datasetIDs: cluster.datasetIDs
+        )
+        let runIDPrefix = preparation.draftArtifact == nil ? "run" : "local"
+        let runID = "\(runIDPrefix)-\(UUID().uuidString)"
+        let paper = Paper(
+            title: cluster.suggestedTitle,
+            status: .generating,
+            codexTaskID: runID,
+            sourceNoteIDs: cluster.noteIDs
+        )
+        let initialStage: ResearchRunStage = preparation.draftArtifact == nil ? .plan : .write
+        let run = ResearchRun(
+            runID: runID,
+            paperID: paper.id,
+            title: cluster.suggestedTitle,
+            theme: cluster.theme,
+            sourceNoteIDs: cluster.noteIDs,
+            datasetIDs: preparation.selectedDatasetIDs,
+            allowedDomains: preparation.allowedDomains,
+            registryVersion: preparation.registryVersion,
+            currentStage: initialStage,
+            status: .running
+        )
+
+        modelContext.insert(paper)
+        modelContext.insert(run)
+
+        if let plan = preparation.planArtifact {
+            try PaperArtifactStore.persistStageArtifact(plan, runID: runID, stage: .plan)
+        }
+
+        if let analysis = preparation.analysisArtifact {
+            try PaperArtifactStore.persistStageArtifact(analysis, runID: runID, stage: .analyze)
+        }
+
+        if let draft = preparation.draftArtifact {
+            try PaperArtifactStore.persistStageArtifact(draft, runID: runID, stage: .write)
+        }
+
+        run.markRunning(stage: initialStage, message: initialStage.title)
+        print("[Heartbeat]   -> Research run ID: \(runID)")
+        try await advanceResearchRun(run, paper: paper, notes: notes)
     }
 }
 

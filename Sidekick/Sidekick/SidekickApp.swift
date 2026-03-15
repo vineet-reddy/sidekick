@@ -12,7 +12,7 @@ struct SidekickApp: App {
     private let modelContainer: ModelContainer
 
     init() {
-        let schema = Schema([Note.self, Paper.self])
+        let schema = Schema([Note.self, Paper.self, ResearchRun.self])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
         do {
             modelContainer = try ModelContainer(for: schema, configurations: configuration)

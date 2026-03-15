@@ -169,6 +169,303 @@ final class OpenAIService: ObservableObject {
         }
     }
 
+    func prepareResearchRun(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String]
+    ) async throws -> ResearchRunPreparation {
+        let noteTexts = notes.map(\.content)
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            limit: 4
+        )
+        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
+        let registryVersion = await trustedDatasets.registryVersion()
+
+        if let localArtifacts = try await LocalPaperGenerationService.generateIfSupported(
+            title: title,
+            theme: theme,
+            noteTexts: noteTexts,
+            selectedDatasets: selectedDatasets,
+            session: session
+        ) {
+            return ResearchRunPreparation(
+                selectedDatasetIDs: selectedDatasets.map(\.id),
+                allowedDomains: allowedDomains,
+                registryVersion: registryVersion,
+                planArtifact: localPlanArtifact(
+                    title: title,
+                    theme: theme,
+                    selectedDatasets: selectedDatasets
+                ),
+                analysisArtifact: localAnalysisArtifact(
+                    selectedDatasets: selectedDatasets,
+                    artifacts: localArtifacts
+                ),
+                draftArtifact: ResearchDraftArtifact(
+                    title: localArtifacts.title,
+                    markdown: localArtifacts.markdown
+                )
+            )
+        }
+
+        return ResearchRunPreparation(
+            selectedDatasetIDs: selectedDatasets.map(\.id),
+            allowedDomains: allowedDomains,
+            registryVersion: registryVersion,
+            planArtifact: nil,
+            analysisArtifact: nil,
+            draftArtifact: nil
+        )
+    }
+
+    func createResearchPlan(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String]
+    ) async throws -> ResearchPlanArtifact {
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: notes.map(\.content),
+            limit: 4
+        )
+        let datasetCards = selectedDatasets.isEmpty
+            ? "- No trusted dataset cards were resolved for this run."
+            : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let notesBody = notes.map { note in
+            [
+                "id": note.id.uuidString,
+                "content": note.content
+            ]
+        }
+
+        let instructions = """
+        You are planning a scientific research run.
+        Return strict JSON only with this exact shape:
+        {
+          "question": "string",
+          "hypotheses": ["string"],
+          "dataset_needs": [
+            {
+              "dataset_id": "trusted-dataset-id or null",
+              "role": "primary or supporting",
+              "variables": ["string"],
+              "rationale": "string"
+            }
+          ],
+          "candidate_methods": ["string"],
+          "planned_figures": [
+            {
+              "identifier": "figure_1",
+              "title": "string",
+              "purpose": "string"
+            }
+          ],
+          "risks": ["string"],
+          "execution_notes": "string"
+        }
+
+        Requirements:
+        - Use only the provided notes and trusted dataset cards.
+        - Keep the plan concise, empirical, and executable.
+        - Do not write the paper yet.
+        """
+
+        let input = """
+        Suggested title: \(title)
+        Theme: \(theme)
+
+        Trusted dataset cards:
+        \(datasetCards)
+
+        Notes:
+        \(stringify(notesBody))
+        """
+
+        let response = try await createResponse(
+            for: .paperGeneration,
+            tools: [],
+            instructions: instructions,
+            input: input
+        )
+
+        return try decodeStructuredPayload(ResearchPlanArtifact.self, from: response.outputText)
+    }
+
+    func startResearchAnalysisTask(
+        notes: [Note],
+        title: String,
+        theme: String,
+        datasetIDs: [String],
+        allowedDomains: [String],
+        plan: ResearchPlanArtifact
+    ) async throws -> String {
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: notes.map(\.content),
+            limit: 4
+        )
+        let datasetCards = selectedDatasets.isEmpty
+            ? "- No trusted dataset cards were resolved for this run."
+            : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
+        let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
+        let notesBody = notes.map { note in
+            "- [\(note.id.uuidString)] \(note.content)"
+        }.joined(separator: "\n\n")
+
+        let prompt = """
+        You are a research scientist using Code Interpreter.
+        Run the empirical analysis only. Do not write the paper yet.
+
+        Requirements:
+        1. Prefer the vetted dataset cards below before using anything else.
+        2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
+        3. Access real data, run the analysis, and produce real figures when warranted.
+        4. Return strict JSON only with this exact shape:
+           {
+             "dataset_manifest": {
+               "primary_dataset_ids": ["trusted-dataset-id"],
+               "data_sources": ["string"],
+               "sample_description": "string",
+               "row_count": 123,
+               "selected_variables": ["string"],
+               "quality_notes": ["string"]
+             },
+             "narrative_summary": "string",
+             "findings": [
+               {
+                 "claim": "string",
+                 "estimate": "string",
+                 "uncertainty": "string",
+                 "evidence": "string",
+                 "supports_hypothesis": true
+               }
+             ],
+             "tables": [
+               {
+                 "identifier": "table_1",
+                 "title": "string",
+                 "columns": ["string"],
+                 "rows": [["string"]],
+                 "notes": "string"
+               }
+             ],
+             "figures": [
+               {
+                 "filename": "figure_1.png",
+                 "caption": "string",
+                 "mime_type": "image/png",
+                 "base64_data": "base64 png bytes"
+               }
+             ],
+             "limitations": ["string"],
+             "provenance": {
+               "used_dataset_ids": ["trusted-dataset-id"],
+               "accessed_domains": ["domain"],
+               "left_trusted_set": false,
+               "external_sources": ["optional domain or source name"],
+               "notes": "short summary of data access and limits"
+             }
+           }
+        5. Include concrete estimates, diagnostics, sample sizes, and uncertainty whenever the data support them.
+        6. If the analysis cannot be completed, maximize the structured evidence you can deliver instead of returning a memo.
+        7. The final assistant message must contain only the JSON object and nothing before or after it.
+
+        Suggested title: \(title)
+        Theme: \(theme)
+        Approved domains: \(allowedDomainText)
+
+        Trusted dataset cards:
+        \(datasetCards)
+
+        Notes:
+        \(notesBody)
+
+        Research plan JSON:
+        \(prettyJSONString(plan))
+        """
+
+        return try await createTask(prompt: prompt)
+    }
+
+    func checkResearchAnalysisTask(_ taskID: String) async throws -> ResearchAnalysisTaskCheckResult {
+        let task = try await fetchTask(taskID: taskID)
+        let snapshot = task.progressSnapshot(taskID: taskID)
+        persistDebugPayload(Data(task.outputText.utf8), named: "analysis-task-output-\(taskID).txt")
+
+        switch task.normalizedStatus {
+        case "queued", "in_progress", "incomplete":
+            return .waiting(snapshot)
+        case "completed":
+            break
+        case "failed", "cancelled":
+            return .failed(snapshot, task.errorMessage ?? "The analysis task failed.")
+        default:
+            return .waiting(snapshot)
+        }
+
+        let artifact = try decodeStructuredPayload(ResearchAnalysisArtifact.self, from: task.outputText)
+        return .completed(snapshot, artifact)
+    }
+
+    func writeResearchPaper(
+        notes: [Note],
+        title: String,
+        theme: String,
+        plan: ResearchPlanArtifact,
+        analysis: ResearchAnalysisArtifact
+    ) async throws -> ResearchDraftArtifact {
+        let noteSummaries = notes.map { note in
+            [
+                "id": note.id.uuidString,
+                "content": note.content
+            ]
+        }
+
+        let instructions = """
+        You are writing a concise professional paper from verified research artifacts.
+        Use the supplied plan and analysis only. Do not invent new results.
+
+        Return strict JSON only with this exact shape:
+        {
+          "title": "string",
+          "markdown": "clean academic markdown only, with references to bare figure_1.png style filenames"
+        }
+
+        Requirements:
+        - Write a compact empirical paper, not a planning memo.
+        - Prefer standard sections such as Abstract, Introduction, Data, Methods, Results, Discussion, and References when they fit.
+        - When referencing figures, use bare filenames like `figure_1.png`.
+        - Do not include tool traces, logs, reproducibility checklists, repo paths, or app-meta commentary.
+        """
+
+        let input = """
+        Suggested title: \(title)
+        Theme: \(theme)
+
+        Notes:
+        \(stringify(noteSummaries))
+
+        Research plan JSON:
+        \(prettyJSONString(plan))
+
+        Analysis JSON:
+        \(stringify(analysisPromptPayload(from: analysis)))
+        """
+
+        let response = try await createResponse(
+            for: .paperGeneration,
+            tools: [],
+            instructions: instructions,
+            input: input
+        )
+
+        return try decodeStructuredPayload(ResearchDraftArtifact.self, from: response.outputText)
+    }
+
     func submitPaperTask(
         notes: [Note],
         title: String,
@@ -1010,6 +1307,171 @@ final class OpenAIService: ObservableObject {
         }
 
         return string
+    }
+
+    private func prettyJSONString<T: Encodable>(_ value: T) -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        guard let data = try? encoder.encode(value),
+              let string = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+
+        return string
+    }
+
+    private func decodeStructuredPayload<T: Decodable>(_ type: T.Type, from raw: String) throws -> T {
+        guard let data = normalizedJSONData(from: raw) else {
+            throw ServiceError.malformedPayload
+        }
+
+        do {
+            return try JSONDecoder().decode(type, from: data)
+        } catch {
+            log("decodeStructuredPayload failed for \(String(describing: type)): \(String(describing: error))")
+            log("decodeStructuredPayload preview: \(preview(String(data: data, encoding: .utf8) ?? "<non-utf8>", limit: 400))")
+            throw error
+        }
+    }
+
+    private func localPlanArtifact(
+        title: String,
+        theme: String,
+        selectedDatasets: [TrustedDataset]
+    ) -> ResearchPlanArtifact {
+        let datasetNeeds = selectedDatasets.map { dataset in
+            ResearchDatasetNeed(
+                datasetID: dataset.id,
+                role: "primary",
+                variables: ["Diabetes_012", "HighBP", "BMI", "PhysActivity", "GenHlth"],
+                rationale: "The BRFSS validation slice uses this trusted dataset for diabetes prevalence summaries and logistic regression."
+            )
+        }
+
+        return ResearchPlanArtifact(
+            question: theme.isEmpty ? title : theme,
+            hypotheses: [
+                "The note cluster can be evaluated with a BRFSS-based empirical wedge.",
+                "Cardiometabolic and self-reported health measures should explain meaningful variation in diagnosed diabetes."
+            ],
+            datasetNeeds: datasetNeeds,
+            candidateMethods: [
+                "Cross-sectional prevalence summaries.",
+                "Logistic regression for diagnosed diabetes using hypertension, BMI, physical activity, and general health."
+            ],
+            plannedFigures: [
+                ResearchFigurePlan(
+                    identifier: "figure_1",
+                    title: "Diabetes prevalence by BMI category",
+                    purpose: "Show the cross-sectional relationship between BMI strata and diagnosed diabetes."
+                ),
+                ResearchFigurePlan(
+                    identifier: "figure_2",
+                    title: "Adjusted odds ratios from logistic regression",
+                    purpose: "Summarize the multivariable regression estimates."
+                )
+            ],
+            risks: [
+                "The local BRFSS slice is a validation wedge, not the intended general-purpose architecture."
+            ],
+            executionNotes: "Used the trusted BRFSS slice to preserve the working empirical loop while staged remote runs are introduced."
+        )
+    }
+
+    private func localAnalysisArtifact(
+        selectedDatasets: [TrustedDataset],
+        artifacts: PaperArtifacts
+    ) -> ResearchAnalysisArtifact {
+        let figures = artifacts.figures.enumerated().map { index, figureData in
+            ResearchFigureArtifact(
+                filename: "figure_\(index + 1).png",
+                caption: "Local BRFSS validation figure \(index + 1)",
+                mimeType: "image/png",
+                base64Data: figureData.base64EncodedString()
+            )
+        }
+
+        return ResearchAnalysisArtifact(
+            datasetManifest: ResearchDatasetManifest(
+                primaryDatasetIDs: selectedDatasets.map(\.id),
+                dataSources: selectedDatasets.map(\.title),
+                sampleDescription: artifacts.provenance?.notes ?? "Local BRFSS validation slice executed successfully.",
+                rowCount: nil,
+                selectedVariables: ["Diabetes_012", "HighBP", "BMI", "PhysActivity", "GenHlth"],
+                qualityNotes: [
+                    "The local BRFSS wedge stores the finished figures and paper artifact first; typed coefficient tables can be expanded later."
+                ]
+            ),
+            narrativeSummary: "A trusted BRFSS dataset was analyzed locally to preserve the working empirical slice while the staged remote architecture is introduced.",
+            findings: [
+                ResearchFinding(
+                    claim: "The BRFSS validation wedge completed successfully.",
+                    estimate: "See the finalized paper body for computed estimates.",
+                    uncertainty: "The finished paper reports the uncertainty directly.",
+                    evidence: "The local fallback generated a ready paper and figures from trusted data.",
+                    supportsHypothesis: nil
+                )
+            ],
+            tables: [],
+            figures: figures,
+            limitations: [
+                "The local fallback remains BRFSS-specific and should not become the primary architecture.",
+                "This first staged version persists the finished local artifact bundle before exposing richer typed local tables."
+            ],
+            provenance: artifacts.provenance ?? TaskOutputProvenance(
+                usedDatasetIDs: selectedDatasets.map(\.id),
+                accessedDomains: TrustedDatasetRegistry.allowedDomains(for: selectedDatasets),
+                leftTrustedSet: false,
+                externalSources: [],
+                notes: "Local BRFSS validation slice."
+            )
+        )
+    }
+
+    private func analysisPromptPayload(from analysis: ResearchAnalysisArtifact) -> [String: Any] {
+        [
+            "dataset_manifest": [
+                "primary_dataset_ids": analysis.datasetManifest.primaryDatasetIDs,
+                "data_sources": analysis.datasetManifest.dataSources,
+                "sample_description": analysis.datasetManifest.sampleDescription,
+                "row_count": analysis.datasetManifest.rowCount.map { NSNumber(value: $0) } ?? NSNull(),
+                "selected_variables": analysis.datasetManifest.selectedVariables,
+                "quality_notes": analysis.datasetManifest.qualityNotes
+            ],
+            "narrative_summary": analysis.narrativeSummary,
+            "findings": analysis.findings.map { finding in
+                [
+                    "claim": finding.claim,
+                    "estimate": finding.estimate,
+                    "uncertainty": finding.uncertainty,
+                    "evidence": finding.evidence,
+                    "supports_hypothesis": finding.supportsHypothesis.map { NSNumber(value: $0) } as Any? ?? NSNull()
+                ]
+            },
+            "tables": analysis.tables.map { table in
+                [
+                    "identifier": table.identifier,
+                    "title": table.title,
+                    "columns": table.columns,
+                    "rows": table.rows,
+                    "notes": table.notes ?? NSNull()
+                ]
+            },
+            "figures": analysis.figures.map { figure in
+                [
+                    "filename": figure.filename,
+                    "caption": figure.caption
+                ]
+            },
+            "limitations": analysis.limitations,
+            "provenance": [
+                "used_dataset_ids": analysis.provenance.usedDatasetIDs,
+                "accessed_domains": analysis.provenance.accessedDomains,
+                "left_trusted_set": analysis.provenance.leftTrustedSet,
+                "external_sources": analysis.provenance.externalSources,
+                "notes": analysis.provenance.notes
+            ]
+        ]
     }
 
     private func normalizedJSONData(from raw: String) -> Data? {
