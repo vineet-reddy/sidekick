@@ -3,11 +3,13 @@ import UIKit
 
 enum ExportService {
     static func exportLaTeX(for paper: Paper) async throws -> URL {
-        try await PaperDocumentService.ensureLaTeX(for: paper)
+        let sourceURL = try await PaperDocumentService.ensureLaTeX(for: paper)
+        return try exportedCopy(of: sourceURL, paperTitle: paper.title, fallbackBasename: "sidekick-paper", fileExtension: "tex")
     }
 
     static func exportPDF(for paper: Paper) async throws -> URL {
-        try await PaperDocumentService.ensurePDF(for: paper)
+        let sourceURL = try await PaperDocumentService.ensurePDF(for: paper)
+        return try exportedCopy(of: sourceURL, paperTitle: paper.title, fallbackBasename: "sidekick-paper", fileExtension: "pdf")
     }
 
     static func latexDocument(for paper: Paper, figureCaptions: [String] = []) -> String {
@@ -36,6 +38,54 @@ enum ExportService {
         \(body)
         \\end{document}
         """
+    }
+
+    private static func exportedCopy(
+        of sourceURL: URL,
+        paperTitle: String,
+        fallbackBasename: String,
+        fileExtension: String
+    ) throws -> URL {
+        let fileManager = FileManager.default
+        let exportsDirectory = fileManager.temporaryDirectory.appendingPathComponent(
+            "SidekickExports",
+            isDirectory: true
+        )
+        try fileManager.createDirectory(at: exportsDirectory, withIntermediateDirectories: true)
+
+        let basename = sanitizedExportBasename(
+            from: paperTitle,
+            fallback: fallbackBasename
+        )
+        let destinationURL = exportsDirectory
+            .appendingPathComponent(basename)
+            .appendingPathExtension(fileExtension)
+
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            try fileManager.removeItem(at: destinationURL)
+        }
+
+        try fileManager.copyItem(at: sourceURL, to: destinationURL)
+        return destinationURL
+    }
+
+    private static func sanitizedExportBasename(from title: String, fallback: String) -> String {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let raw = trimmed.isEmpty ? fallback : trimmed
+
+        let invalidCharacters = CharacterSet(charactersIn: "/\\?%*|\"<>:\n\r\t")
+        let cleanedScalars = raw.unicodeScalars.map { scalar in
+            invalidCharacters.contains(scalar) ? " " : String(scalar)
+        }.joined()
+
+        let collapsedWhitespace = cleanedScalars
+            .replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let limited = String(collapsedWhitespace.prefix(120))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return limited.isEmpty ? fallback : limited
     }
 }
 

@@ -815,9 +815,13 @@ final class OpenAIService: ObservableObject {
         - The caption for `figure_1.png` must explicitly name the plotted stratifications and state whether the saved figure includes the risk table, so downstream verification can confirm the requirement from the checkpointed artifact.
         - Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.
         - Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
+        - Include a table or table note that reports the exact number of patients contributing to every Kaplan-Meier stratum shown in the saved figure and the exact complete-case sample size used for the Cox model.
+        - If HM27 and HM450 MGMT measurements are both present, report the exact count available from each assay and the exact merge rule used in the model.
         - If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
         - If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
         - If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
+        - Keep narrative claims directionally consistent with the reported estimates and confidence intervals; do not describe an effect as harmful or protective if the estimate and uncertainty do not support that wording.
+        - When a subgroup is small or the confidence interval is wide, qualify the claim explicitly in the narrative and limitations instead of stating a definitive benefit or harm.
         - If the strongest trustworthy result is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
         - `findings[].evidence` must cite exact counts, field names, subgroup definitions, or figure/table identifiers from this run.
         - If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
@@ -945,16 +949,20 @@ final class OpenAIService: ObservableObject {
         9. The caption for `figure_1.png` must explicitly name the plotted stratifications and state whether the saved figure includes the risk table, so downstream verification can confirm the requirement from the checkpointed artifact.
         10. Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.
         11. Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
-        12. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
-        13. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
-        14. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
-        15. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        16. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
-        17. Report sex distributions or explicitly explain why the supplied fields cannot support them.
-        18. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
-        19. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
-        20. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
-        21. The final assistant message must contain only the JSON object and nothing before or after it.
+        12. Include a table or table note that reports the exact number of patients contributing to every Kaplan-Meier stratum shown in the saved figure and the exact complete-case sample size used for the Cox model.
+        13. If HM27 and HM450 MGMT measurements are both present, report the exact count available from each assay and the exact merge rule used in the model.
+        14. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
+        15. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
+        16. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
+        17. Keep narrative claims directionally consistent with the reported estimates and confidence intervals; do not describe an effect as harmful or protective if the estimate and uncertainty do not support that wording.
+        18. When a subgroup is small or the confidence interval is wide, qualify the claim explicitly in the narrative and limitations instead of stating a definitive benefit or harm.
+        19. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
+        20. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
+        21. Report sex distributions or explicitly explain why the supplied fields cannot support them.
+        22. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
+        23. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
+        24. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
+        25. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -1993,10 +2001,10 @@ final class OpenAIService: ObservableObject {
         joinedPayload: String
     ) throws -> [StreamedResponseEvent] {
         do {
-            return [try decodeSingleStreamedEvent(from: joinedPayload)]
-        } catch {
+            return [try decodeSingleStreamedEvent(from: joinedPayload, logOnFailure: dataLines.count == 1)]
+        } catch let joinedError {
             guard dataLines.count > 1 else {
-                throw error
+                throw joinedError
             }
 
             log("processStreamedEvent retrying batched SSE payload line-by-line. line_count=\(dataLines.count)")
@@ -2004,25 +2012,41 @@ final class OpenAIService: ObservableObject {
             var events: [StreamedResponseEvent] = []
             events.reserveCapacity(dataLines.count)
 
-            for line in dataLines {
-                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !trimmed.isEmpty, trimmed != "[DONE]" else {
-                    continue
-                }
+            do {
+                for line in dataLines {
+                    let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !trimmed.isEmpty, trimmed != "[DONE]" else {
+                        continue
+                    }
 
-                events.append(try decodeSingleStreamedEvent(from: trimmed))
+                    events.append(try decodeSingleStreamedEvent(from: trimmed, logOnFailure: false))
+                }
+            } catch let lineError {
+                log(
+                    "processStreamedEvent failed to decode joined SSE payload and line-by-line fallback. " +
+                        "joined_error=\(String(describing: joinedError)) line_error=\(String(describing: lineError))"
+                )
+                log("processStreamedEvent payload preview: \(preview(joinedPayload, limit: 500))")
+                throw lineError
             }
 
             return events
         }
     }
 
-    private func decodeSingleStreamedEvent(from payload: String) throws -> StreamedResponseEvent {
+    private func decodeSingleStreamedEvent(
+        from payload: String,
+        logOnFailure: Bool = true
+    ) throws -> StreamedResponseEvent {
         let data = Data(payload.utf8)
 
         do {
             return try JSONDecoder().decode(StreamedResponseEvent.self, from: data)
         } catch {
+            guard logOnFailure else {
+                throw error
+            }
+
             log("processStreamedEvent failed to decode SSE event: \(String(describing: error))")
             log("processStreamedEvent payload preview: \(preview(payload, limit: 500))")
             throw error
@@ -2134,12 +2158,41 @@ final class OpenAIService: ObservableObject {
     }
 
     private func stringify(_ value: Any) -> String {
-        guard let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted]),
+        let sanitized = jsonCompatibleValue(value)
+        guard JSONSerialization.isValidJSONObject(sanitized),
+              let data = try? JSONSerialization.data(withJSONObject: sanitized, options: [.prettyPrinted]),
               let string = String(data: data, encoding: .utf8) else {
             return "[]"
         }
 
         return string
+    }
+
+    private func jsonCompatibleValue(_ value: Any) -> Any {
+        switch value {
+        case is NSNull:
+            return NSNull()
+        case let string as String:
+            return string
+        case let number as NSNumber:
+            return number
+        case let array as [Any]:
+            return array.map(jsonCompatibleValue)
+        case let dictionary as [String: Any]:
+            return dictionary.mapValues(jsonCompatibleValue)
+        case let date as Date:
+            return ISO8601DateFormatter().string(from: date)
+        default:
+            let mirror = Mirror(reflecting: value)
+            if mirror.displayStyle == .optional {
+                if let wrapped = mirror.children.first?.value {
+                    return jsonCompatibleValue(wrapped)
+                }
+                return NSNull()
+            }
+
+            return String(describing: value)
+        }
     }
 
     private func prettyJSONString<T: Encodable>(_ value: T) -> String {
@@ -2369,12 +2422,20 @@ final class OpenAIService: ObservableObject {
                 ]
             },
             "figures": analysis.figures.map { figure in
-                let imageData = figure.imageData
-                [
+                if let imageData = figure.imageData {
+                    return [
+                        "filename": figure.filename,
+                        "caption": figure.caption,
+                        "asset_status": "ok",
+                        "image_bytes": NSNumber(value: imageData.count)
+                    ]
+                }
+
+                return [
                     "filename": figure.filename,
                     "caption": figure.caption,
-                    "asset_status": imageData == nil ? "missing_or_unusable" : "ok",
-                    "image_bytes": imageData.map { NSNumber(value: $0.count) } ?? NSNull()
+                    "asset_status": "missing_or_unusable",
+                    "image_bytes": NSNull()
                 ]
             },
             "limitations": analysis.limitations,
