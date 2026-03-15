@@ -1,14 +1,13 @@
 import Foundation
 
 enum PaperHTMLBuilder {
-    static func html(for paper: Paper) -> String {
-        let normalizedMarkdown = PaperContentNormalizer.normalize(markdown: paper.markdown)
+    static func html(for paper: Paper, figureCaptions: [String] = []) -> String {
+        let normalizedMarkdown = PaperContentNormalizer.normalize(
+            markdown: paper.markdown,
+            figureCaptions: figureCaptions
+        )
         var html = MarkdownHTMLRenderer.render(markdown: normalizedMarkdown)
-        for (index, data) in paper.figureData.enumerated() {
-            let filename = "figure_\(index + 1).png"
-            let replacement = "data:image/png;base64,\(data.base64EncodedString())"
-            html = html.replacingOccurrences(of: filename, with: replacement)
-        }
+        html = replaceFigureSources(in: html, figures: paper.figureData)
         html = stylizeFigures(in: html)
         html = mergeFigureCaptions(in: html)
         html = stylizeAbstract(in: html)
@@ -222,6 +221,21 @@ enum PaperHTMLBuilder {
         """
     }
 
+    private static func replaceFigureSources(in html: String, figures: [Data]) -> String {
+        var updated = html
+
+        for (index, data) in figures.enumerated() {
+            let filename = "figure_\(index + 1).png"
+            let replacement = "data:image/png;base64,\(data.base64EncodedString())"
+            updated = updated.replacingOccurrences(
+                of: "src=\"\(filename)\"",
+                with: "src=\"\(replacement)\""
+            )
+        }
+
+        return updated
+    }
+
     private static func stylizeAbstract(in html: String) -> String {
         replacing(
             pattern: #"(?s)<h2>Abstract</h2>\s*<p>(.*?)</p>"#,
@@ -263,7 +277,7 @@ enum PaperHTMLBuilder {
 }
 
 enum PaperContentNormalizer {
-    static func normalize(markdown: String) -> String {
+    static func normalize(markdown: String, figureCaptions: [String] = []) -> String {
         var value = markdown
 
         if let decoded = decodeJSONStringFragment(markdown) {
@@ -312,6 +326,8 @@ enum PaperContentNormalizer {
             template: "this paper"
         )
 
+        value = materializeBareFigureReferences(in: value, figureCaptions: figureCaptions)
+
         value = droppingSections(
             titled: [
                 "reproducibility checks",
@@ -330,6 +346,81 @@ enum PaperContentNormalizer {
         }
 
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func materializeBareFigureReferences(
+        in markdown: String,
+        figureCaptions: [String]
+    ) -> String {
+        guard !figureCaptions.isEmpty else {
+            return markdown
+        }
+
+        let figureMetadata = figureCaptions.enumerated().map { index, caption in
+            FigureReference(
+                filename: "figure_\(index + 1).png",
+                label: "Figure \(index + 1)",
+                caption: caption.trimmingCharacters(in: .whitespacesAndNewlines)
+            )
+        }
+        let explicitFigureFilenames = Set(
+            figureMetadata.compactMap { metadata in
+                markdown.contains("](\(metadata.filename))") ? metadata.filename : nil
+            }
+        )
+
+        var currentHeading: String?
+        var insertedFigures = Set<String>()
+        var output: [String] = []
+
+        for line in markdown.components(separatedBy: .newlines) {
+            let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let heading = markdownHeadingTitle(from: trimmed) {
+                currentHeading = heading.lowercased()
+            }
+
+            var processedLine = line
+            var mentionedFigures: [FigureReference] = []
+
+            for metadata in figureMetadata where !explicitFigureFilenames.contains(metadata.filename) {
+                guard processedLine.contains(metadata.filename) else {
+                    continue
+                }
+
+                processedLine = replaceFigureReferenceToken(
+                    in: processedLine,
+                    filename: metadata.filename,
+                    label: metadata.label
+                )
+                mentionedFigures.append(metadata)
+            }
+
+            output.append(processedLine)
+
+            guard currentHeading != "abstract" else {
+                continue
+            }
+
+            for metadata in mentionedFigures where !insertedFigures.contains(metadata.filename) {
+                if output.last?.isEmpty == false {
+                    output.append("")
+                }
+                output.append("![\(metadata.altText)](\(metadata.filename))")
+                output.append("")
+                insertedFigures.insert(metadata.filename)
+            }
+        }
+
+        for metadata in figureMetadata
+        where !explicitFigureFilenames.contains(metadata.filename) && !insertedFigures.contains(metadata.filename) {
+            if output.last?.isEmpty == false {
+                output.append("")
+            }
+            output.append("![\(metadata.altText)](\(metadata.filename))")
+            output.append("")
+        }
+
+        return output.joined(separator: "\n")
     }
 
     private static func decodeJSONStringFragment(_ fragment: String) -> String? {
@@ -386,6 +477,28 @@ enum PaperContentNormalizer {
         let stripped = line.drop(while: { $0 == "#" || $0.isWhitespace })
         let title = stripped.trimmingCharacters(in: .whitespacesAndNewlines)
         return title.isEmpty ? nil : title
+    }
+
+    private static func replaceFigureReferenceToken(
+        in line: String,
+        filename: String,
+        label: String
+    ) -> String {
+        replacing(
+            pattern: "`?\(NSRegularExpression.escapedPattern(for: filename))`?",
+            in: line,
+            template: label
+        )
+    }
+}
+
+private struct FigureReference {
+    let filename: String
+    let label: String
+    let caption: String
+
+    var altText: String {
+        caption.isEmpty ? label : caption
     }
 }
 

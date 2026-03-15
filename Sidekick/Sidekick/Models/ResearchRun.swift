@@ -279,6 +279,25 @@ final class ResearchRun {
     }
 }
 
+extension Sequence where Element == ResearchRun {
+    func latestRunsByPaperID() -> [UUID: ResearchRun] {
+        reduce(into: [UUID: ResearchRun]()) { result, run in
+            if let existing = result[run.paperID], existing.updatedAt >= run.updatedAt {
+                return
+            }
+
+            result[run.paperID] = run
+        }
+    }
+
+    func latestRun(for paperID: UUID) -> ResearchRun? {
+        filter { $0.paperID == paperID }
+            .max { lhs, rhs in
+                lhs.updatedAt < rhs.updatedAt
+            }
+    }
+}
+
 nonisolated struct ResearchDatasetNeed: Codable {
     let datasetID: String?
     let role: String

@@ -10,9 +10,12 @@ enum ExportService {
         try await PaperDocumentService.ensurePDF(for: paper)
     }
 
-    static func latexDocument(for paper: Paper) -> String {
+    static func latexDocument(for paper: Paper, figureCaptions: [String] = []) -> String {
         let title = paper.title.replacingOccurrences(of: "\\", with: "\\\\")
-        let normalizedMarkdown = PaperContentNormalizer.normalize(markdown: paper.markdown)
+        let normalizedMarkdown = PaperContentNormalizer.normalize(
+            markdown: paper.markdown,
+            figureCaptions: figureCaptions
+        )
         let body = LatexRenderer.render(
             markdown: LatexRenderer.strippingLeadingTitle(from: normalizedMarkdown, title: paper.title)
         )
@@ -150,18 +153,12 @@ private enum LatexRenderer {
             return "\\subsection{\(escape(text.dropFirst(4)))}"
         }
 
-        if text.hasPrefix("!["),
-           let altStart = text.firstIndex(of: "["),
-           let altEnd = text.firstIndex(of: "]"),
-           let pathStart = text.firstIndex(of: "("),
-           let pathEnd = text.lastIndex(of: ")") {
-            let caption = text[text.index(after: altStart) ..< altEnd]
-            let path = text[text.index(after: pathStart) ..< pathEnd]
+        if let image = parseImageMarkdown(text) {
             return """
             \\begin{figure}[h]
             \\centering
-            \\includegraphics[width=\\linewidth]{\(escape(path))}
-            \\caption{\(escape(caption))}
+            \\includegraphics[width=\\linewidth]{\(escape(image.path))}
+            \\caption{\(escape(image.caption))}
             \\end{figure}
             """
         }
@@ -171,6 +168,21 @@ private enum LatexRenderer {
         }
 
         return escape(text)
+    }
+
+    nonisolated private static func parseImageMarkdown(_ text: String) -> (caption: String, path: String)? {
+        guard let regex = try? NSRegularExpression(pattern: #"!\[([^\]]*)\]\(([^)\n]+)\)"#) else {
+            return nil
+        }
+
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              let captionRange = Range(match.range(at: 1), in: text),
+              let pathRange = Range(match.range(at: 2), in: text) else {
+            return nil
+        }
+
+        return (String(text[captionRange]), String(text[pathRange]))
     }
 
     nonisolated private static func escape<S: StringProtocol>(_ text: S) -> String {

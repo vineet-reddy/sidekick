@@ -125,12 +125,12 @@ final class HeartbeatManager: ObservableObject {
 
     private func resolveInFlightPapers(modelContext: ModelContext) async throws {
         let papers = try modelContext.fetch(
-            FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+            FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
         )
         let runs = try modelContext.fetch(
-            FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+            FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
         )
-        let runsByPaperID = Dictionary(uniqueKeysWithValues: runs.map { ($0.paperID, $0) })
+        let runsByPaperID = runs.latestRunsByPaperID()
         let recoverablePaperIDs = Set(
             runs.compactMap { run in
                 pendingAnalysisRevision(for: run.runID) == nil ? nil : run.paperID

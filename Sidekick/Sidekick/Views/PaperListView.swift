@@ -3,8 +3,8 @@ import SwiftUI
 
 struct PaperListView: View {
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \Paper.createdAt, order: .reverse) private var papers: [Paper]
-    @Query(sort: \ResearchRun.createdAt, order: .reverse) private var runs: [ResearchRun]
+    @Query(sort: \Paper.updatedAt, order: .reverse) private var papers: [Paper]
+    @Query(sort: \ResearchRun.updatedAt, order: .reverse) private var runs: [ResearchRun]
     @State private var path: [UUID] = []
     @State private var hasAutoOpenedLatestReadyPaper = false
 
@@ -70,7 +70,7 @@ struct PaperListView: View {
     }
 
     private var runsByPaperID: [UUID: ResearchRun] {
-        Dictionary(uniqueKeysWithValues: runs.map { ($0.paperID, $0) })
+        runs.latestRunsByPaperID()
     }
 
     private func autoOpenLatestReadyPaperIfNeeded() {
@@ -103,7 +103,7 @@ struct PaperListView: View {
             }
 
             HStack {
-                Text(paper.createdAt, style: .relative)
+                Text(paper.updatedAt, style: .relative)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
 

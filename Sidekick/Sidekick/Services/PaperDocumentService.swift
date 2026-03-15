@@ -14,7 +14,7 @@ enum PaperDocumentService {
         }
     }
 
-    private static let renderVersion = 4
+    private static let renderVersion = 6
 
     static func ensurePDF(for paper: Paper) async throws -> URL {
         try await ensureRenderedBundle(for: paper).pdfURL
@@ -39,13 +39,14 @@ enum PaperDocumentService {
 
     private static func ensureRenderedBundle(for paper: Paper) async throws -> PaperArtifactStore.RenderedPaperBundle {
         let taskID = artifactKey(for: paper)
+        let analysis = PaperArtifactStore.stageArtifact(
+            ResearchAnalysisArtifact.self,
+            runID: taskID,
+            stage: .analyze
+        )
+        let figureCaptions = analysis?.figures.map(\.caption) ?? []
 
-        if paper.figureData.isEmpty,
-           let analysis = PaperArtifactStore.stageArtifact(
-               ResearchAnalysisArtifact.self,
-               runID: taskID,
-               stage: .analyze
-           ) {
+        if paper.figureData.isEmpty, let analysis {
             let recoveredFigures = analysis.figureData
             if !recoveredFigures.isEmpty {
                 print("[PaperDocs] recovered \(recoveredFigures.count) figure(s) from staged analysis task=\(taskID)")
@@ -61,8 +62,8 @@ enum PaperDocumentService {
         }
 
         print("[PaperDocs] rendering bundle task=\(taskID)")
-        let html = PaperHTMLBuilder.html(for: paper)
-        let latex = ExportService.latexDocument(for: paper)
+        let html = PaperHTMLBuilder.html(for: paper, figureCaptions: figureCaptions)
+        let latex = ExportService.latexDocument(for: paper, figureCaptions: figureCaptions)
         let pdfData = try renderPDF(from: html)
 
         return try PaperArtifactStore.persistRenderedBundle(

@@ -5,7 +5,7 @@ import SwiftUI
 struct PaperDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \ResearchRun.createdAt, order: .reverse) private var runs: [ResearchRun]
+    @Query(sort: \ResearchRun.updatedAt, order: .reverse) private var runs: [ResearchRun]
     @State private var shareItem: ShareItem?
     @State private var exportError: String?
     @State private var isShowingExportError = false
@@ -39,6 +39,7 @@ struct PaperDetailView: View {
         }
         .navigationTitle(paper.title.isEmpty ? "Paper" : paper.title)
         .navigationBarTitleDisplayMode(.inline)
+        .toolbar(.hidden, for: .tabBar)
         .task(id: paper.updatedAt) {
             await loadDocumentIfNeeded()
         }
@@ -113,7 +114,7 @@ struct PaperDetailView: View {
     }
 
     private var researchRun: ResearchRun? {
-        runs.first(where: { $0.paperID == paper.id })
+        runs.latestRun(for: paper.id)
     }
 
     private func progressCard(title: String, message: String) -> some View {
