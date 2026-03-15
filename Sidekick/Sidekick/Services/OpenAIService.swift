@@ -503,11 +503,7 @@ final class OpenAIService: ObservableObject {
         \(fallback.promptJSON)
         """
 
-        let response = try await createResponse(
-            for: .researchStageFallback,
-            tools: codeInterpreterTools(),
-            toolChoice: "required",
-            responseBaseURL: apiBaseURL,
+        let response = try await createResearchStageFallbackResponse(
             instructions: instructions,
             input: input
         )
@@ -823,11 +819,7 @@ final class OpenAIService: ObservableObject {
         \(fallback.promptJSON)
         """
 
-        let response = try await createResponse(
-            for: .researchStageFallback,
-            tools: codeInterpreterTools(),
-            toolChoice: "required",
-            responseBaseURL: apiBaseURL,
+        let response = try await createResearchStageFallbackResponse(
             instructions: instructions,
             input: input
         )
@@ -1298,7 +1290,7 @@ final class OpenAIService: ObservableObject {
         }
 
         return figures.compactMap { figure in
-            Data(base64Encoded: figure.base64Data)
+            decodeSidekickBase64Payload(figure.base64Data)
         }
     }
 
@@ -1378,6 +1370,40 @@ final class OpenAIService: ObservableObject {
         throw ServiceError.taskFailed(
             "OpenAI did not accept any recommended \(workload.description) model. Tried \(candidates.joined(separator: ", ")). \(details)"
         )
+    }
+
+    private func createResearchStageFallbackResponse(
+        instructions: String,
+        input: String
+    ) async throws -> ResponseEnvelope {
+        do {
+            return try await createResponse(
+                for: .researchStageFallback,
+                tools: codeInterpreterTools(),
+                toolChoice: "required",
+                responseBaseURL: apiBaseURL,
+                instructions: instructions,
+                input: input
+            )
+        } catch {
+            guard shouldRetryResearchStageFallbackResponse(after: error) else {
+                throw error
+            }
+
+            log(
+                "createResearchStageFallbackResponse retrying via ChatGPT backend /codex/responses " +
+                    "after api failure: \(String(describing: error))"
+            )
+
+            return try await createResponse(
+                for: .researchStageFallback,
+                tools: codeInterpreterTools(),
+                toolChoice: "required",
+                responseBaseURL: codexBaseURL,
+                instructions: instructions,
+                input: input
+            )
+        }
     }
 
     private func createTask(
@@ -2369,6 +2395,22 @@ final class OpenAIService: ObservableObject {
         ]
 
         return retryableIndicators.contains(where: normalized.contains) ? message : nil
+    }
+
+    private func shouldRetryResearchStageFallbackResponse(after error: Error) -> Bool {
+        guard case let ServiceError.taskFailed(message) = error else {
+            return false
+        }
+
+        let normalized = message.lowercased()
+        let indicators = [
+            "unsupported tool type: code_interpreter",
+            "missing scopes: api.responses.write",
+            "insufficient permissions",
+            "not found"
+        ]
+
+        return indicators.contains(where: normalized.contains)
     }
 
     private func responseErrorMessage(from data: Data) -> String {

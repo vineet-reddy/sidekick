@@ -389,7 +389,7 @@ nonisolated struct ResearchFigureArtifact: Codable {
     }
 
     var imageData: Data? {
-        Data(base64Encoded: base64Data)
+        decodeSidekickBase64Payload(base64Data)
     }
 }
 
@@ -474,6 +474,30 @@ nonisolated struct ResearchVerificationArtifact: Codable {
 
         return "Verification did not approve paper drafting from the current artifacts."
     }
+}
+
+nonisolated func decodeSidekickBase64Payload(_ raw: String) -> Data? {
+    var normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    if let commaIndex = normalized.firstIndex(of: ","),
+       normalized[..<commaIndex].lowercased().contains("base64") {
+        normalized = String(normalized[normalized.index(after: commaIndex)...])
+    }
+
+    normalized = normalized.replacingOccurrences(of: "\n", with: "")
+    normalized = normalized.replacingOccurrences(of: "\r", with: "")
+    normalized = normalized.replacingOccurrences(of: " ", with: "")
+
+    guard !normalized.isEmpty else {
+        return nil
+    }
+
+    let remainder = normalized.count % 4
+    if remainder != 0 {
+        normalized.append(String(repeating: "=", count: 4 - remainder))
+    }
+
+    return Data(base64Encoded: normalized)
 }
 
 nonisolated struct ResearchDraftArtifact: Codable {

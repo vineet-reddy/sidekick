@@ -39,6 +39,20 @@ enum PaperDocumentService {
 
     private static func ensureRenderedBundle(for paper: Paper) async throws -> PaperArtifactStore.RenderedPaperBundle {
         let taskID = artifactKey(for: paper)
+
+        if paper.figureData.isEmpty,
+           let analysis = PaperArtifactStore.stageArtifact(
+               ResearchAnalysisArtifact.self,
+               runID: taskID,
+               stage: .analyze
+           ) {
+            let recoveredFigures = analysis.figureData
+            if !recoveredFigures.isEmpty {
+                print("[PaperDocs] recovered \(recoveredFigures.count) figure(s) from staged analysis task=\(taskID)")
+                paper.figureData = recoveredFigures
+            }
+        }
+
         let fingerprint = artifactFingerprint(for: paper)
 
         if let existing = PaperArtifactStore.renderedBundle(for: taskID, fingerprint: fingerprint) {
