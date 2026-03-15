@@ -11,6 +11,7 @@ nonisolated struct PaperTaskSubmission {
     let selectedDatasetIDs: [String]
     let allowedDomains: [String]
     let registryVersion: Int
+    let precomputedArtifacts: PaperArtifacts?
 }
 
 nonisolated struct TaskOutputProvenance: Codable {
@@ -211,7 +212,10 @@ actor TrustedDatasetRegistry {
 
         let resolved = datasetIDs.compactMap { directByID[$0] }
         if !resolved.isEmpty {
-            return resolved
+            let extras = shortlist(noteTexts: noteTexts, limit: limit)
+                .filter { candidate in !resolved.contains(where: { $0.id == candidate.id }) }
+
+            return Array((resolved + extras).prefix(limit))
         }
 
         return shortlist(noteTexts: noteTexts, limit: limit)

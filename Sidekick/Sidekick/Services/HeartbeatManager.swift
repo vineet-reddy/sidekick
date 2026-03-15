@@ -15,7 +15,7 @@ enum HeartbeatPhase: Equatable {
         case .idle: return ""
         case .checkingPapers: return "Checking papers..."
         case .assessingNotes: return "Reading your notes..."
-        case .submittingPaper(let title): return "Drafting \"\(title)\"..."
+        case .submittingPaper(let title): return "Writing \"\(title)\"..."
         case .done(let count):
             if count == 0 { return "All caught up." }
             return count == 1 ? "1 new paper started." : "\(count) new papers started."
@@ -35,6 +35,7 @@ final class HeartbeatManager: ObservableObject {
 
     private let lastRunKey = "com.vineet.sidekick.lastHeartbeatAt"
     private let cooldown: TimeInterval = 20 * 60
+    private let localFallbackGracePeriod: TimeInterval = 10 * 60
 
     init(
         openAI: OpenAIService,
@@ -114,37 +115,73 @@ final class HeartbeatManager: ObservableObject {
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
             .filter { $0.status == .generating }
+        let notes = try modelContext.fetch(FetchDescriptor<Note>())
+        let notesByID = Dictionary(uniqueKeysWithValues: notes.map { ($0.id, $0) })
 
         print("[Heartbeat] Found \(papers.count) in-flight paper(s).")
 
         for paper in papers {
             print("[Heartbeat]   Checking task \(paper.codexTaskID) for \"\(paper.title)\"...")
             guard let artifacts = try await openAI.checkTask(paper.codexTaskID) else {
-                print("[Heartbeat]   -> Still in progress.")
+                if let fallback = try await localFallbackArtifacts(for: paper, notesByID: notesByID) {
+                    applyArtifacts(fallback, to: paper)
+                    print("[Heartbeat]   -> Recovered locally: \"\(fallback.title)\"")
+                } else {
+                    print("[Heartbeat]   -> Still in progress.")
+                }
                 continue
             }
 
-            do {
-                try PaperArtifactStore.finalizeProvenance(
-                    taskID: paper.codexTaskID,
-                    title: artifacts.title,
-                    modelProvenance: artifacts.provenance
-                )
-            } catch {
-                print("[Heartbeat]   -> Failed to persist provenance: \(error.localizedDescription)")
-            }
-
-            paper.title = artifacts.title
-            paper.markdown = artifacts.markdown
-            paper.figureData = artifacts.figures
-            paper.status = .ready
+            applyArtifacts(artifacts, to: paper)
             print("[Heartbeat]   -> Paper ready: \"\(artifacts.title)\"")
-
-            if paper.lastNotifiedAt == nil {
-                notifications.notify(paper: paper)
-                paper.lastNotifiedAt = .now
-            }
         }
+    }
+
+    private func applyArtifacts(_ artifacts: PaperArtifacts, to paper: Paper) {
+        do {
+            try PaperArtifactStore.finalizeProvenance(
+                taskID: paper.codexTaskID,
+                title: artifacts.title,
+                modelProvenance: artifacts.provenance
+            )
+        } catch {
+            print("[Heartbeat]   -> Failed to persist provenance: \(error.localizedDescription)")
+        }
+
+        paper.title = artifacts.title
+        paper.markdown = artifacts.markdown
+        paper.figureData = artifacts.figures
+        paper.status = .ready
+
+        if paper.lastNotifiedAt == nil {
+            notifications.notify(paper: paper)
+            paper.lastNotifiedAt = .now
+        }
+    }
+
+    private func localFallbackArtifacts(
+        for paper: Paper,
+        notesByID: [UUID: Note]
+    ) async throws -> PaperArtifacts? {
+        guard Date().timeIntervalSince(paper.createdAt) >= localFallbackGracePeriod else {
+            return nil
+        }
+
+        guard let submission = PaperArtifactStore.pendingSubmission(for: paper.codexTaskID) else {
+            return nil
+        }
+
+        let noteTexts = paper.sourceNoteIDs.compactMap { notesByID[$0]?.content }
+        guard !noteTexts.isEmpty else {
+            return nil
+        }
+
+        return try await openAI.generateLocalPaperIfSupported(
+            title: paper.title,
+            theme: paper.title,
+            noteTexts: noteTexts,
+            datasetIDs: submission.selectedDatasetIDs
+        )
     }
 
     @discardableResult
@@ -197,13 +234,39 @@ final class HeartbeatManager: ObservableObject {
                 print("[Heartbeat]   -> Failed to persist submission metadata: \(error.localizedDescription)")
             }
 
-            let paper = Paper(
-                title: cluster.suggestedTitle,
-                status: .generating,
-                codexTaskID: submission.taskID,
-                sourceNoteIDs: cluster.noteIDs
-            )
-            modelContext.insert(paper)
+            if let artifacts = submission.precomputedArtifacts {
+                let paper = Paper(
+                    title: artifacts.title,
+                    markdown: artifacts.markdown,
+                    status: .ready,
+                    codexTaskID: submission.taskID,
+                    sourceNoteIDs: cluster.noteIDs,
+                    figureData: artifacts.figures,
+                    lastNotifiedAt: .now
+                )
+                modelContext.insert(paper)
+
+                do {
+                    try PaperArtifactStore.finalizeProvenance(
+                        taskID: submission.taskID,
+                        title: artifacts.title,
+                        modelProvenance: artifacts.provenance
+                    )
+                } catch {
+                    print("[Heartbeat]   -> Failed to finalize local provenance: \(error.localizedDescription)")
+                }
+
+                notifications.notify(paper: paper)
+            } else {
+                let paper = Paper(
+                    title: cluster.suggestedTitle,
+                    status: .generating,
+                    codexTaskID: submission.taskID,
+                    sourceNoteIDs: cluster.noteIDs
+                )
+                modelContext.insert(paper)
+            }
+
             submitted += 1
         }
 
@@ -215,7 +278,7 @@ final class BackgroundHeartbeatScheduler {
     static let shared = BackgroundHeartbeatScheduler()
     static let identifier = "com.vineet.sidekick.heartbeat"
 
-    var runner: (@Sendable () async -> Void)?
+    var runner: (@MainActor @Sendable () async -> Void)?
 
     private init() {}
 
@@ -243,7 +306,7 @@ final class BackgroundHeartbeatScheduler {
 
         schedule()
 
-        let work = Task {
+        let work = Task { @MainActor in
             await runner?()
             task.setTaskCompleted(success: true)
         }

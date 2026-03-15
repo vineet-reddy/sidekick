@@ -1,5 +1,6 @@
 import Combine
 import Foundation
+import zlib
 
 struct NoteCluster: Codable, Hashable {
     let noteIDs: [UUID]
@@ -189,21 +190,46 @@ final class OpenAIService: ObservableObject {
         let registryVersion = await trustedDatasets.registryVersion()
         let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
 
+        if let localArtifacts = try await LocalPaperGenerationService.generateIfSupported(
+            title: title,
+            theme: theme,
+            noteTexts: notes.map(\.content),
+            selectedDatasets: selectedDatasets,
+            session: session
+        ) {
+            return PaperTaskSubmission(
+                taskID: "local-\(UUID().uuidString)",
+                selectedDatasetIDs: selectedDatasets.map(\.id),
+                allowedDomains: allowedDomains,
+                registryVersion: registryVersion,
+                precomputedArtifacts: localArtifacts
+            )
+        }
+
         let systemInstructions = """
         You are a research scientist using Code Interpreter.
-        Create a real draft paper from the notes below.
+        Create a real research paper from the notes below.
 
         Requirements:
         1. Prefer the vetted dataset cards below before using anything else.
-        2. Keep internet usage inside the approved domains unless you truly need to leave the trusted set.
+        2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
         3. Prefer focused API queries and small subsets over bulk downloads.
-        4. Run real analysis whenever data is available.
-        5. Generate charts as PNG files when they add value.
-        6. Cite every source actually used in the paper.
-        7. Return strict JSON only in your final message:
+        4. If a vetted dataset is reachable, run the real analysis now. Do not stop at a methods memo, access report, or future-work outline when usable data are available.
+        5. Report concrete estimates, sample sizes, uncertainty, and model outputs when you have them. Do not fabricate results.
+        6. Generate publication-quality charts as PNG files when they add value, and include them in the final JSON as base64 PNG payloads.
+        7. Cite every source actually used in the paper.
+        8. Return strict JSON only in your final message:
            {
              "title": "string",
-             "markdown": "full academic markdown with references to figure_1.png style filenames",
+             "markdown": "clean academic markdown only, with references to bare figure_1.png style filenames",
+             "figures": [
+               {
+                 "filename": "figure_1.png",
+                 "caption": "string",
+                 "mime_type": "image/png",
+                 "base64_data": "base64 png bytes"
+               }
+             ],
              "provenance": {
                "used_dataset_ids": ["trusted-dataset-id"],
                "accessed_domains": ["domain"],
@@ -212,7 +238,14 @@ final class OpenAIService: ObservableObject {
                "notes": "short summary of data access and limits"
              }
            }
-        8. If analysis is partial, state limitations clearly and still produce the strongest draft possible.
+        9. The markdown must read like a serious paper suitable for an arXiv-style PDF, not a planning memo. Prefer standard sections such as Abstract, Introduction, Data, Methods, Results, Discussion, and References when they fit.
+        10. When you reference figures in markdown, use bare filenames like `figure_1.png` only. Do not use repo paths such as `research/figures/figure_1.png`.
+        11. If you generate figure files during the run, you must also include the same PNG bytes in `figures[].base64_data`. Do not rely on repo snapshots or diffs as the only transport for figures.
+        12. Do not include repo citations, line markers, path citations, tool traces, execution logs, reproducibility checklists, PR notes, or literal escape sequences.
+        13. Avoid “draft”, “future work”, and “next steps” language unless blocked data access genuinely prevents the core analysis.
+        14. If the approved sources are blocked, pivot to the strongest reachable public data source and complete the best empirical analysis you can. Record that decision in provenance instead of stopping at an access report.
+        15. If analysis is still partial after trying reasonable alternatives, state the limitations clearly while maximizing the amount of real evidence, tables, and figures.
+        16. The final assistant message must contain only the JSON object and nothing before or after it.
         """
 
         let userInput = """
@@ -240,7 +273,29 @@ final class OpenAIService: ObservableObject {
             taskID: taskID,
             selectedDatasetIDs: selectedDatasets.map(\.id),
             allowedDomains: allowedDomains,
-            registryVersion: registryVersion
+            registryVersion: registryVersion,
+            precomputedArtifacts: nil
+        )
+    }
+
+    func generateLocalPaperIfSupported(
+        title: String,
+        theme: String,
+        noteTexts: [String],
+        datasetIDs: [String]
+    ) async throws -> PaperArtifacts? {
+        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            limit: 4
+        )
+
+        return try await LocalPaperGenerationService.generateIfSupported(
+            title: title,
+            theme: theme,
+            noteTexts: noteTexts,
+            selectedDatasets: selectedDatasets,
+            session: session
         )
     }
 
@@ -248,6 +303,7 @@ final class OpenAIService: ObservableObject {
         log("checkTask polling. task_id=\(taskID)")
         let task = try await fetchTask(taskID: taskID)
         log("checkTask status=\(task.normalizedStatus) output_chars=\(task.outputText.count)")
+        persistDebugPayload(Data(task.outputText.utf8), named: "task-output-\(taskID).txt")
 
         switch task.normalizedStatus {
         case "queued", "in_progress", "incomplete":
@@ -261,16 +317,92 @@ final class OpenAIService: ObservableObject {
         }
 
         guard let data = normalizedJSONData(from: task.outputText) else {
-            throw ServiceError.malformedPayload
+            let payload = try decodePaperResponse(from: task.outputText)
+            let markdown = normalizedPaperMarkdown(payload.markdown)
+            let figures = recoveredFigureData(from: task, payloadFigures: payload.figures, markdown: markdown)
+            return PaperArtifacts(
+                title: payload.title,
+                markdown: markdown,
+                figures: figures,
+                provenance: payload.provenance
+            )
         }
 
-        let payload = try JSONDecoder().decode(PaperResponse.self, from: data)
+        let payload: PaperResponse
+        do {
+            payload = try JSONDecoder().decode(PaperResponse.self, from: data)
+        } catch {
+            payload = try decodePaperResponse(from: task.outputText)
+        }
+
+        let markdown = normalizedPaperMarkdown(payload.markdown)
+        let figures = recoveredFigureData(from: task, payloadFigures: payload.figures, markdown: markdown)
 
         return PaperArtifacts(
             title: payload.title,
-            markdown: payload.markdown,
-            figures: [],
+            markdown: markdown,
+            figures: figures,
             provenance: payload.provenance
+        )
+    }
+
+    private func decodePaperResponse(from raw: String) throws -> PaperResponse {
+        if let data = normalizedJSONData(from: raw),
+           let payload = try? JSONDecoder().decode(PaperResponse.self, from: data) {
+            return payload
+        }
+
+        let pattern = #"""
+        (?s)"title"\s*:\s*"((?:\\.|[^"\\])*)"\s*,\s*"markdown"\s*:\s*"(.*)"\s*(?:,\s*"provenance"\s*:\s*(\{.*\}))?\s*\}\s*$
+        """#
+
+        guard let match = firstRegexMatch(pattern: pattern, in: raw),
+              let title = captureGroup(1, from: match, in: raw).flatMap(decodeJSONStringFragment),
+              let encodedMarkdown = captureGroup(2, from: match, in: raw) else {
+            throw ServiceError.malformedPayload
+        }
+
+        let markdown = decodeJSONStringFragment(encodedMarkdown) ?? encodedMarkdown
+
+        let provenance: TaskOutputProvenance? = captureGroup(3, from: match, in: raw).flatMap { json in
+            guard let data = json.data(using: .utf8) else {
+                return nil
+            }
+
+            return try? JSONDecoder().decode(TaskOutputProvenance.self, from: data)
+        }
+
+        return PaperResponse(
+            title: title,
+            markdown: markdown.trimmingCharacters(in: .whitespacesAndNewlines),
+            figures: nil,
+            provenance: provenance
+        )
+    }
+
+    private func decodedFigureData(from figures: [PaperResponseFigure]?) -> [Data] {
+        guard let figures else {
+            return []
+        }
+
+        return figures.compactMap { figure in
+            Data(base64Encoded: figure.base64Data)
+        }
+    }
+
+    private func recoveredFigureData(
+        from task: CloudTaskDetails,
+        payloadFigures: [PaperResponseFigure]?,
+        markdown: String
+    ) -> [Data] {
+        let decoded = decodedFigureData(from: payloadFigures)
+        guard decoded.isEmpty else {
+            return decoded
+        }
+
+        return GitBinaryPatchFigureExtractor.extractFigureData(
+            from: task.outputDiffText,
+            referencedBy: markdown
         )
     }
 
@@ -334,35 +466,113 @@ final class OpenAIService: ObservableObject {
     }
 
     private func createTask(prompt: String) async throws -> String {
-        let environment = try await selectEnvironment()
-        log("createTask using environment id=\(environment.id) label=\(environment.label ?? "<none>") branch=\(resolvedTaskBranch())")
-        let body: [String: Any] = [
-            "new_task": [
-                "environment_id": environment.id,
-                "branch": resolvedTaskBranch(),
-                "run_environment_in_qa_mode": false
-            ],
-            "input_items": [
-                [
-                    "type": "message",
-                    "role": "user",
-                    "content": [
-                        [
-                            "content_type": "text",
-                            "text": prompt
+        let environments = try await candidateEnvironments()
+        let branch = resolvedTaskBranch()
+        var lastError: Error?
+        var skippedLabels: [String] = []
+
+        for environment in environments {
+            log("createTask using environment id=\(environment.id) label=\(environment.label ?? "<none>") branch=\(branch)")
+            let body: [String: Any] = [
+                "new_task": [
+                    "environment_id": environment.id,
+                    "branch": branch,
+                    "run_environment_in_qa_mode": false
+                ],
+                "input_items": [
+                    [
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            [
+                                "content_type": "text",
+                                "text": prompt
+                            ]
                         ]
                     ]
                 ]
             ]
-        ]
 
+            do {
+                let data = try await sendBackendRequest(
+                    pathComponents: ["wham", "tasks"],
+                    method: "POST",
+                    body: body
+                )
+                persistDebugPayload(data, named: "create-task-response.json")
+                log("createTask response bytes=\(data.count)")
+
+                let taskID = try decodeTaskID(from: data)
+                await environmentRouter.remember(environment)
+                return taskID
+            } catch let error as BackendRequestFailure
+                where error.detailType == "repo_not_accessible" {
+                    let label = environment.label ?? environment.id
+                    skippedLabels.append(label)
+                    lastError = error
+                    log("createTask skipping environment \(label) due to repo_not_accessible")
+                    continue
+                } catch {
+                    lastError = error
+                    break
+                }
+        }
+
+        if !skippedLabels.isEmpty {
+            throw ServiceError.taskFailed(
+                "No usable Codex cloud environment could accept the task. Skipped: \(skippedLabels.joined(separator: ", "))"
+            )
+        }
+
+        throw lastError ?? ServiceError.missingTaskID
+    }
+
+    private func fetchTask(taskID: String) async throws -> CloudTaskDetails {
         let data = try await sendBackendRequest(
-            pathComponents: ["wham", "tasks"],
-            method: "POST",
-            body: body
+            pathComponents: ["wham", "tasks", taskID],
+            method: "GET",
+            body: nil
         )
-        log("createTask response bytes=\(data.count)")
+        persistDebugPayload(data, named: "task-\(taskID).json")
+        log("fetchTask response bytes=\(data.count) task_id=\(taskID)")
 
+        return try JSONDecoder().decode(CloudTaskDetails.self, from: data)
+    }
+
+    private func fetchEnvironments() async throws -> [CloudTaskEnvironment] {
+        let data = try await sendBackendRequest(
+            pathComponents: ["wham", "environments"],
+            method: "GET",
+            body: nil
+        )
+        persistDebugPayload(data, named: "environments.json")
+
+        let environments = try JSONDecoder().decode([CloudTaskEnvironment].self, from: data)
+        log("selectEnvironment fetched environments count=\(environments.count)")
+        guard !environments.isEmpty else {
+            throw ServiceError.taskFailed("No Codex cloud environments are available for this ChatGPT workspace.")
+        }
+
+        return environments
+    }
+
+    private func candidateEnvironments() async throws -> [CloudTaskEnvironment] {
+        let environments = try await fetchEnvironments()
+        let networkEnabled = environments.filter { $0.agentNetworkAccess?.mode?.lowercased() != "off" }
+
+        var candidates = (networkEnabled.isEmpty ? environments : networkEnabled)
+            .sorted { environmentPriority($0) > environmentPriority($1) }
+
+        if let remembered = await environmentRouter.cached(),
+           let index = candidates.firstIndex(where: { $0.id == remembered.id }) {
+            let cached = candidates.remove(at: index)
+            candidates.insert(cached, at: 0)
+        }
+
+        return candidates
+    }
+
+    private func decodeTaskID(from data: Data) throws -> String {
         guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             log("createTask failed to decode top-level task response JSON")
             throw ServiceError.invalidResponse
@@ -381,42 +591,6 @@ final class OpenAIService: ObservableObject {
         throw ServiceError.missingTaskID
     }
 
-    private func fetchTask(taskID: String) async throws -> CloudTaskDetails {
-        let data = try await sendBackendRequest(
-            pathComponents: ["wham", "tasks", taskID],
-            method: "GET",
-            body: nil
-        )
-        log("fetchTask response bytes=\(data.count) task_id=\(taskID)")
-
-        return try JSONDecoder().decode(CloudTaskDetails.self, from: data)
-    }
-
-    private func selectEnvironment() async throws -> CloudTaskEnvironment {
-        if let cached = await environmentRouter.cached() {
-            return cached
-        }
-
-        let data = try await sendBackendRequest(
-            pathComponents: ["wham", "environments"],
-            method: "GET",
-            body: nil
-        )
-
-        let environments = try JSONDecoder().decode([CloudTaskEnvironment].self, from: data)
-        log("selectEnvironment fetched environments count=\(environments.count)")
-        guard !environments.isEmpty else {
-            throw ServiceError.taskFailed("No Codex cloud environments are available for this ChatGPT workspace.")
-        }
-
-        let selected = environments.first(where: { $0.isPinned == true })
-            ?? environments.max(by: { ($0.taskCount ?? 0) < ($1.taskCount ?? 0) })
-            ?? environments[0]
-
-        await environmentRouter.remember(selected)
-        return selected
-    }
-
     private func resolvedTaskBranch() -> String {
         if let override = ProcessInfo.processInfo.environment["SIDEKICK_CODEX_BRANCH"]?
             .trimmingCharacters(in: .whitespacesAndNewlines),
@@ -425,6 +599,28 @@ final class OpenAIService: ObservableObject {
         }
 
         return "main"
+    }
+
+    private func environmentPriority(_ environment: CloudTaskEnvironment) -> Int {
+        var score = environment.taskCount ?? 0
+
+        if environment.isPinned == true {
+            score += 10_000
+        }
+
+        let mode = environment.agentNetworkAccess?.mode?.lowercased()
+        if mode == "on" {
+            score += 1_000
+        }
+
+        let preset = environment.agentNetworkAccess?.presetAllowlist?.lowercased()
+        if preset == "all" {
+            score += 100
+        } else if preset == "codex" {
+            score += 10
+        }
+
+        return score
     }
 
     private func sendJSONRequest(
@@ -483,8 +679,11 @@ final class OpenAIService: ObservableObject {
         }
 
         guard (200 ..< 300).contains(httpResponse.statusCode) else {
-            let message = responseErrorMessage(from: data)
-            throw ServiceError.taskFailed(message)
+            persistDebugPayload(
+                data,
+                named: "backend-error-\(httpResponse.statusCode)-\(pathComponents.joined(separator: "_")).json"
+            )
+            throw backendRequestFailure(statusCode: httpResponse.statusCode, data: data)
         }
 
         return data
@@ -760,6 +959,26 @@ final class OpenAIService: ObservableObject {
         print("[OpenAI] \(message)")
     }
 
+    private func backendRequestFailure(statusCode: Int, data: Data) -> BackendRequestFailure {
+        if let payload = try? JSONDecoder().decode(BackendErrorEnvelope.self, from: data),
+           let detail = payload.detail {
+            let message = detail.message ?? responseErrorMessage(from: data)
+            return BackendRequestFailure(
+                statusCode: statusCode,
+                detailType: detail.type,
+                message: message,
+                rawBody: String(data: data, encoding: .utf8) ?? ""
+            )
+        }
+
+        return BackendRequestFailure(
+            statusCode: statusCode,
+            detailType: nil,
+            message: responseErrorMessage(from: data),
+            rawBody: String(data: data, encoding: .utf8) ?? ""
+        )
+    }
+
     private func preview(_ value: String, limit: Int) -> String {
         let flattened = value
             .replacingOccurrences(of: "\n", with: "\\n")
@@ -787,32 +1006,79 @@ final class OpenAIService: ObservableObject {
             return nil
         }
 
-        if let data = trimmed.data(using: .utf8),
-           (try? JSONSerialization.jsonObject(with: data)) != nil {
-            return data
-        }
-
         let cleaned = trimmed
             .replacingOccurrences(of: "```json", with: "")
             .replacingOccurrences(of: "```", with: "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if let data = cleaned.data(using: .utf8),
-           (try? JSONSerialization.jsonObject(with: data)) != nil {
-            return data
-        }
+        let candidates = [
+            trimmed,
+            cleaned,
+            extractFirstJSONObject(from: cleaned)
+        ].compactMap { $0 }
 
-        if let start = cleaned.firstIndex(of: "{"),
-           let end = cleaned.lastIndex(of: "}"),
-           start <= end {
-            let candidate = String(cleaned[start ... end])
-            if let data = candidate.data(using: .utf8),
-               (try? JSONSerialization.jsonObject(with: data)) != nil {
+        for candidate in candidates {
+            guard let data = candidate.data(using: .utf8) else {
+                continue
+            }
+
+            if (try? JSONSerialization.jsonObject(with: data)) != nil {
                 return data
             }
         }
 
-        return cleaned.data(using: .utf8)
+        return nil
+    }
+
+    private func extractFirstJSONObject(from raw: String) -> String? {
+        var startIndex: String.Index?
+        var depth = 0
+        var isInsideString = false
+        var isEscaping = false
+
+        for index in raw.indices {
+            let character = raw[index]
+
+            if isEscaping {
+                isEscaping = false
+                continue
+            }
+
+            if character == "\\" {
+                isEscaping = true
+                continue
+            }
+
+            if character == "\"" {
+                isInsideString.toggle()
+                continue
+            }
+
+            if isInsideString {
+                continue
+            }
+
+            if character == "{" {
+                if depth == 0 {
+                    startIndex = index
+                }
+                depth += 1
+                continue
+            }
+
+            if character == "}" {
+                guard depth > 0 else {
+                    continue
+                }
+
+                depth -= 1
+                if depth == 0, let startIndex {
+                    return String(raw[startIndex ... index])
+                }
+            }
+        }
+
+        return nil
     }
 
     private func retryableModelSelectionMessage(from error: Error) -> String? {
@@ -858,6 +1124,63 @@ final class OpenAIService: ObservableObject {
         }
 
         return String(data: data, encoding: .utf8) ?? "OpenAI request failed."
+    }
+
+    private func firstRegexMatch(pattern: String, in raw: String) -> NSTextCheckingResult? {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return nil
+        }
+
+        let range = NSRange(raw.startIndex..<raw.endIndex, in: raw)
+        return regex.firstMatch(in: raw, options: [], range: range)
+    }
+
+    private func captureGroup(_ index: Int, from match: NSTextCheckingResult, in raw: String) -> String? {
+        let range = match.range(at: index)
+        guard range.location != NSNotFound,
+              let swiftRange = Range(range, in: raw) else {
+            return nil
+        }
+
+        return String(raw[swiftRange])
+    }
+
+    private func decodeJSONStringFragment(_ fragment: String) -> String? {
+        let wrapped = "\"\(fragment)\""
+        guard let data = wrapped.data(using: .utf8) else {
+            return nil
+        }
+
+        return try? JSONDecoder().decode(String.self, from: data)
+    }
+
+    private func normalizedPaperMarkdown(_ markdown: String) -> String {
+        PaperContentNormalizer.normalize(markdown: markdown)
+    }
+
+    private func replacingRegex(pattern: String, in text: String, template: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return text
+        }
+
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: template)
+    }
+
+    private func persistDebugPayload(_ data: Data, named filename: String) {
+        guard let baseURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first else {
+            return
+        }
+
+        let debugDirectory = baseURL.appendingPathComponent("DebugPayloads", isDirectory: true)
+
+        do {
+            try FileManager.default.createDirectory(at: debugDirectory, withIntermediateDirectories: true)
+            let destination = debugDirectory.appendingPathComponent(filename)
+            try data.write(to: destination, options: .atomic)
+        } catch {
+            print("[OpenAI] Failed to persist debug payload \(filename): \(error.localizedDescription)")
+        }
     }
 
     private var codexBaseURL: URL {
@@ -920,6 +1243,26 @@ private enum OpenAIWorkload {
     }
 }
 
+private struct BackendRequestFailure: LocalizedError {
+    let statusCode: Int
+    let detailType: String?
+    let message: String
+    let rawBody: String
+
+    var errorDescription: String? {
+        "HTTP \(statusCode): \(message)"
+    }
+}
+
+private struct BackendErrorEnvelope: Decodable {
+    let detail: BackendErrorDetail?
+}
+
+private struct BackendErrorDetail: Decodable {
+    let type: String?
+    let message: String?
+}
+
 private actor OpenAIModelRouter {
     private var rememberedModels: [String: String] = [:]
 
@@ -973,7 +1316,22 @@ private struct ClusterResponse: Decodable {
 private struct PaperResponse: Decodable {
     let title: String
     let markdown: String
+    let figures: [PaperResponseFigure]?
     let provenance: TaskOutputProvenance?
+}
+
+private struct PaperResponseFigure: Decodable {
+    let filename: String
+    let caption: String?
+    let mimeType: String?
+    let base64Data: String
+
+    enum CodingKeys: String, CodingKey {
+        case filename
+        case caption
+        case mimeType = "mime_type"
+        case base64Data = "base64_data"
+    }
 }
 
 private struct CloudTaskEnvironment: Decodable {
@@ -981,12 +1339,24 @@ private struct CloudTaskEnvironment: Decodable {
     let label: String?
     let isPinned: Bool?
     let taskCount: Int?
+    let agentNetworkAccess: CloudTaskAgentNetworkAccess?
 
     enum CodingKeys: String, CodingKey {
         case id
         case label
         case isPinned = "is_pinned"
         case taskCount = "task_count"
+        case agentNetworkAccess = "agent_network_access"
+    }
+}
+
+private struct CloudTaskAgentNetworkAccess: Decodable {
+    let mode: String?
+    let presetAllowlist: String?
+
+    enum CodingKeys: String, CodingKey {
+        case mode
+        case presetAllowlist = "preset_allowlist"
     }
 }
 
@@ -1032,8 +1402,15 @@ private struct CloudTaskDetails: Decodable {
     }
 
     var outputText: String {
-        assistantTexts.joined(separator: "\n\n")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
+        prioritizedMessageText(from: currentAssistantTurn)
+            ?? prioritizedMessageText(from: currentDiffTaskTurn)
+            ?? ""
+    }
+
+    var outputDiffText: String {
+        prioritizedDiffText(from: currentAssistantTurn)
+            ?? prioritizedDiffText(from: currentDiffTaskTurn)
+            ?? ""
     }
 
     var errorMessage: String? {
@@ -1042,10 +1419,18 @@ private struct CloudTaskDetails: Decodable {
             ?? task?.lastErrorMessage
     }
 
-    private var assistantTexts: [String] {
-        [currentDiffTaskTurn, currentAssistantTurn]
-            .compactMap { $0 }
-            .flatMap(\.messageTexts)
+    private func prioritizedMessageText(from turn: CloudTaskTurn?) -> String? {
+        let text = turn?.messageTexts.joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return text.isEmpty ? nil : text
+    }
+
+    private func prioritizedDiffText(from turn: CloudTaskTurn?) -> String? {
+        let text = turn?.diffTexts.joined(separator: "\n\n")
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+        return text.isEmpty ? nil : text
     }
 }
 
@@ -1114,11 +1499,23 @@ private struct CloudTaskTurn: Decodable {
         texts.append(contentsOf: worklogTexts)
         return texts.filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
+
+    var diffTexts: [String] {
+        (outputItems ?? []).compactMap(\.diffText)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+    }
 }
 
 private struct CloudTaskOutputItem: Decodable {
     let type: String?
     let content: [CloudTaskContentFragment]?
+    let outputDiff: CloudTaskOutputDiff?
+
+    enum CodingKeys: String, CodingKey {
+        case type
+        case content
+        case outputDiff = "output_diff"
+    }
 
     var textValues: [String] {
         guard type == "message" else {
@@ -1127,6 +1524,14 @@ private struct CloudTaskOutputItem: Decodable {
 
         return (content ?? []).compactMap(\.text)
     }
+
+    var diffText: String? {
+        outputDiff?.diff
+    }
+}
+
+private struct CloudTaskOutputDiff: Decodable {
+    let diff: String?
 }
 
 private enum CloudTaskContentFragment: Decodable {
@@ -1424,4 +1829,264 @@ private struct StreamedResponseEvent: Decodable {
 private struct ResponseAPIError: Decodable {
     let code: String?
     let message: String?
+}
+
+private enum GitBinaryPatchFigureExtractor {
+    private struct RecoveredFigure {
+        let filename: String
+        let data: Data
+    }
+
+    private static let base85Alphabet = Array("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz!#$%&()*+-;<=>?@^_`{|}~".utf8)
+    private static let base85DecodeTable: [UInt8: UInt32] = {
+        Dictionary(uniqueKeysWithValues: base85Alphabet.enumerated().map { (UInt8($0.element), UInt32($0.offset)) })
+    }()
+
+    static func extractFigureData(from diff: String, referencedBy markdown: String) -> [Data] {
+        guard !diff.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return []
+        }
+
+        let normalizedDiff = diff
+            .replacingOccurrences(of: "\r\n", with: "\n")
+            .replacingOccurrences(of: "\r", with: "\n")
+        let referencedFiles = referencedFigureFilenames(in: markdown)
+        var recovered: [RecoveredFigure] = []
+        let lines = normalizedDiff.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var index = 0
+
+        while index < lines.count {
+            let line = lines[index]
+            guard line.hasPrefix("diff --git ") else {
+                index += 1
+                continue
+            }
+
+            let targetPath = diffTargetPath(from: line)
+            index += 1
+
+            var sectionLines: [String] = []
+            while index < lines.count, !lines[index].hasPrefix("diff --git ") {
+                sectionLines.append(lines[index])
+                index += 1
+            }
+
+            guard let targetPath, targetPath.lowercased().hasSuffix(".png") else {
+                continue
+            }
+
+            let filename = URL(fileURLWithPath: targetPath).lastPathComponent
+            let normalizedFilename = filename.lowercased()
+            if !referencedFiles.isEmpty, !referencedFiles.contains(normalizedFilename) {
+                continue
+            }
+
+            guard let data = literalImageData(from: sectionLines) else {
+                continue
+            }
+
+            recovered.append(RecoveredFigure(filename: filename, data: data))
+        }
+
+        return recovered
+            .sorted { lhs, rhs in
+                let left = figureSortKey(for: lhs.filename)
+                let right = figureSortKey(for: rhs.filename)
+
+                switch (left, right) {
+                case let (.some(leftNumber), .some(rightNumber)):
+                    if leftNumber != rightNumber {
+                        return leftNumber < rightNumber
+                    }
+                case (.some, .none):
+                    return true
+                case (.none, .some):
+                    return false
+                case (.none, .none):
+                    break
+                }
+
+                return lhs.filename.localizedCaseInsensitiveCompare(rhs.filename) == .orderedAscending
+            }
+            .map(\.data)
+    }
+
+    private static func diffTargetPath(from line: String) -> String? {
+        let parts = line.split(separator: " ", omittingEmptySubsequences: true)
+        guard parts.count >= 4 else {
+            return nil
+        }
+
+        let target = String(parts[3])
+        guard target.hasPrefix("b/") else {
+            return nil
+        }
+
+        return String(target.dropFirst(2))
+    }
+
+    private static func literalImageData(from lines: [String]) -> Data? {
+        guard let patchMarker = lines.firstIndex(of: "GIT binary patch") else {
+            return nil
+        }
+
+        let headerIndex = lines.index(after: patchMarker)
+        guard headerIndex < lines.count else {
+            return nil
+        }
+
+        let header = lines[headerIndex].split(separator: " ", omittingEmptySubsequences: true)
+        guard header.count == 2,
+              header[0] == "literal",
+              let inflatedSize = Int(header[1]) else {
+            return nil
+        }
+
+        var compressed = Data()
+        var lineIndex = headerIndex + 1
+
+        while lineIndex < lines.count {
+            let line = lines[lineIndex]
+            if line.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                break
+            }
+
+            guard let firstByte = line.utf8.first,
+                  let byteLength = decodedLineByteLength(for: firstByte),
+                  let chunk = decode85(String(line.dropFirst()), byteLength: byteLength) else {
+                return nil
+            }
+
+            compressed.append(chunk)
+            lineIndex += 1
+        }
+
+        return inflateZlib(data: compressed, expectedSize: inflatedSize)
+    }
+
+    private static func decodedLineByteLength(for firstByte: UInt8) -> Int? {
+        switch firstByte {
+        case UInt8(ascii: "A") ... UInt8(ascii: "Z"):
+            return Int(firstByte - UInt8(ascii: "A")) + 1
+        case UInt8(ascii: "a") ... UInt8(ascii: "z"):
+            return Int(firstByte - UInt8(ascii: "a")) + 27
+        default:
+            return nil
+        }
+    }
+
+    private static func decode85(_ payload: String, byteLength: Int) -> Data? {
+        let bytes = Array(payload.utf8)
+        let expectedChunkCount = ((byteLength + 3) / 4) * 5
+        guard bytes.count >= expectedChunkCount else {
+            return nil
+        }
+
+        var decoded: [UInt8] = []
+        decoded.reserveCapacity(byteLength)
+
+        var remaining = byteLength
+        var index = 0
+
+        while remaining > 0 {
+            guard index + 5 <= bytes.count else {
+                return nil
+            }
+
+            var accumulator: UInt32 = 0
+            for offset in 0 ..< 5 {
+                guard let value = base85DecodeTable[bytes[index + offset]] else {
+                    return nil
+                }
+
+                accumulator = (accumulator * 85) + value
+            }
+
+            let chunkCount = min(4, remaining)
+            for _ in 0 ..< chunkCount {
+                accumulator = (accumulator << 8) | (accumulator >> 24)
+                decoded.append(UInt8(accumulator & 0xff))
+            }
+
+            remaining -= chunkCount
+            index += 5
+        }
+
+        return Data(decoded)
+    }
+
+    private static func inflateZlib(data: Data, expectedSize: Int) -> Data? {
+        guard expectedSize > 0 else {
+            return Data()
+        }
+
+        var stream = z_stream()
+        var destination = Data(count: expectedSize)
+
+        let status: Int32 = data.withUnsafeBytes { sourceBuffer in
+            destination.withUnsafeMutableBytes { destinationBuffer in
+                guard let sourceBase = sourceBuffer.bindMemory(to: Bytef.self).baseAddress,
+                      let destinationBase = destinationBuffer.bindMemory(to: Bytef.self).baseAddress else {
+                    return Z_DATA_ERROR
+                }
+
+                stream.next_in = UnsafeMutablePointer(mutating: sourceBase)
+                stream.avail_in = uInt(data.count)
+                stream.next_out = destinationBase
+                stream.avail_out = uInt(expectedSize)
+
+                let initStatus = inflateInit_(&stream, ZLIB_VERSION, Int32(MemoryLayout<z_stream>.size))
+                guard initStatus == Z_OK else {
+                    return initStatus
+                }
+
+                defer {
+                    inflateEnd(&stream)
+                }
+
+                return inflate(&stream, Z_FINISH)
+            }
+        }
+
+        guard status == Z_STREAM_END, Int(stream.total_out) == expectedSize else {
+            return nil
+        }
+
+        destination.count = Int(stream.total_out)
+        return destination
+    }
+
+    private static func referencedFigureFilenames(in markdown: String) -> Set<String> {
+        guard let regex = try? NSRegularExpression(pattern: #"\(([^)\n]+\.png)\)"#, options: [.caseInsensitive]) else {
+            return []
+        }
+
+        let range = NSRange(markdown.startIndex..<markdown.endIndex, in: markdown)
+        let matches = regex.matches(in: markdown, options: [], range: range)
+
+        return Set(matches.compactMap { match in
+            guard match.numberOfRanges > 1,
+                  let pathRange = Range(match.range(at: 1), in: markdown) else {
+                return nil
+            }
+
+            let path = String(markdown[pathRange])
+            return URL(fileURLWithPath: path).lastPathComponent.lowercased()
+        })
+    }
+
+    private static func figureSortKey(for filename: String) -> Int? {
+        guard let regex = try? NSRegularExpression(pattern: #"figure_(\d+)\.png"#, options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        let range = NSRange(filename.startIndex..<filename.endIndex, in: filename)
+        guard let match = regex.firstMatch(in: filename, options: [], range: range),
+              match.numberOfRanges > 1,
+              let valueRange = Range(match.range(at: 1), in: filename) else {
+            return nil
+        }
+
+        return Int(filename[valueRange])
+    }
 }

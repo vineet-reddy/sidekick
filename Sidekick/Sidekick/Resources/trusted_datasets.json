@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-03-13",
+  "updated_at": "2026-03-14",
   "entries": [
     {
       "id": "openalex-works",
@@ -241,6 +241,26 @@
       "citation_hint": "Cite the specific CDC dataset used.",
       "requires_auth": false,
       "priority": 0.94
+    },
+    {
+      "id": "brfss-2015-github-mirror",
+      "entry_type": "direct_source",
+      "status": "trusted",
+      "trust_tier": "curated",
+      "source_type": "download",
+      "title": "BRFSS 2015 Diabetes Health Indicators (GitHub mirror)",
+      "handle": "https://raw.githubusercontent.com/anandprakash0/Diabetes-prediction/main/data/diabetes_012_health_indicators_BRFSS2015.csv",
+      "domains": ["raw.githubusercontent.com", "github.com"],
+      "disciplines": ["public-health", "epidemiology", "survey-research"],
+      "keywords": ["brfss", "cdc", "diabetes", "obesity", "bmi", "risk factors", "survey", "health indicators"],
+      "use_for": "real empirical analysis of obesity, diabetes, and related risk factors when official CDC portal access is blocked",
+      "avoid_for": "state-year trend claims, policy claims tied to geography, or prevalence trend estimates over time because this mirror omits state and year fields",
+      "access_hint": "Download the CSV directly from raw.githubusercontent.com, inspect columns first, and use it for cross-sectional obesity-diabetes analysis rather than state trend work.",
+      "example_access": "https://raw.githubusercontent.com/anandprakash0/Diabetes-prediction/main/data/diabetes_012_health_indicators_BRFSS2015.csv",
+      "sampling_hint": "Start with outcome prevalence by BMI, age, and comorbidity strata before fitting logistic models.",
+      "citation_hint": "Cite the mirrored BRFSS 2015 health indicators dataset and note that access was through a public GitHub mirror.",
+      "requires_auth": false,
+      "priority": 0.87
     },
     {
       "id": "openfda-drug-events",

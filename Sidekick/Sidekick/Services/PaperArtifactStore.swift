@@ -1,6 +1,15 @@
 import Foundation
 
 enum PaperArtifactStore {
+    struct PendingSubmissionSnapshot {
+        let taskID: String
+        let title: String
+        let registryVersion: Int
+        let selectedDatasetIDs: [String]
+        let allowedDomains: [String]
+        let createdAt: Date
+    }
+
     private struct PendingSubmission: Codable {
         let taskID: String
         let title: String
@@ -65,6 +74,21 @@ enum PaperArtifactStore {
         if FileManager.default.fileExists(atPath: submissionURL.path) {
             try? FileManager.default.removeItem(at: submissionURL)
         }
+    }
+
+    static func pendingSubmission(for taskID: String) -> PendingSubmissionSnapshot? {
+        guard let pending = load(PendingSubmission.self, from: submissionURL(for: taskID)) else {
+            return nil
+        }
+
+        return PendingSubmissionSnapshot(
+            taskID: pending.taskID,
+            title: pending.title,
+            registryVersion: pending.registryVersion,
+            selectedDatasetIDs: pending.selectedDatasetIDs,
+            allowedDomains: pending.allowedDomains,
+            createdAt: pending.createdAt
+        )
     }
 
     private static func submissionURL(for taskID: String) -> URL {
