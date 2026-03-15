@@ -44,6 +44,7 @@ final class HeartbeatManager: ObservableObject {
     private let cooldown: TimeInterval = 20 * 60
     private let supportedLocalRecoveryGracePeriod: TimeInterval = 3 * 60
     private let remoteRetryGracePeriod: TimeInterval = 8 * 60
+    private let bundledRemoteRetryGracePeriod: TimeInterval = 20 * 60
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
     private let maxResearchStageAttempts = 3
@@ -887,6 +888,23 @@ final class HeartbeatManager: ObservableObject {
                     print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
 
+                    if revisionRequest != nil {
+                        do {
+                            try await performAnalyzeResponsesFallback(
+                                run,
+                                paper: paper,
+                                notes: notes,
+                                plan: plan,
+                                inspection: inspection,
+                                revisionRequest: revisionRequest,
+                                incrementAttempt: false
+                            )
+                        } catch {
+                            handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                        }
+                        return
+                    }
+
                     if shouldUseResponsesFallback(for: snapshot) {
                         do {
                             try await performAnalyzeResponsesFallback(
@@ -926,7 +944,22 @@ final class HeartbeatManager: ObservableObject {
                 persistTaskProgress(snapshot)
                 run.activeTaskID = nil
 
-                if revisionRequest != nil || run.attemptCount(for: .analyze) < maxResearchStageAttempts {
+                if revisionRequest != nil {
+                    print("[Heartbeat]   -> Analysis revision stage failed for \(run.runID); retrying checkpointed analysis.")
+                    do {
+                        try await performAnalyzeResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                    }
+                } else if run.attemptCount(for: .analyze) < maxResearchStageAttempts {
                     print("[Heartbeat]   -> Analysis stage failed for \(run.runID); retrying same stage.")
                     try await startResearchAnalysisTask(
                         run,
@@ -941,6 +974,23 @@ final class HeartbeatManager: ObservableObject {
                 }
             }
 
+            return
+        }
+
+        if revisionRequest != nil {
+            do {
+                try await performAnalyzeResponsesFallback(
+                    run,
+                    paper: paper,
+                    notes: notes,
+                    plan: plan,
+                    inspection: inspection,
+                    revisionRequest: revisionRequest,
+                    incrementAttempt: false
+                )
+            } catch {
+                handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+            }
             return
         }
 
@@ -1278,8 +1328,14 @@ final class HeartbeatManager: ObservableObject {
 
         let taskAge = now.timeIntervalSince(taskStart)
         let progressAge = now.timeIntervalSince(lastProgress)
+        let latestProgress = run.latestProgressMessage?.lowercased() ?? ""
+        let networkMode = snapshot.environmentNetworkMode?.lowercased() ?? ""
+        let retryGracePeriod =
+            latestProgress.contains("bundled") && networkMode == "on"
+            ? bundledRemoteRetryGracePeriod
+            : remoteRetryGracePeriod
 
-        return taskAge >= remoteRetryGracePeriod
+        return taskAge >= retryGracePeriod
             && (snapshot.outputCharacterCount == 0 || progressAge >= stalledEventGracePeriod)
     }
 

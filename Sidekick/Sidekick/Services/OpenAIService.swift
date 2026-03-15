@@ -1421,7 +1421,7 @@ final class OpenAIService: ObservableObject {
                 log("createTask response bytes=\(data.count)")
 
                 let taskID = try decodeTaskID(from: data)
-                await environmentRouter.remember(environment)
+                await environmentRouter.remember(environment, for: preference)
                 return taskID
             } catch let error as BackendRequestFailure
                 where error.detailType == "repo_not_accessible" {
@@ -1486,7 +1486,7 @@ final class OpenAIService: ObservableObject {
             var prioritized = (networkEnabled.isEmpty ? environments : networkEnabled)
                 .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
 
-            if let remembered = await environmentRouter.cached(),
+            if let remembered = await environmentRouter.cached(for: preference),
                let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
                 let cached = prioritized.remove(at: index)
                 prioritized.insert(cached, at: 0)
@@ -2571,14 +2571,14 @@ private actor OpenAIModelRouter {
 }
 
 private actor OpenAIEnvironmentRouter {
-    private var selectedEnvironment: CloudTaskEnvironment?
+    private var selectedEnvironments: [CloudTaskEnvironmentPreference: CloudTaskEnvironment] = [:]
 
-    func cached() -> CloudTaskEnvironment? {
-        selectedEnvironment
+    func cached(for preference: CloudTaskEnvironmentPreference) -> CloudTaskEnvironment? {
+        selectedEnvironments[preference]
     }
 
-    func remember(_ environment: CloudTaskEnvironment) {
-        selectedEnvironment = environment
+    func remember(_ environment: CloudTaskEnvironment, for preference: CloudTaskEnvironmentPreference) {
+        selectedEnvironments[preference] = environment
     }
 }
 
