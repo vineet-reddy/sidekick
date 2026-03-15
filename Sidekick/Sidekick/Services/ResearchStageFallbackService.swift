@@ -31,6 +31,18 @@ actor ResearchStageFallbackService {
         self.session = session
     }
 
+    func supportsFallback(
+        datasetIDs: [String],
+        noteTexts: [String],
+        theme: String
+    ) -> Bool {
+        supportsGlioblastomaCBioPortalBundle(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            theme: theme
+        )
+    }
+
     func inspectionInput(
         datasetIDs: [String],
         noteTexts: [String],

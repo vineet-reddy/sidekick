@@ -16,7 +16,7 @@ struct PaperListView: View {
                 SidekickBackground()
 
                 ScrollView {
-                    if papers.isEmpty {
+                    if orderedPapers.isEmpty {
                         Text("Papers will appear here as your notes develop.")
                             .font(.subheadline)
                             .foregroundStyle(.tertiary)
@@ -24,7 +24,7 @@ struct PaperListView: View {
                             .padding(.top, 80)
                     } else {
                         LazyVStack(spacing: 14) {
-                            ForEach(papers) { paper in
+                            ForEach(orderedPapers) { paper in
                                 NavigationLink(value: paper.id) {
                                     paperCard(for: paper)
                                 }
@@ -59,7 +59,7 @@ struct PaperListView: View {
     }
 
     private var autoOpenTaskKey: String {
-        let ids = papers.map(\.id.uuidString).joined(separator: ",")
+        let ids = orderedPapers.map(\.id.uuidString).joined(separator: ",")
         return "\(shouldAutoOpenLatestReadyPaper)|\(ids)"
     }
 
@@ -73,12 +73,29 @@ struct PaperListView: View {
         runs.latestRunsByPaperID()
     }
 
+    private var orderedPapers: [Paper] {
+        papers.sorted { lhs, rhs in
+            let leftPriority = sortPriority(for: lhs.status)
+            let rightPriority = sortPriority(for: rhs.status)
+
+            if leftPriority != rightPriority {
+                return leftPriority < rightPriority
+            }
+
+            if lhs.updatedAt != rhs.updatedAt {
+                return lhs.updatedAt > rhs.updatedAt
+            }
+
+            return lhs.createdAt > rhs.createdAt
+        }
+    }
+
     private func autoOpenLatestReadyPaperIfNeeded() {
         guard shouldAutoOpenLatestReadyPaper, !hasAutoOpenedLatestReadyPaper else {
             return
         }
 
-        guard let latestReadyPaper = papers.first(where: { $0.status == .ready }) else {
+        guard let latestReadyPaper = orderedPapers.first(where: { $0.status == .ready }) else {
             return
         }
 
@@ -135,6 +152,17 @@ struct PaperListView: View {
     private func delete(_ paper: Paper) {
         try? ContentDeletionService.deletePaper(paper, modelContext: modelContext)
         path.removeAll { $0 == paper.id }
+    }
+
+    private func sortPriority(for status: PaperStatus) -> Int {
+        switch status {
+        case .generating:
+            return 0
+        case .ready:
+            return 1
+        case .failed:
+            return 2
+        }
     }
 
     @ViewBuilder

@@ -5,11 +5,14 @@ import UIKit
 enum PaperDocumentService {
     enum DocumentError: LocalizedError {
         case renderFailed
+        case missingRequiredFigureAsset
 
         var errorDescription: String? {
             switch self {
             case .renderFailed:
                 return "Sidekick could not render the paper PDF."
+            case .missingRequiredFigureAsset:
+                return "Sidekick could not recover the required figure assets for this paper."
             }
         }
     }
@@ -45,22 +48,33 @@ enum PaperDocumentService {
             stage: .analyze
         )
         let figureCaptions = analysis?.figures.map(\.caption) ?? []
-        let validExistingFigures = paper.figureData.filter(isSidekickRenderableImageData)
+        let normalizedExistingFigures = paper.figureData.compactMap(normalizedSidekickRenderableImageData)
 
-        if validExistingFigures.count != paper.figureData.count {
-            print(
-                "[PaperDocs] dropped \(paper.figureData.count - validExistingFigures.count) invalid figure(s) " +
-                    "task=\(taskID)"
-            )
-            paper.figureData = validExistingFigures
+        if normalizedExistingFigures != paper.figureData {
+            let droppedFigureCount = paper.figureData.count - normalizedExistingFigures.count
+            if droppedFigureCount > 0 {
+                print("[PaperDocs] dropped \(droppedFigureCount) invalid figure(s) task=\(taskID)")
+            } else {
+                print("[PaperDocs] normalized cached figure bytes task=\(taskID)")
+            }
+            updateFigureDataPreservingTimestamp(normalizedExistingFigures, for: paper)
         }
 
         if paper.figureData.isEmpty, let analysis {
             let recoveredFigures = analysis.figureData
             if !recoveredFigures.isEmpty {
                 print("[PaperDocs] recovered \(recoveredFigures.count) figure(s) from staged analysis task=\(taskID)")
-                paper.figureData = recoveredFigures
+                updateFigureDataPreservingTimestamp(recoveredFigures, for: paper)
             }
+        }
+
+        if paper.figureData.isEmpty,
+           let analysis,
+           !analysis.figures.isEmpty,
+           paper.status == .ready {
+            print("[PaperDocs] required staged figures are unavailable; downgrading paper task=\(taskID)")
+            updatePaperStatusPreservingTimestamp(.failed, for: paper)
+            throw DocumentError.missingRequiredFigureAsset
         }
 
         let fingerprint = artifactFingerprint(for: paper)
@@ -105,6 +119,18 @@ enum PaperDocumentService {
             String(paper.figureData.count),
             String(figureBytes)
         ].joined(separator: "|")
+    }
+
+    private static func updateFigureDataPreservingTimestamp(_ figures: [Data], for paper: Paper) {
+        let originalUpdatedAt = paper.updatedAt
+        paper.figureData = figures
+        paper.updatedAt = originalUpdatedAt
+    }
+
+    private static func updatePaperStatusPreservingTimestamp(_ status: PaperStatus, for paper: Paper) {
+        let originalUpdatedAt = paper.updatedAt
+        paper.status = status
+        paper.updatedAt = originalUpdatedAt
     }
 
     private static func renderPDF(from html: String) throws -> Data {

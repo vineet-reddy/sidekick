@@ -45,6 +45,7 @@ final class HeartbeatManager: ObservableObject {
     private let supportedLocalRecoveryGracePeriod: TimeInterval = 3 * 60
     private let remoteRetryGracePeriod: TimeInterval = 8 * 60
     private let bundledRemoteRetryGracePeriod: TimeInterval = 20 * 60
+    private let failedPaperRetryCooldown: TimeInterval = 20 * 60
     private let deadBundledTaskGracePeriod: TimeInterval = 2 * 60
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
@@ -777,8 +778,29 @@ final class HeartbeatManager: ObservableObject {
 
             case let .completed(snapshot, artifact):
                 persistTaskProgress(snapshot)
-                try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
                 run.activeTaskID = nil
+
+                if await shouldRerouteInspectionArtifactToBundledFallback(
+                    artifact,
+                    run: run,
+                    notes: notes
+                ) {
+                    print("[Heartbeat]   -> Inspect task for \(run.runID) only returned transport-block diagnostics; rerouting to bundled fallback.")
+                    do {
+                        try await performInspectResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+                    }
+                    return
+                }
+
+                try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
                 run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
                 try persistModelChanges(in: run.modelContext)
                 print("[Heartbeat]   -> Inspect stage completed for \(run.runID)")
@@ -817,7 +839,25 @@ final class HeartbeatManager: ObservableObject {
             return
         }
 
+        let shouldUseBundledFallback = await prefersBundledResearchFallback(run: run, notes: notes)
         run.incrementAttempt(for: .inspect)
+
+        if shouldUseBundledFallback {
+            print("[Heartbeat]   -> Inspect stage for \(run.runID) is supported by a bundled cohort fallback; skipping the live remote path.")
+            do {
+                try await performInspectResponsesFallback(
+                    run,
+                    paper: paper,
+                    notes: notes,
+                    plan: plan,
+                    incrementAttempt: false
+                )
+            } catch {
+                handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+            }
+            return
+        }
+
         run.markRunning(stage: .inspect, message: "Resolving and inspecting the dataset slice.")
         try persistModelChanges(in: run.modelContext)
 
@@ -966,8 +1006,31 @@ final class HeartbeatManager: ObservableObject {
 
             case let .completed(snapshot, artifact):
                 persistTaskProgress(snapshot)
-                try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
                 run.activeTaskID = nil
+
+                if await shouldRerouteAnalysisArtifactToBundledFallback(
+                    artifact,
+                    run: run,
+                    notes: notes
+                ) {
+                    print("[Heartbeat]   -> Analysis task for \(run.runID) only returned transport-block diagnostics; rerouting to bundled fallback.")
+                    do {
+                        try await performAnalyzeResponsesFallback(
+                            run,
+                            paper: paper,
+                            notes: notes,
+                            plan: plan,
+                            inspection: inspection,
+                            revisionRequest: revisionRequest,
+                            incrementAttempt: false
+                        )
+                    } catch {
+                        handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+                    }
+                    return
+                }
+
+                try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
                 run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
                 try persistModelChanges(in: run.modelContext)
                 print("[Heartbeat]   -> Analysis stage completed for \(run.runID)")
@@ -1056,9 +1119,35 @@ final class HeartbeatManager: ObservableObject {
             return
         }
 
+        let shouldUseBundledFallback: Bool
+        if isRevisionRetry {
+            shouldUseBundledFallback = false
+        } else {
+            shouldUseBundledFallback = await prefersBundledResearchFallback(run: run, notes: notes)
+        }
+
         if !isRevisionRetry {
             run.incrementAttempt(for: .analyze)
         }
+
+        if shouldUseBundledFallback {
+            print("[Heartbeat]   -> Analysis stage for \(run.runID) is supported by a bundled cohort fallback; skipping the live remote path.")
+            do {
+                try await performAnalyzeResponsesFallback(
+                    run,
+                    paper: paper,
+                    notes: notes,
+                    plan: plan,
+                    inspection: inspection,
+                    revisionRequest: revisionRequest,
+                    incrementAttempt: false
+                )
+            } catch {
+                handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+            }
+            return
+        }
+
         run.markRunning(
             stage: .analyze,
             message: isRevisionRetry
@@ -1134,9 +1223,13 @@ final class HeartbeatManager: ObservableObject {
                 inspection: inspection,
                 analysis: analysis
             )
-            try PaperArtifactStore.persistStageArtifact(verification, runID: run.runID, stage: .verify)
+            let normalizedVerification = normalizedVerificationArtifact(
+                verification,
+                analysis: analysis
+            )
+            try PaperArtifactStore.persistStageArtifact(normalizedVerification, runID: run.runID, stage: .verify)
 
-            if verification.decision == .reviseAnalysis {
+            if normalizedVerification.decision == .reviseAnalysis {
                 run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
                 try persistModelChanges(in: run.modelContext)
                 print("[Heartbeat]   -> Verification requested analysis revisions for \(run.runID)")
@@ -1144,9 +1237,9 @@ final class HeartbeatManager: ObservableObject {
                 return
             }
 
-            guard verification.allowsWriting else {
+            guard normalizedVerification.allowsWriting else {
                 print("[Heartbeat]   -> Verification blocked drafting for \(run.runID)")
-                markResearchRunFailed(run, paper: paper, message: verification.blockingMessage)
+                markResearchRunFailed(run, paper: paper, message: normalizedVerification.blockingMessage)
                 return
             }
 
@@ -1448,6 +1541,170 @@ final class HeartbeatManager: ObservableObject {
         return indicators.contains(where: message.contains)
     }
 
+    private func prefersBundledResearchFallback(
+        run: ResearchRun,
+        notes: [Note]
+    ) async -> Bool {
+        await openAI.supportsBundledResearchFallback(
+            datasetIDs: run.datasetIDs,
+            noteTexts: notes.map(\.content),
+            theme: run.theme
+        )
+    }
+
+    private func shouldRerouteInspectionArtifactToBundledFallback(
+        _ artifact: ResearchInspectionArtifact,
+        run: ResearchRun,
+        notes: [Note]
+    ) async -> Bool {
+        guard await prefersBundledResearchFallback(run: run, notes: notes),
+              (artifact.datasetManifest.rowCount ?? 0) == 0 else {
+            return false
+        }
+
+        let evidence = [
+            artifact.accessNotes,
+            artifact.datasetManifest.sampleDescription
+        ] + artifact.qualityChecks
+            + artifact.analysisChecklist
+            + artifact.datasetManifest.qualityNotes
+            + artifact.datasetManifest.dataSources
+            + artifact.datasetManifest.selectedVariables
+
+        return artifactTextIndicatesTransportBlock(evidence)
+    }
+
+    private func shouldRerouteAnalysisArtifactToBundledFallback(
+        _ artifact: ResearchAnalysisArtifact,
+        run: ResearchRun,
+        notes: [Note]
+    ) async -> Bool {
+        guard await prefersBundledResearchFallback(run: run, notes: notes),
+              (artifact.datasetManifest.rowCount ?? 0) == 0,
+              artifact.figures.isEmpty else {
+            return false
+        }
+
+        let findingEvidence = artifact.findings.flatMap { finding in
+            [finding.claim, finding.estimate, finding.uncertainty, finding.evidence]
+        }
+        let evidence = [
+            artifact.narrativeSummary,
+            artifact.datasetManifest.sampleDescription,
+            artifact.provenance.notes
+        ]
+        + artifact.limitations
+        + artifact.datasetManifest.qualityNotes
+        + artifact.datasetManifest.dataSources
+        + artifact.datasetManifest.selectedVariables
+        + findingEvidence
+
+        return artifactTextIndicatesTransportBlock(evidence)
+    }
+
+    private func artifactTextIndicatesTransportBlock(_ parts: [String]) -> Bool {
+        let combined = parts.joined(separator: " ").lowercased()
+        let indicators = [
+            "connect tunnel",
+            "tunnel connection failed",
+            "response 403",
+            "403 forbidden",
+            "approved domains were probed",
+            "approved-domain",
+            "outbound https",
+            "outbound access",
+            "network egress",
+            "transport-layer block",
+            "transport blockage",
+            "restore outbound access",
+            "all approved endpoint probes failed"
+        ]
+
+        return indicators.contains(where: combined.contains)
+    }
+
+    private func normalizedVerificationArtifact(
+        _ verification: ResearchVerificationArtifact,
+        analysis: ResearchAnalysisArtifact
+    ) -> ResearchVerificationArtifact {
+        guard verification.decision != .blocked,
+              !analysis.figures.isEmpty else {
+            return verification
+        }
+
+        var reasons: [String] = []
+        var figureChecks = verification.figureSanityChecks
+        var requiredRevisions = verification.requiredRevisions
+        let existingCheckFilenames = Set(
+            figureChecks.map { $0.filename.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        )
+        let unusableFigures = analysis.figures.filter { $0.imageData == nil }
+
+        if !unusableFigures.isEmpty {
+            reasons.append("At least one required figure asset was missing or unusable after local validation.")
+            requiredRevisions.append(
+                "Regenerate every required figure asset as a real PNG and ensure the saved analysis artifact includes it."
+            )
+
+            for figure in unusableFigures {
+                let normalizedFilename = figure.filename.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                guard !existingCheckFilenames.contains(normalizedFilename) else {
+                    continue
+                }
+
+                figureChecks.append(
+                    ResearchFigureSanityCheck(
+                        filename: figure.filename,
+                        status: "missing",
+                        issue: "This figure asset was missing or unusable after local validation. Regenerate it as a real PNG."
+                    )
+                )
+            }
+        }
+
+        if verification.figureSanityChecks.contains(where: {
+            $0.status.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "missing"
+        }) {
+            reasons.append("Verification reported at least one required figure as missing.")
+            requiredRevisions.append("Regenerate or reattach the missing figure asset before drafting.")
+        }
+
+        guard !reasons.isEmpty else {
+            return verification
+        }
+
+        let baseSummary = verification.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        let summarySuffix = uniquePreservingOrder(reasons).joined(separator: " ")
+        let summary = baseSummary.isEmpty ? summarySuffix : "\(baseSummary) \(summarySuffix)"
+
+        return ResearchVerificationArtifact(
+            decision: .reviseAnalysis,
+            summary: summary,
+            supportedClaims: verification.supportedClaims,
+            weakOrUnsupportedClaims: verification.weakOrUnsupportedClaims,
+            figureSanityChecks: figureChecks,
+            modelWarnings: verification.modelWarnings,
+            sampleWarnings: verification.sampleWarnings,
+            requiredRevisions: uniquePreservingOrder(requiredRevisions)
+        )
+    }
+
+    private func uniquePreservingOrder(_ values: [String]) -> [String] {
+        var seen: Set<String> = []
+        var result: [String] = []
+
+        for value in values {
+            let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !normalized.isEmpty, seen.insert(normalized).inserted else {
+                continue
+            }
+
+            result.append(normalized)
+        }
+
+        return result
+    }
+
     private func pendingAnalysisRevision(for runID: String) -> ResearchVerificationArtifact? {
         guard let verification = PaperArtifactStore.stageArtifact(
             ResearchVerificationArtifact.self,
@@ -1564,10 +1821,23 @@ final class HeartbeatManager: ObservableObject {
             }
 
             let latestNoteUpdate = clusterNotes.map(\.updatedAt).max() ?? .distantPast
-            if let latestPaper = matchingPapers.max(by: { $0.updatedAt < $1.updatedAt }),
-               latestPaper.updatedAt >= latestNoteUpdate {
-                print("[Heartbeat]   Cluster \"\(cluster.suggestedTitle)\" already tracked, skipping.")
-                continue
+            if let latestPaper = matchingPapers.max(by: { $0.updatedAt < $1.updatedAt }) {
+                if latestPaper.status == .failed {
+                    let failureAge = Date().timeIntervalSince(latestPaper.updatedAt)
+                    guard failureAge >= failedPaperRetryCooldown else {
+                        let retryDelayMinutes = max(
+                            1,
+                            Int(ceil((failedPaperRetryCooldown - failureAge) / 60))
+                        )
+                        print("[Heartbeat]   Cluster \"\(cluster.suggestedTitle)\" failed recently; retrying in about \(retryDelayMinutes) minute(s).")
+                        continue
+                    }
+
+                    print("[Heartbeat]   Cluster \"\(cluster.suggestedTitle)\" failed previously; retrying the cluster.")
+                } else if latestPaper.updatedAt >= latestNoteUpdate {
+                    print("[Heartbeat]   Cluster \"\(cluster.suggestedTitle)\" already tracked, skipping.")
+                    continue
+                }
             }
 
             if !matchingPapers.isEmpty {

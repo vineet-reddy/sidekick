@@ -1,6 +1,8 @@
+import CoreGraphics
 import Foundation
 import ImageIO
 import SwiftData
+import UniformTypeIdentifiers
 
 enum ResearchRunStage: String, Codable, CaseIterable {
     case plan
@@ -409,12 +411,11 @@ nonisolated struct ResearchFigureArtifact: Codable {
     }
 
     var imageData: Data? {
-        guard let data = decodeSidekickBase64Payload(base64Data),
-              isSidekickRenderableImageData(data) else {
+        guard let data = decodeSidekickBase64Payload(base64Data) else {
             return nil
         }
 
-        return data
+        return normalizedSidekickRenderableImageData(data)
     }
 }
 
@@ -502,13 +503,11 @@ nonisolated struct ResearchVerificationArtifact: Codable {
 }
 
 nonisolated func isSidekickRenderableImageData(_ data: Data) -> Bool {
-    guard let source = CGImageSourceCreateWithData(data as CFData, nil),
-          CGImageSourceGetCount(source) > 0,
-          CGImageSourceCreateImageAtIndex(source, 0, nil) != nil else {
-        return false
-    }
+    normalizedSidekickRenderableImageData(data) != nil
+}
 
-    return true
+nonisolated func normalizedSidekickRenderableImageData(_ data: Data) -> Data? {
+    SidekickImageValidator.normalizedPNGData(from: data)
 }
 
 nonisolated func decodeSidekickBase64Payload(_ raw: String) -> Data? {
@@ -550,6 +549,103 @@ nonisolated func decodeSidekickBase64Payload(_ raw: String) -> Data? {
     }
 
     return Data(base64Encoded: normalized)
+}
+
+private enum SidekickImageValidator {
+    private static let maximumSampleDimension = 96
+    private static let minimumContrast = 8
+    private static let minimumForegroundDelta = 12
+    private static let minimumForegroundPixels = 12
+    private static let foregroundPixelDivisor = 500
+
+    static func normalizedPNGData(from data: Data) -> Data? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil),
+              CGImageSourceGetCount(source) > 0,
+              let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
+              image.width > 0,
+              image.height > 0,
+              containsVisibleContent(image) else {
+            return nil
+        }
+
+        return canonicalPNGData(for: image) ?? data
+    }
+
+    private static func containsVisibleContent(_ image: CGImage) -> Bool {
+        let sampleWidth = max(1, min(maximumSampleDimension, image.width))
+        let sampleHeight = max(1, min(maximumSampleDimension, image.height))
+        let pixelCount = sampleWidth * sampleHeight
+        var pixels = [UInt8](repeating: 0, count: pixelCount)
+
+        let drawSucceeded = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let baseAddress = buffer.baseAddress,
+                  let context = CGContext(
+                      data: baseAddress,
+                      width: sampleWidth,
+                      height: sampleHeight,
+                      bitsPerComponent: 8,
+                      bytesPerRow: sampleWidth,
+                      space: CGColorSpaceCreateDeviceGray(),
+                      bitmapInfo: CGImageAlphaInfo.none.rawValue
+                  ) else {
+                return false
+            }
+
+            context.interpolationQuality = .medium
+            context.draw(image, in: CGRect(x: 0, y: 0, width: sampleWidth, height: sampleHeight))
+            return true
+        }
+
+        guard drawSucceeded else {
+            return false
+        }
+
+        let cornerIndexes = [
+            0,
+            sampleWidth - 1,
+            (sampleHeight - 1) * sampleWidth,
+            pixelCount - 1
+        ]
+        let backgroundValue = cornerIndexes
+            .map { Int(pixels[$0]) }
+            .reduce(0, +) / cornerIndexes.count
+
+        var minValue = 255
+        var maxValue = 0
+        var nonBackgroundPixels = 0
+
+        for pixel in pixels {
+            let value = Int(pixel)
+            minValue = min(minValue, value)
+            maxValue = max(maxValue, value)
+
+            if abs(value - backgroundValue) >= minimumForegroundDelta {
+                nonBackgroundPixels += 1
+            }
+        }
+
+        let minimumForeground = max(minimumForegroundPixels, pixelCount / foregroundPixelDivisor)
+        return (maxValue - minValue) >= minimumContrast && nonBackgroundPixels >= minimumForeground
+    }
+
+    private static func canonicalPNGData(for image: CGImage) -> Data? {
+        let encoded = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(
+            encoded as CFMutableData,
+            UTType.png.identifier as CFString,
+            1,
+            nil
+        ) else {
+            return nil
+        }
+
+        CGImageDestinationAddImage(destination, image, nil)
+        guard CGImageDestinationFinalize(destination) else {
+            return nil
+        }
+
+        return encoded as Data
+    }
 }
 
 nonisolated struct ResearchDraftArtifact: Codable {

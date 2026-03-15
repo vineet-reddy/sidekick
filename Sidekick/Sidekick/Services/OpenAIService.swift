@@ -435,6 +435,18 @@ final class OpenAIService: ObservableObject {
         await environmentRouter.quarantine(environmentID, for: .selfContainedBundle)
     }
 
+    func supportsBundledResearchFallback(
+        datasetIDs: [String],
+        noteTexts: [String],
+        theme: String
+    ) async -> Bool {
+        await stageFallback.supportsFallback(
+            datasetIDs: datasetIDs,
+            noteTexts: noteTexts,
+            theme: theme
+        )
+    }
+
     func runResearchInspectionFallback(
         notes: [Note],
         title: String,
@@ -798,8 +810,10 @@ final class OpenAIService: ObservableObject {
         - Do not contact GDC, cBioPortal, or any other external service. The supplied bundle is authoritative for this analysis pass.
         - Prefer one concrete public cohort analysis over speculative multi-source synthesis.
         - Treat MGMT measurements exactly as represented in the bundle; do not relabel continuous methylation values as binary promoter status unless the data justify it.
-        - If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png`; do not substitute a bar chart or median-only graphic.
+        - If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png` with the corresponding risk table rendered beneath each requested panel when the cohort supports it; do not substitute a bar chart or median-only graphic.
         - Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.
+        - The caption for `figure_1.png` must explicitly name the plotted stratifications and state whether the saved figure includes the risk table, so downstream verification can confirm the requirement from the checkpointed artifact.
+        - Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.
         - Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
         - If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
         - If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
@@ -926,19 +940,21 @@ final class OpenAIService: ObservableObject {
              }
            }
         6. Treat MGMT measurements exactly as represented in the supplied bundle. Do not relabel continuous methylation values as a binary promoter status unless the data justify it.
-        7. If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png`; do not substitute a bar chart or median-only graphic.
+        7. If survival time and event fields are present, generate a real Kaplan-Meier survival figure as `figure_1.png` with the corresponding risk table rendered beneath each requested panel when the cohort supports it; do not substitute a bar chart or median-only graphic.
         8. Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.
-        9. Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
-        10. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
-        11. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
-        12. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
-        13. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
-        14. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
-        15. Report sex distributions or explicitly explain why the supplied fields cannot support them.
-        16. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
-        17. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
-        18. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
-        19. The final assistant message must contain only the JSON object and nothing before or after it.
+        9. The caption for `figure_1.png` must explicitly name the plotted stratifications and state whether the saved figure includes the risk table, so downstream verification can confirm the requirement from the checkpointed artifact.
+        10. Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.
+        11. Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.
+        12. If survival time, event, and the requested covariates are available with enough complete cases, fit the requested multivariable Cox model and report hazard ratios with confidence intervals.
+        13. If age and sex fields are present, report their distributions and include at least one age- or sex-aware survival comparison or subgroup summary.
+        14. If multiple assay fields represent one biological variable, document the exact merge rule in `dataset_manifest.quality_notes` and any relevant table notes.
+        15. If the strongest trustworthy analysis is descriptive or limited to one or two subgroup comparisons, return that instead of stalling.
+        16. If verification guidance is supplied below, every required revision is mandatory unless the supplied bundle truly lacks the needed fields; in that case explain the blocker precisely in `limitations` and `quality_notes`.
+        17. Report sex distributions or explicitly explain why the supplied fields cannot support them.
+        18. If a desired claim cannot be supported from the supplied bundle, say so in `limitations` or `quality_notes` instead of trying to fetch replacement data.
+        19. Set `provenance.accessed_domains` to an empty list unless you actually accessed an external domain, which you must not do in this task.
+        20. Set `provenance.external_sources` to an empty list unless you truly used one, which you must not do in this task.
+        21. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)
         Theme: \(theme)
@@ -1000,6 +1016,8 @@ final class OpenAIService: ObservableObject {
         - Set `decision` to `proceed` only when the analysis artifact is sufficient for a concise honest paper.
         - Set `decision` to `revise_analysis` when the question is still viable but the analysis is missing key sample sizes, uncertainty, figure integrity, cohort definition, or claim support.
         - Set `decision` to `blocked` when the inspected dataset slice does not support the intended paper.
+        - If any figure entry below has `asset_status` other than `ok`, treat that as missing figure integrity and require `revise_analysis` unless the paper can honestly proceed without that figure.
+        - When the requested Kaplan-Meier output requires a risk table, do not approve `proceed` unless the saved figure caption or supporting evidence explicitly confirms that the risk table is included.
         - Put any claim that must not appear in Results into `weak_or_unsupported_claims`.
         - Use `required_revisions` for concrete stage-local corrections only.
         - Keep the verification terse, specific, and scientifically conservative.
@@ -1323,11 +1341,11 @@ final class OpenAIService: ObservableObject {
 
         return figures.compactMap { figure in
             guard let data = decodeSidekickBase64Payload(figure.base64Data),
-                  isSidekickRenderableImageData(data) else {
+                  let normalized = normalizedSidekickRenderableImageData(data) else {
                 return nil
             }
 
-            return data
+            return normalized
         }
     }
 
@@ -1361,7 +1379,7 @@ final class OpenAIService: ObservableObject {
             if let task, outputContainsTruncationMarker(task.outputText) {
                 reason = "The analysis task output was truncated before all figure bytes arrived."
             } else {
-                reason = "The analysis task returned figure metadata without recoverable image bytes."
+                reason = "The analysis task returned figure metadata without a usable figure asset."
             }
 
             throw ServiceError.taskFailed(reason)
@@ -1396,21 +1414,10 @@ final class OpenAIService: ObservableObject {
         }
 
         return artifact.figures.enumerated().compactMap { index, figure in
-            if figure.imageData != nil {
-                return figure
-            }
-
-            guard recoveredDiffFigures.indices.contains(index),
-                  isSidekickRenderableImageData(recoveredDiffFigures[index]) else {
-                return nil
-            }
-
-            return ResearchFigureArtifact(
-                filename: figure.filename,
-                caption: figure.caption,
-                mimeType: figure.mimeType,
-                base64Data: recoveredDiffFigures[index].base64EncodedString()
-            )
+            let fallbackData = recoveredDiffFigures.indices.contains(index)
+                ? recoveredDiffFigures[index]
+                : nil
+            return normalizedResearchFigure(figure, fallbackData: fallbackData)
         }
     }
 
@@ -1584,6 +1591,7 @@ final class OpenAIService: ObservableObject {
                     let label = environment.label ?? environment.id
                     skippedLabels.append(label)
                     lastError = error
+                    await environmentRouter.quarantine(environment.id, for: preference)
                     log("createTask skipping environment \(label) due to repo_not_accessible")
                     continue
                 } catch {
@@ -2361,9 +2369,12 @@ final class OpenAIService: ObservableObject {
                 ]
             },
             "figures": analysis.figures.map { figure in
+                let imageData = figure.imageData
                 [
                     "filename": figure.filename,
-                    "caption": figure.caption
+                    "caption": figure.caption,
+                    "asset_status": imageData == nil ? "missing_or_unusable" : "ok",
+                    "image_bytes": imageData.map { NSNumber(value: $0.count) } ?? NSNull()
                 ]
             },
             "limitations": analysis.limitations,
@@ -2375,6 +2386,33 @@ final class OpenAIService: ObservableObject {
                 "notes": analysis.provenance.notes
             ]
         ]
+    }
+
+    private func normalizedResearchFigure(
+        _ figure: ResearchFigureArtifact,
+        fallbackData: Data?
+    ) -> ResearchFigureArtifact? {
+        if let payloadData = decodeSidekickBase64Payload(figure.base64Data),
+           let normalizedPayload = normalizedSidekickRenderableImageData(payloadData) {
+            return ResearchFigureArtifact(
+                filename: figure.filename,
+                caption: figure.caption,
+                mimeType: figure.mimeType,
+                base64Data: normalizedPayload.base64EncodedString()
+            )
+        }
+
+        if let fallbackData,
+           let normalizedFallback = normalizedSidekickRenderableImageData(fallbackData) {
+            return ResearchFigureArtifact(
+                filename: figure.filename,
+                caption: figure.caption,
+                mimeType: figure.mimeType,
+                base64Data: normalizedFallback.base64EncodedString()
+            )
+        }
+
+        return nil
     }
 
     private func verificationPromptPayload(from verification: ResearchVerificationArtifact) -> [String: Any] {
