@@ -11,6 +11,7 @@ struct PaperDetailView: View {
     @State private var isShowingExportError = false
     @State private var isShowingDeleteConfirmation = false
     @State private var documentState: DocumentState = .loading
+    @State private var hasAutoPresentedShareSheet = false
 
     let paper: Paper
 
@@ -168,6 +169,7 @@ struct PaperDetailView: View {
         do {
             let url = try await ExportService.exportPDF(for: paper)
             documentState = .ready(url)
+            presentQAShareSheetIfNeeded(for: url)
         } catch {
             documentState = .failed(error.localizedDescription)
         }
@@ -176,6 +178,16 @@ struct PaperDetailView: View {
     private func deletePaper() {
         try? ContentDeletionService.deletePaper(paper, modelContext: modelContext)
         dismiss()
+    }
+
+    private func presentQAShareSheetIfNeeded(for url: URL) {
+        guard QAFlags.shouldAutoShareLatestPaper, !hasAutoPresentedShareSheet else {
+            return
+        }
+
+        shareItem = ShareItem(url: url)
+        hasAutoPresentedShareSheet = true
+        print("[QA] Auto-presenting share sheet for task=\(paper.codexTaskID)")
     }
 
     private func pipelineRow(stage: ResearchRunStage, state: ResearchRunPipelineStepState) -> some View {

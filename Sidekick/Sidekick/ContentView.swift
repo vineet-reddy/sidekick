@@ -25,6 +25,25 @@ enum QAFlags {
 
         return ProcessInfo.processInfo.environment["SIDEKICK_QA_FORCE_HEARTBEAT"] == "1"
     }
+
+    static var shouldAutoShareLatestPaper: Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--qa-auto-share-latest-paper") {
+            return true
+        }
+
+        return ProcessInfo.processInfo.environment["SIDEKICK_QA_AUTO_SHARE_LATEST_PAPER"] == "1"
+    }
+
+    static var seedNoteContent: String? {
+        guard let raw = ProcessInfo.processInfo.environment["SIDEKICK_QA_SEED_NOTE"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else {
+            return nil
+        }
+
+        return raw
+    }
 }
 
 struct AppShellView: View {
@@ -41,6 +60,7 @@ struct AppShellView: View {
                     await notifications.requestAuthorization()
                 }
                 heartbeat.scheduleBackgroundRefresh()
+                seedQANoteIfNeeded(modelContext: modelContext)
                 Task {
                     await preloadRecentReadyPapers(modelContext: modelContext)
                 }
@@ -64,6 +84,28 @@ struct AppShellView: View {
                     await heartbeat.runIfNeeded(modelContext: modelContext)
                 }
             }
+    }
+
+    private func seedQANoteIfNeeded(modelContext: ModelContext) {
+        guard let content = QAFlags.seedNoteContent else {
+            return
+        }
+
+        do {
+            let existingNotes = try modelContext.fetch(FetchDescriptor<Note>())
+            guard existingNotes.contains(where: {
+                $0.content.trimmingCharacters(in: .whitespacesAndNewlines) == content
+            }) == false else {
+                return
+            }
+
+            let note = Note(content: content, createdAt: .now, updatedAt: .now)
+            modelContext.insert(note)
+            try modelContext.save()
+            print("[QA] Seeded note title=\"\(note.title)\"")
+        } catch {
+            print("[QA] Failed to seed note: \(error.localizedDescription)")
+        }
     }
 
     private func preloadRecentReadyPapers(modelContext: ModelContext) async {
