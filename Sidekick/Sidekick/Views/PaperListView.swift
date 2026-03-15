@@ -34,6 +34,7 @@ struct PaperListView: View {
         }
         .navigationTitle("Papers")
         .navigationBarTitleDisplayMode(.inline)
+        .accessibilityIdentifier("papers.listView")
     }
 
     private func paperCard(for paper: Paper) -> some View {
@@ -71,5 +72,7 @@ struct PaperListView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(padding: 14)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("paper.card.\(paper.id.uuidString)")
     }
 }

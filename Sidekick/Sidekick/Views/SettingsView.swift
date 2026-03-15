@@ -37,6 +37,10 @@ struct SettingsView: View {
                             Text("Last sync encountered an issue.")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
+                            Text(lastError)
+                                .font(.footnote)
+                                .foregroundStyle(.primary)
+                                .textSelection(.enabled)
                             Text("Sidekick will retry automatically.")
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
@@ -57,5 +61,6 @@ struct SettingsView: View {
         }
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
+        .accessibilityIdentifier("settings.view")
     }
 }

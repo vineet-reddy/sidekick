@@ -78,6 +78,17 @@ struct NoteListView: View {
         .navigationTitle("Notes")
         .navigationBarTitleDisplayMode(.inline)
         .searchable(text: $searchText, placement: .navigationBarDrawer(displayMode: .automatic), prompt: "Search notes")
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button {
+                    runHeartbeatNow()
+                } label: {
+                    Image(systemName: "arrow.clockwise")
+                }
+                .accessibilityIdentifier("notes.syncButton")
+                .accessibilityLabel("Run sync now")
+            }
+        }
         .sheet(item: $editingNote) { note in
             NoteEditorView(note: note)
         }
@@ -93,6 +104,7 @@ struct NoteListView: View {
                 .onSubmit {
                     commitNewNote()
                 }
+                .accessibilityIdentifier("notes.composerField")
 
             if !newNoteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 Button {
@@ -102,6 +114,8 @@ struct NoteListView: View {
                         .font(.title2)
                         .foregroundStyle(SidekickTheme.accent)
                 }
+                .accessibilityIdentifier("notes.sendButton")
+                .accessibilityLabel("Save note")
             }
         }
         .padding(.horizontal, 16)
@@ -114,6 +128,7 @@ struct NoteListView: View {
         .shadow(color: SidekickTheme.shadow, radius: 12, x: 0, y: -4)
         .padding(.horizontal, 16)
         .padding(.bottom, 4)
+        .accessibilityIdentifier("notes.inlineComposer")
     }
 
     // MARK: - Note Card
@@ -143,6 +158,8 @@ struct NoteListView: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .glassCard(padding: 14)
+        .accessibilityElement(children: .combine)
+        .accessibilityIdentifier("note.card.\(note.id.uuidString)")
     }
 
     // MARK: - Actions
@@ -179,6 +196,12 @@ struct NoteListView: View {
     private func scheduleHeartbeat() {
         Task {
             try? await Task.sleep(for: .seconds(30))
+            await heartbeat.run(modelContext: modelContext, force: true)
+        }
+    }
+
+    private func runHeartbeatNow() {
+        Task {
             await heartbeat.run(modelContext: modelContext, force: true)
         }
     }

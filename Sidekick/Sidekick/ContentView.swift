@@ -11,7 +11,9 @@ struct AppShellView: View {
     var body: some View {
         ContentView()
             .task {
-                await notifications.requestAuthorization()
+                Task {
+                    await notifications.requestAuthorization()
+                }
                 heartbeat.scheduleBackgroundRefresh()
                 await heartbeat.runIfNeeded(modelContext: modelContext)
                 BackgroundHeartbeatScheduler.shared.runner = {
@@ -130,22 +132,29 @@ struct ContentView: View {
                 }
                 .tabItem {
                     Label("Notes", systemImage: "square.and.pencil")
+                        .accessibilityIdentifier("tab.notes")
                 }
+                .accessibilityIdentifier("tab.notes")
 
                 NavigationStack {
                     PaperListView()
                 }
                 .tabItem {
                     Label("Papers", systemImage: "doc.text.magnifyingglass")
+                        .accessibilityIdentifier("tab.papers")
                 }
+                .accessibilityIdentifier("tab.papers")
 
                 NavigationStack {
                     SettingsView()
                 }
                 .tabItem {
                     Label("Settings", systemImage: "gearshape")
+                        .accessibilityIdentifier("tab.settings")
                 }
+                .accessibilityIdentifier("tab.settings")
             }
+            .accessibilityIdentifier("app.tabView")
             .overlay(alignment: .bottom) {
                 statusDot
             }
