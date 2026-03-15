@@ -20,7 +20,8 @@ enum PaperHTMLBuilder {
           <meta name="viewport" content="width=device-width, initial-scale=1.0">
           <style>
             @page {
-              margin: 0.8in 0.75in;
+              size: 8.5in 11in;
+              margin: 0.68in 0.72in 0.78in;
             }
             :root {
               color-scheme: light only;
@@ -28,57 +29,58 @@ enum PaperHTMLBuilder {
               --canvas: #eef2f6;
               --ink: #16181d;
               --muted: #4d5562;
-              --rule: #c8ced8;
-              --accent: #1f4f8c;
-              --accent-soft: #e8f0fb;
+              --rule: #c6ccd6;
+              --accent: #163d73;
+              --accent-soft: #eff4fb;
+              --table-rule: #667085;
             }
             body {
               margin: 0;
               padding: 24px 14px 48px;
               background: var(--canvas);
               color: var(--ink);
-              font-family: "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+              font-family: "Baskerville", "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
             }
             article {
               box-sizing: border-box;
               width: min(100%, 820px);
               min-height: calc(100vh - 72px);
               margin: 0 auto;
-              padding: 62px 68px 72px;
+              padding: 56px 64px 66px;
               background: var(--page);
               border: 1px solid rgba(17, 24, 39, 0.08);
               box-shadow: 0 28px 80px rgba(16, 24, 40, 0.14);
             }
             h1, h2, h3 {
-              font-family: "Times New Roman", "Iowan Old Style", Georgia, serif;
+              font-family: "Times New Roman", "Baskerville", Georgia, serif;
               font-weight: 700;
               color: var(--ink);
               line-height: 1.15;
             }
             h1 {
-              margin: 0 0 24px;
+              margin: 0 0 20px;
               text-align: center;
-              font-size: 2rem;
-              letter-spacing: -0.02em;
+              font-size: 1.86rem;
+              letter-spacing: -0.025em;
             }
             h2 {
-              margin: 30px 0 12px;
+              margin: 28px 0 10px;
               padding-top: 8px;
               border-top: 1px solid var(--rule);
-              font-size: 1.05rem;
+              font-size: 0.98rem;
               letter-spacing: 0.08em;
               text-transform: uppercase;
             }
             h3 {
-              margin: 22px 0 10px;
-              font-size: 1rem;
+              margin: 20px 0 8px;
+              font-size: 0.98rem;
             }
             p, li {
               color: var(--ink);
-              font-size: 1rem;
-              line-height: 1.62;
+              font-size: 0.98rem;
+              line-height: 1.5;
             }
-            p { margin: 0 0 1em; }
+            p { margin: 0 0 0.9em; }
             ul, ol { margin: 0.35em 0 1em 1.35em; padding: 0; }
             li { margin: 0.2em 0; }
             code, pre {
@@ -110,8 +112,8 @@ enum PaperHTMLBuilder {
             }
             a:hover { text-decoration: underline; }
             .abstract {
-              margin: 0 auto 28px;
-              padding: 16px 20px 18px;
+              margin: 0 auto 24px;
+              padding: 14px 18px 16px;
               background: var(--accent-soft);
               border: 1px solid rgba(31, 79, 140, 0.14);
             }
@@ -168,21 +170,23 @@ enum PaperHTMLBuilder {
               width: 100%;
               margin: 1.4em 0;
               border-collapse: collapse;
-              font-size: 0.96rem;
+              border-top: 1.8px solid var(--table-rule);
+              border-bottom: 1.8px solid var(--table-rule);
+              font-size: 0.93rem;
             }
             table.paper-table th,
             table.paper-table td {
-              padding: 8px 10px;
-              border: 1px solid #d5dbe3;
+              padding: 7px 8px;
+              border: none;
               text-align: left;
               vertical-align: top;
             }
             table.paper-table thead th {
-              background: #f3f6fa;
               font-weight: 700;
+              border-bottom: 1px solid var(--table-rule);
             }
-            table.paper-table tbody tr:nth-child(even) {
-              background: #fafbfd;
+            table.paper-table tbody tr + tr td {
+              border-top: 0.6px solid rgba(102, 112, 133, 0.32);
             }
             @media print {
               body {
@@ -201,10 +205,10 @@ enum PaperHTMLBuilder {
             @media (max-width: 700px) {
               article {
                 min-height: auto;
-                padding: 28px 22px 36px;
+                padding: 26px 20px 34px;
               }
               h1 {
-                font-size: 1.55rem;
+                font-size: 1.46rem;
               }
             }
           </style>
@@ -269,6 +273,7 @@ enum PaperContentNormalizer {
                 .replacingOccurrences(of: "\\n", with: "\n")
                 .replacingOccurrences(of: "\\t", with: "\t")
                 .replacingOccurrences(of: "\\\"", with: "\"")
+                .replacingOccurrences(of: "\\/", with: "/")
         }
 
         value = replacing(
@@ -455,7 +460,7 @@ private enum MarkdownHTMLRenderer {
 
         func flushMathBlock() {
             guard !mathLines.isEmpty else { return }
-            html.append(#"<div class="equation">\#(escape(mathLines.joined(separator: "\n")))</div>"#)
+            html.append(#"<div class="equation">\#(escape(MathTextFormatter.displayText(for: mathLines.joined(separator: " "))))</div>"#)
             mathLines.removeAll()
         }
 
@@ -627,5 +632,51 @@ private enum MarkdownHTMLRenderer {
             .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
             .split(separator: "|", omittingEmptySubsequences: false)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+}
+
+private enum MathTextFormatter {
+    static func displayText(for latex: String) -> String {
+        var value = latex
+            .replacingOccurrences(of: "\n", with: " ")
+            .replacingOccurrences(of: "\\left", with: "")
+            .replacingOccurrences(of: "\\right", with: "")
+            .replacingOccurrences(of: "\\cdot", with: " * ")
+            .replacingOccurrences(of: "\\times", with: " x ")
+            .replacingOccurrences(of: "\\log", with: "log")
+            .replacingOccurrences(of: "\\,", with: " ")
+
+        value = replacing(pattern: #"\\text\{([^}]*)\}"#, in: value, template: "$1")
+        value = replacing(pattern: #"\\mathrm\{([^}]*)\}"#, in: value, template: "$1")
+
+        while value.contains("\\frac") {
+            let updated = replacing(pattern: #"\\frac\{([^{}]+)\}\{([^{}]+)\}"#, in: value, template: "($1) / ($2)")
+            if updated == value {
+                break
+            }
+            value = updated
+        }
+
+        value = replacing(pattern: #"\\([A-Za-z]+)_\{?([A-Za-z0-9]+)\}?"#, in: value, template: "$1_$2")
+        value = replacing(pattern: #"\\([A-Za-z]+)"#, in: value, template: "$1")
+        value = value
+            .replacingOccurrences(of: "{", with: "")
+            .replacingOccurrences(of: "}", with: "")
+            .replacingOccurrences(of: "^", with: "")
+
+        while value.contains("  ") {
+            value = value.replacingOccurrences(of: "  ", with: " ")
+        }
+
+        return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func replacing(pattern: String, in text: String, template: String) -> String {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            return text
+        }
+
+        let range = NSRange(text.startIndex ..< text.endIndex, in: text)
+        return regex.stringByReplacingMatches(in: text, range: range, withTemplate: template)
     }
 }

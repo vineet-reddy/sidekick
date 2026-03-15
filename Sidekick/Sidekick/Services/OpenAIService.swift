@@ -299,32 +299,41 @@ final class OpenAIService: ObservableObject {
         )
     }
 
-    func checkTask(_ taskID: String) async throws -> PaperArtifacts? {
+    func checkTask(_ taskID: String) async throws -> PaperTaskCheckResult {
         log("checkTask polling. task_id=\(taskID)")
         let task = try await fetchTask(taskID: taskID)
-        log("checkTask status=\(task.normalizedStatus) output_chars=\(task.outputText.count)")
+        let snapshot = task.progressSnapshot(taskID: taskID)
+        let latestEventText = snapshot.latestEventText ?? "<none>"
+        let latestEventAge = snapshot.latestEventAt.map { Int(Date().timeIntervalSince($0)) } ?? -1
+        log(
+            "checkTask status=\(task.normalizedStatus) output_chars=\(task.outputText.count) " +
+            "latest_event_age_s=\(latestEventAge) latest_event=\"\(latestEventText)\""
+        )
         persistDebugPayload(Data(task.outputText.utf8), named: "task-output-\(taskID).txt")
 
         switch task.normalizedStatus {
         case "queued", "in_progress", "incomplete":
-            return nil
+            return .waiting(snapshot)
         case "completed":
             break
         case "failed", "cancelled":
-            throw ServiceError.taskFailed(task.errorMessage ?? "The paper task failed.")
+            return .failed(snapshot, task.errorMessage ?? "The paper task failed.")
         default:
-            return nil
+            return .waiting(snapshot)
         }
 
         guard let data = normalizedJSONData(from: task.outputText) else {
             let payload = try decodePaperResponse(from: task.outputText)
             let markdown = normalizedPaperMarkdown(payload.markdown)
             let figures = recoveredFigureData(from: task, payloadFigures: payload.figures, markdown: markdown)
-            return PaperArtifacts(
-                title: payload.title,
-                markdown: markdown,
-                figures: figures,
-                provenance: payload.provenance
+            return .completed(
+                snapshot,
+                PaperArtifacts(
+                    title: payload.title,
+                    markdown: markdown,
+                    figures: figures,
+                    provenance: payload.provenance
+                )
             )
         }
 
@@ -338,11 +347,14 @@ final class OpenAIService: ObservableObject {
         let markdown = normalizedPaperMarkdown(payload.markdown)
         let figures = recoveredFigureData(from: task, payloadFigures: payload.figures, markdown: markdown)
 
-        return PaperArtifacts(
-            title: payload.title,
-            markdown: markdown,
-            figures: figures,
-            provenance: payload.provenance
+        return .completed(
+            snapshot,
+            PaperArtifacts(
+                title: payload.title,
+                markdown: markdown,
+                figures: figures,
+                provenance: payload.provenance
+            )
         )
     }
 
@@ -1419,6 +1431,23 @@ private struct CloudTaskDetails: Decodable {
             ?? task?.lastErrorMessage
     }
 
+    func progressSnapshot(taskID: String) -> PaperTaskProgressSnapshot {
+        let assistantTurn = currentAssistantTurn ?? currentDiffTaskTurn
+
+        return PaperTaskProgressSnapshot(
+            taskID: taskID,
+            status: normalizedStatus,
+            observedAt: .now,
+            taskCreatedAt: task?.createdAtDate,
+            assistantTurnCreatedAt: assistantTurn?.createdAtDate,
+            latestEventAt: assistantTurn?.latestEventCreatedAt,
+            latestEventText: assistantTurn?.latestEvent?.text,
+            outputCharacterCount: outputText.count,
+            environmentID: assistantTurn?.environmentID,
+            environmentLabel: assistantTurn?.environment?.label
+        )
+    }
+
     private func prioritizedMessageText(from turn: CloudTaskTurn?) -> String? {
         let text = turn?.messageTexts.joined(separator: "\n\n")
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -1437,18 +1466,24 @@ private struct CloudTaskDetails: Decodable {
 private struct CloudTaskMetadata: Decodable {
     let id: String?
     let title: String?
+    let createdAt: Double?
     let taskStatusDisplay: CloudTaskStatusDisplay?
     let error: CloudTaskTurnError?
 
     enum CodingKeys: String, CodingKey {
         case id
         case title
+        case createdAt = "created_at"
         case taskStatusDisplay = "task_status_display"
         case error
     }
 
     var lastErrorMessage: String? {
         error?.summary
+    }
+
+    var createdAtDate: Date? {
+        createdAt.map(Date.init(timeIntervalSince1970:))
     }
 }
 
@@ -1476,8 +1511,12 @@ private struct CloudTaskTurn: Decodable {
     let turnStatus: String?
     let siblingTurnIDs: [String]?
     let outputItems: [CloudTaskOutputItem]?
+    let latestEvent: CloudTaskLatestEvent?
     let worklog: CloudTaskWorklog?
     let error: CloudTaskTurnError?
+    let createdAt: Double?
+    let environmentID: String?
+    let environment: CloudTaskExecutionEnvironment?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -1485,8 +1524,20 @@ private struct CloudTaskTurn: Decodable {
         case turnStatus = "turn_status"
         case siblingTurnIDs = "sibling_turn_ids"
         case outputItems = "output_items"
+        case latestEvent = "latest_event"
         case worklog
         case error
+        case createdAt = "created_at"
+        case environmentID = "environment_id"
+        case environment
+    }
+
+    var createdAtDate: Date? {
+        createdAt.map(Date.init(timeIntervalSince1970:))
+    }
+
+    var latestEventCreatedAt: Date? {
+        latestEvent?.created.map(Date.init(timeIntervalSince1970:))
     }
 
     var messageTexts: [String] {
@@ -1504,6 +1555,22 @@ private struct CloudTaskTurn: Decodable {
         (outputItems ?? []).compactMap(\.diffText)
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
     }
+}
+
+private struct CloudTaskLatestEvent: Decodable {
+    let created: Double?
+    let text: String?
+    let eventType: String?
+
+    enum CodingKeys: String, CodingKey {
+        case created
+        case text
+        case eventType = "event_type"
+    }
+}
+
+private struct CloudTaskExecutionEnvironment: Decodable {
+    let label: String?
 }
 
 private struct CloudTaskOutputItem: Decodable {

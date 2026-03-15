@@ -1,6 +1,23 @@
 import SwiftData
 import SwiftUI
 
+private enum AppTab: Hashable {
+    case notes
+    case papers
+    case settings
+}
+
+enum QAFlags {
+    static var shouldOpenLatestPaper: Bool {
+        let arguments = ProcessInfo.processInfo.arguments
+        if arguments.contains("--qa-open-latest-paper") {
+            return true
+        }
+
+        return ProcessInfo.processInfo.environment["SIDEKICK_QA_OPEN_LATEST_PAPER"] == "1"
+    }
+}
+
 struct AppShellView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
@@ -15,9 +32,14 @@ struct AppShellView: View {
                     await notifications.requestAuthorization()
                 }
                 heartbeat.scheduleBackgroundRefresh()
+                Task {
+                    await preloadRecentReadyPapers(modelContext: modelContext)
+                }
                 await heartbeat.runIfNeeded(modelContext: modelContext)
                 BackgroundHeartbeatScheduler.shared.runner = {
+                    await preloadRecentReadyPapers(modelContext: modelContext)
                     await heartbeat.run(modelContext: modelContext, force: true)
+                    await preloadRecentReadyPapers(modelContext: modelContext)
                 }
             }
             .onChange(of: scenePhase) { _, newPhase in
@@ -29,6 +51,24 @@ struct AppShellView: View {
                     await heartbeat.runIfNeeded(modelContext: modelContext)
                 }
             }
+    }
+
+    private func preloadRecentReadyPapers(modelContext: ModelContext) async {
+        do {
+            let papers = try modelContext.fetch(
+                FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.updatedAt, order: .reverse)])
+            )
+                .filter { $0.status == .ready }
+
+            print("[PaperDocs] preloadRecentReadyPapers count=\(papers.count)")
+
+            for paper in papers.prefix(3) {
+                print("[PaperDocs] precomputing task=\(paper.codexTaskID) title=\"\(paper.title)\"")
+                await PaperDocumentService.precomputeIfNeeded(for: paper)
+            }
+        } catch {
+            print("[PaperDocs] preload failed: \(error.localizedDescription)")
+        }
     }
 }
 
@@ -123,22 +163,23 @@ struct OnboardingView: View {
 struct ContentView: View {
     @EnvironmentObject private var auth: AuthService
     @EnvironmentObject private var heartbeat: HeartbeatManager
+    @State private var selectedTab: AppTab = QAFlags.shouldOpenLatestPaper ? .papers : .notes
 
     var body: some View {
         if auth.isAuthenticated {
-            TabView {
+            TabView(selection: $selectedTab) {
                 NavigationStack {
                     NoteListView()
                 }
+                .tag(AppTab.notes)
                 .tabItem {
                     Label("Notes", systemImage: "square.and.pencil")
                         .accessibilityIdentifier("tab.notes")
                 }
                 .accessibilityIdentifier("tab.notes")
 
-                NavigationStack {
-                    PaperListView()
-                }
+                PaperListView()
+                .tag(AppTab.papers)
                 .tabItem {
                     Label("Papers", systemImage: "doc.text.magnifyingglass")
                         .accessibilityIdentifier("tab.papers")
@@ -148,6 +189,7 @@ struct ContentView: View {
                 NavigationStack {
                     SettingsView()
                 }
+                .tag(AppTab.settings)
                 .tabItem {
                     Label("Settings", systemImage: "gearshape")
                         .accessibilityIdentifier("tab.settings")

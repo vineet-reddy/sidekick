@@ -4,6 +4,10 @@ import UIKit
 enum LocalPaperGenerationService {
     private static let supportedBRFSSDatasetID = "brfss-2015-github-mirror"
 
+    static func supports(datasetIDs: [String]) -> Bool {
+        datasetIDs.contains(supportedBRFSSDatasetID)
+    }
+
     static func generateIfSupported(
         title: String,
         theme: String,
@@ -409,18 +413,15 @@ private enum BRFSS2015PaperBuilder {
     private static func markdown(
         title: String,
         theme: String,
-        noteTexts: [String],
+        noteTexts _: [String],
         dataset: TrustedDataset,
         summary: BRFSSSummary,
         regression: BRFSSRegressionResult
     ) -> String {
-        let noteContext = noteTexts
-            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
-            .filter { !$0.isEmpty }
-            .first ?? theme
+        let thematicFocus = theme.trimmingCharacters(in: .whitespacesAndNewlines)
 
         let abstract = """
-        We analyzed \(formattedInteger(summary.totalRespondents)) respondents from the BRFSS 2015 diabetes health indicators dataset to quantify how hypertension, body mass index (BMI), physical activity, and self-rated general health were associated with diagnosed diabetes. Diagnosed diabetes was present in \(formattedPercent(summary.diagnosedDiabetesPrevalence)) of respondents, while \(formattedPercent(summary.prediabetesPrevalence)) were labeled as prediabetes. In an unweighted logistic regression that excluded prediabetes and compared diagnosed diabetes against no diabetes (\(formattedInteger(regression.sampleSize)) analytic observations), hypertension was associated with substantially higher adjusted odds of diabetes (OR \(formattedDecimal(regression.coefficients[0].oddsRatio)), 95% CI \(formattedDecimal(regression.coefficients[0].lowerConfidenceInterval))-\(formattedDecimal(regression.coefficients[0].upperConfidenceInterval))). Higher BMI and worse self-rated general health were also positively associated with diabetes, whereas reporting any physical activity was associated with lower odds. These findings support the app's note-to-paper loop with a real empirical analysis, real figures, and quantitatively interpretable effect estimates rather than a planning memo.
+        We analyzed \(formattedInteger(summary.totalRespondents)) respondents in the BRFSS 2015 diabetes health indicators mirror to quantify how hypertension, body mass index (BMI), physical activity, and self-rated general health were associated with diagnosed diabetes. Diagnosed diabetes was present in \(formattedPercent(summary.diagnosedDiabetesPrevalence)) of respondents and prediabetes in \(formattedPercent(summary.prediabetesPrevalence)). In an unweighted logistic regression restricted to diagnosed diabetes versus no diabetes (\(formattedInteger(regression.sampleSize)) observations; \(formattedInteger(regression.eventCount)) events), hypertension was associated with markedly higher odds of diabetes (OR \(formattedDecimal(regression.coefficients[0].oddsRatio)), 95% CI \(formattedDecimal(regression.coefficients[0].lowerConfidenceInterval))-\(formattedDecimal(regression.coefficients[0].upperConfidenceInterval))). Worse self-rated health and higher BMI were also associated with higher odds, whereas any physical activity was associated with lower odds. The joint pattern is consistent with a coherent cardiometabolic risk gradient in this public cross-sectional sample.
         """
 
         return """
@@ -430,23 +431,15 @@ private enum BRFSS2015PaperBuilder {
         \(abstract)
 
         ## Introduction
-        Diabetes risk in BRFSS-style surveillance data is strongly patterned by cardiovascular comorbidity, adiposity, and functional health status. The motivating note for this paper was: "\(escapedInlineQuote(noteContext))" To make that idea concrete, this paper uses a public BRFSS 2015 health-indicators mirror to estimate descriptive prevalence patterns and an adjusted logistic regression for diagnosed diabetes.
+        Diabetes burden in population surveillance data is strongly patterned by adiposity, vascular comorbidity, and functional health status. This paper uses a public BRFSS 2015 mirror to test whether a compact set of routinely collected predictors recovers those gradients in a large cross-sectional sample. The originating note cluster focused on \(thematicFocus.isEmpty ? "diabetes risk in public-health surveillance data" : thematicFocus.lowercased()); the present analysis addresses that question directly with a fully computed local empirical pipeline.
 
-        ## Data
-        The analysis uses the curated trusted dataset card **[\(dataset.id)] \(dataset.title)**, downloaded from \(dataset.handle). The file contains \(formattedInteger(summary.totalRespondents)) respondent records and 22 derived health indicators. `Diabetes_012` was treated as a three-level outcome in the source file (0 = no diabetes, 1 = prediabetes, 2 = diagnosed diabetes). Descriptive prevalence summaries retain all respondents, while the regression analysis excludes prediabetes to fit a clean binary comparison between diagnosed diabetes and no diabetes.
+        ## Data and Methods
+        The analysis uses the curated trusted dataset card [\(dataset.id)] \(dataset.title). The mirror contains \(formattedInteger(summary.totalRespondents)) respondent records and 22 derived indicators. Diabetes_012 was treated as a three-level outcome in the source file (0 = no diabetes, 1 = prediabetes, 2 = diagnosed diabetes). Descriptive summaries retain all respondents, whereas the regression excludes prediabetes to fit a binary contrast between diagnosed diabetes and no diabetes.
 
-        ## Methods
-        We estimated a logistic regression with diagnosed diabetes as the binary outcome and four pre-specified predictors: hypertension, BMI, any physical activity, and self-rated general health. The fitted model was:
-
-        \\[
-        \\log\\left(\\frac{P(\\text{diabetes}_i = 1)}{1 - P(\\text{diabetes}_i = 1)}\\right) =
-        \\beta_0 + \\beta_1 \\text{HighBP}_i + \\beta_2 \\text{BMI}_i + \\beta_3 \\text{PhysActivity}_i + \\beta_4 \\text{GenHlth}_i
-        \\]
-
-        Odds ratios and Wald 95% confidence intervals were computed from the observed information matrix. Because the public mirror omits BRFSS survey weights and design variables, all estimates here should be interpreted as unweighted associations from the released mirror rather than design-corrected national estimates.
+        We estimated a logistic regression with diagnosed diabetes as the outcome and four pre-specified predictors: hypertension, BMI, any physical activity, and self-rated general health. Model specification: logit P(diabetes = 1) = intercept + beta1*HighBP + beta2*BMI + beta3*PhysActivity + beta4*GenHlth. Odds ratios and Wald 95% confidence intervals were computed from the observed information matrix. Because the public mirror omits BRFSS survey weights and design variables, all estimates here should be interpreted as unweighted associations rather than design-corrected national estimates.
 
         ## Results
-        Diagnosed diabetes prevalence in the full dataset was \(formattedPercent(summary.diagnosedDiabetesPrevalence)) (\(formattedInteger(summary.diagnosedDiabetes)) of \(formattedInteger(summary.totalRespondents))). Prevalence increased monotonically across BMI categories, from \(formattedPercent(summary.bmiCategories[0].prevalence)) among respondents with BMI below 25 to \(formattedPercent(summary.bmiCategories[3].prevalence)) among respondents with BMI of 35 or higher. Hypertension and lower physical activity were also associated with materially higher crude diabetes prevalence.
+        Diagnosed diabetes prevalence in the full dataset was \(formattedPercent(summary.diagnosedDiabetesPrevalence)) (\(formattedInteger(summary.diagnosedDiabetes)) of \(formattedInteger(summary.totalRespondents))). Prevalence increased monotonically across BMI categories, from \(formattedPercent(summary.bmiCategories[0].prevalence)) among respondents with BMI below 25 to \(formattedPercent(summary.bmiCategories[3].prevalence)) among respondents with BMI of 35 or higher. Crude prevalence was also much higher among respondents with hypertension and among those reporting no physical activity.
 
         | BMI category | N | Diagnosed diabetes prevalence |
         | --- | --- | --- |
@@ -464,9 +457,9 @@ private enum BRFSS2015PaperBuilder {
 
         ![Diagnosed diabetes prevalence by BMI category](figure_1.png)
 
-        **Figure 1.** Diagnosed diabetes prevalence rose sharply across BMI strata in the BRFSS 2015 mirror, with the highest burden observed among respondents with BMI of 35 or higher.
+        Figure 1. Diagnosed diabetes prevalence rose sharply across BMI strata in the BRFSS 2015 mirror, with the highest burden observed among respondents with BMI of 35 or higher.
 
-        The adjusted regression retained the same rank ordering of association strength. Hypertension had the largest adjusted association with diabetes, followed by worse self-rated general health. Higher BMI remained independently associated with higher odds of diabetes, while any physical activity was associated with lower adjusted odds. The model pseudo-R^2 was \(formattedDecimal(regression.pseudoR2)) and the Akaike information criterion was \(formattedDecimal(regression.aic)).
+        The adjusted regression retained the same ordering of association strength. Hypertension had the largest adjusted association with diabetes, followed by worse self-rated general health. Higher BMI remained independently associated with higher odds of diabetes, whereas any physical activity was associated with lower adjusted odds. Model fit statistics were pseudo-R^2 = \(formattedDecimal(regression.pseudoR2)) and AIC = \(formattedDecimal(regression.aic)).
 
         | Predictor | Adjusted OR | 95% CI |
         | --- | --- | --- |
@@ -477,13 +470,13 @@ private enum BRFSS2015PaperBuilder {
 
         ![Adjusted odds ratios from multivariable logistic regression](figure_2.png)
 
-        **Figure 2.** Forest plot of adjusted odds ratios and 95% confidence intervals for the four pre-specified predictors in the BRFSS 2015 regression model.
+        Figure 2. Forest plot of adjusted odds ratios and 95% confidence intervals for the four pre-specified predictors in the BRFSS 2015 regression model.
 
         ## Discussion
-        This analysis converts the original note into a real empirical paper with concrete estimates. Within the limitations of the public mirror, hypertension, higher BMI, and worse general health were all strongly associated with diagnosed diabetes, while self-reported physical activity was protective on average. The effect size for hypertension was especially large, with adjusted odds above 3, which is consistent with the broader cardiometabolic literature.
+        The main empirical result is a tight, internally consistent cardiometabolic risk profile: higher BMI, hypertension, and worse self-rated health all tracked substantially higher diabetes odds, while physical activity tracked lower odds. Hypertension remained the dominant adjusted predictor, and the monotonic BMI gradient suggests that the model is recovering a stable population pattern rather than a single noisy contrast. These associations are directionally consistent with the broader epidemiologic literature on diabetes risk.
 
         ## Limitations
-        The public mirror does not expose BRFSS survey weights, state identifiers, or replicate-weight design variables, so the results should not be interpreted as design-corrected state or national prevalence estimates. The model is observational and cross-sectional, so it quantifies association rather than causation. Finally, the predictor set was intentionally narrow to align with the original note and to keep the first automated paper interpretable.
+        The public mirror does not expose BRFSS survey weights, state identifiers, or replicate-weight design variables, so the results should not be interpreted as design-corrected state or national prevalence estimates. The model is observational and cross-sectional, so it quantifies association rather than causation. The predictor set was intentionally narrow to preserve interpretability and align with the original automation target of a short, high-density paper.
 
         ## References
         1. Centers for Disease Control and Prevention. Behavioral Risk Factor Surveillance System. 2015 survey year.
@@ -503,10 +496,6 @@ private enum BRFSS2015PaperBuilder {
 
     private static func formattedDecimal(_ value: Double) -> String {
         String(format: "%.2f", value)
-    }
-
-    private static func escapedInlineQuote(_ value: String) -> String {
-        value.replacingOccurrences(of: "\"", with: "'")
     }
 
     private static func sigmoid(_ value: Double) -> Double {

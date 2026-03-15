@@ -1,12 +1,22 @@
 import Foundation
 import UIKit
-import WebKit
 
 enum ExportService {
-    static func exportLaTeX(for paper: Paper) throws -> URL {
+    static func exportLaTeX(for paper: Paper) async throws -> URL {
+        try await PaperDocumentService.ensureLaTeX(for: paper)
+    }
+
+    static func exportPDF(for paper: Paper) async throws -> URL {
+        try await PaperDocumentService.ensurePDF(for: paper)
+    }
+
+    static func latexDocument(for paper: Paper) -> String {
         let title = paper.title.replacingOccurrences(of: "\\", with: "\\\\")
-        let body = LatexRenderer.render(markdown: PaperContentNormalizer.normalize(markdown: paper.markdown))
-        let document = """
+        let normalizedMarkdown = PaperContentNormalizer.normalize(markdown: paper.markdown)
+        let body = LatexRenderer.render(
+            markdown: LatexRenderer.strippingLeadingTitle(from: normalizedMarkdown, title: paper.title)
+        )
+        return """
         \\documentclass[11pt]{article}
         \\usepackage[margin=1in]{geometry}
         \\usepackage[utf8]{inputenc}
@@ -23,46 +33,30 @@ enum ExportService {
         \(body)
         \\end{document}
         """
-
-        let url = temporaryURL(for: paper, pathExtension: "tex")
-        try document.write(to: url, atomically: true, encoding: .utf8)
-        return url
-    }
-
-    static func exportPDF(for paper: Paper, webView: WKWebView) async throws -> URL {
-        let configuration = WKPDFConfiguration()
-        let data = try await webView.pdf(configuration: configuration)
-        let url = temporaryURL(for: paper, pathExtension: "pdf")
-        try data.write(to: url, options: .atomic)
-        return url
-    }
-
-    private static func temporaryURL(for paper: Paper, pathExtension: String) -> URL {
-        let name = paper.title
-            .lowercased()
-            .replacingOccurrences(of: " ", with: "-")
-            .components(separatedBy: CharacterSet.alphanumerics.inverted)
-            .joined()
-        return FileManager.default.temporaryDirectory.appendingPathComponent("\(name).\(pathExtension)")
-    }
-}
-
-private extension WKWebView {
-    func pdf(configuration: WKPDFConfiguration) async throws -> Data {
-        try await withCheckedThrowingContinuation { continuation in
-            createPDF(configuration: configuration) { result in
-                continuation.resume(with: result)
-            }
-        }
     }
 }
 
 private enum LatexRenderer {
-    static func render(markdown: String) -> String {
+    nonisolated static func strippingLeadingTitle(from markdown: String, title: String) -> String {
+        let lines = markdown.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard let firstLine = lines.first else {
+            return markdown
+        }
+
+        let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if firstLine.trimmingCharacters(in: .whitespacesAndNewlines) == "# \(trimmedTitle)" {
+            return lines.dropFirst().joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        return markdown
+    }
+
+    nonisolated static func render(markdown: String) -> String {
         let lines = markdown.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
         var rendered: [String] = []
         var isMathBlock = false
         var mathLines: [String] = []
+        var tableLines: [String] = []
 
         func flushMathBlock() {
             guard !mathLines.isEmpty else { return }
@@ -72,10 +66,44 @@ private enum LatexRenderer {
             mathLines.removeAll()
         }
 
+        func flushTable() {
+            guard !tableLines.isEmpty else {
+                return
+            }
+
+            let rows = tableLines.map(parseTableRow)
+            guard let header = rows.first, !header.isEmpty else {
+                tableLines.removeAll()
+                return
+            }
+
+            let bodyRows = rows.dropFirst().filter { !$0.isEmpty && !isTableSeparatorRow($0) }
+            let columnSpec = Array(repeating: "l", count: header.count).joined()
+
+            rendered.append("\\begin{table}[h]")
+            rendered.append("\\centering")
+            rendered.append("\\begin{tabular}{\(columnSpec)}")
+            rendered.append("\\toprule")
+            rendered.append(header.map(escape).joined(separator: " & ") + " \\\\")
+
+            if !bodyRows.isEmpty {
+                rendered.append("\\midrule")
+                for row in bodyRows {
+                    rendered.append(row.map(escape).joined(separator: " & ") + " \\\\")
+                }
+            }
+
+            rendered.append("\\bottomrule")
+            rendered.append("\\end{tabular}")
+            rendered.append("\\end{table}")
+            tableLines.removeAll()
+        }
+
         for line in lines {
             let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
 
             if trimmed == "\\[" {
+                flushTable()
                 isMathBlock = true
                 continue
             }
@@ -90,15 +118,25 @@ private enum LatexRenderer {
                 continue
             }
 
+            if isTableRow(trimmed) {
+                tableLines.append(trimmed)
+                continue
+            }
+
+            flushTable()
+
             rendered.append(render(line: line))
         }
 
+        flushTable()
         flushMathBlock()
         return rendered.joined(separator: "\n")
     }
 
-    private static func render(line: String) -> String {
+    nonisolated private static func render(line: String) -> String {
         let text = line
+            .replacingOccurrences(of: "**", with: "")
+            .replacingOccurrences(of: "`", with: "")
 
         if text.hasPrefix("# ") {
             return "\\section*{\(escape(text.dropFirst(2)))}"
@@ -135,7 +173,7 @@ private enum LatexRenderer {
         return escape(text)
     }
 
-    private static func escape<S: StringProtocol>(_ text: S) -> String {
+    nonisolated private static func escape<S: StringProtocol>(_ text: S) -> String {
         let placeholder = "\u{0000}BACKSLASH\u{0000}"
         return String(text)
             .replacingOccurrences(of: "\\", with: placeholder)
@@ -146,6 +184,28 @@ private enum LatexRenderer {
             .replacingOccurrences(of: "$", with: "\\$")
             .replacingOccurrences(of: "#", with: "\\#")
             .replacingOccurrences(of: "_", with: "\\_")
+            .replacingOccurrences(of: "^", with: "\\textasciicircum{}")
+            .replacingOccurrences(of: "~", with: "\\textasciitilde{}")
             .replacingOccurrences(of: placeholder, with: "\\textbackslash{}")
+    }
+
+    nonisolated private static func isTableRow(_ line: String) -> Bool {
+        line.hasPrefix("|") && line.hasSuffix("|") && line.contains("|")
+    }
+
+    nonisolated private static func isTableSeparatorRow(_ columns: [String]) -> Bool {
+        let stripped = columns
+            .joined()
+            .replacingOccurrences(of: ":", with: "")
+            .replacingOccurrences(of: "-", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return stripped.isEmpty
+    }
+
+    nonisolated private static func parseTableRow(_ line: String) -> [String] {
+        line
+            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+            .split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
     }
 }

@@ -4,18 +4,29 @@ enum PaperArtifactStore {
     struct PendingSubmissionSnapshot {
         let taskID: String
         let title: String
+        let theme: String
         let registryVersion: Int
         let selectedDatasetIDs: [String]
         let allowedDomains: [String]
+        let attemptCount: Int
         let createdAt: Date
+    }
+
+    struct RenderedPaperBundle {
+        let directoryURL: URL
+        let htmlURL: URL
+        let pdfURL: URL
+        let latexURL: URL?
     }
 
     private struct PendingSubmission: Codable {
         let taskID: String
         let title: String
+        let theme: String
         let registryVersion: Int
         let selectedDatasetIDs: [String]
         let allowedDomains: [String]
+        let attemptCount: Int
         let createdAt: Date
     }
 
@@ -34,13 +45,27 @@ enum PaperArtifactStore {
         let completedAt: Date
     }
 
-    static func persistPendingSubmission(_ submission: PaperTaskSubmission, title: String) throws {
+    private struct RenderedPaperManifest: Codable {
+        let title: String
+        let fingerprint: String
+        let renderedAt: Date
+        let figureCount: Int
+    }
+
+    static func persistPendingSubmission(
+        _ submission: PaperTaskSubmission,
+        title: String,
+        theme: String,
+        attemptCount: Int = 1
+    ) throws {
         let pending = PendingSubmission(
             taskID: submission.taskID,
             title: title,
+            theme: theme,
             registryVersion: submission.registryVersion,
             selectedDatasetIDs: submission.selectedDatasetIDs,
             allowedDomains: submission.allowedDomains,
+            attemptCount: attemptCount,
             createdAt: .now
         )
 
@@ -84,10 +109,86 @@ enum PaperArtifactStore {
         return PendingSubmissionSnapshot(
             taskID: pending.taskID,
             title: pending.title,
+            theme: pending.theme,
             registryVersion: pending.registryVersion,
             selectedDatasetIDs: pending.selectedDatasetIDs,
             allowedDomains: pending.allowedDomains,
+            attemptCount: pending.attemptCount,
             createdAt: pending.createdAt
+        )
+    }
+
+    static func recordTaskProgress(_ snapshot: PaperTaskProgressSnapshot) throws {
+        try write(snapshot, to: statusURL(for: snapshot.taskID))
+    }
+
+    static func taskProgress(for taskID: String) -> PaperTaskProgressSnapshot? {
+        load(PaperTaskProgressSnapshot.self, from: statusURL(for: taskID))
+    }
+
+    static func renderedBundle(for taskID: String, fingerprint: String) -> RenderedPaperBundle? {
+        let manifestURL = renderManifestURL(for: taskID)
+        guard let manifest = load(RenderedPaperManifest.self, from: manifestURL),
+              manifest.fingerprint == fingerprint else {
+            return nil
+        }
+
+        let directory = directoryURL(for: taskID)
+        let htmlURL = directory.appendingPathComponent("paper.html")
+        let pdfURL = directory.appendingPathComponent("paper.pdf")
+        let latexURL = directory.appendingPathComponent("paper.tex")
+
+        guard FileManager.default.fileExists(atPath: htmlURL.path),
+              FileManager.default.fileExists(atPath: pdfURL.path) else {
+            return nil
+        }
+
+        return RenderedPaperBundle(
+            directoryURL: directory,
+            htmlURL: htmlURL,
+            pdfURL: pdfURL,
+            latexURL: FileManager.default.fileExists(atPath: latexURL.path) ? latexURL : nil
+        )
+    }
+
+    static func persistRenderedBundle(
+        taskID: String,
+        title: String,
+        fingerprint: String,
+        html: String,
+        latex: String,
+        figures: [Data],
+        pdfData: Data
+    ) throws -> RenderedPaperBundle {
+        let directory = directoryURL(for: taskID)
+        let htmlURL = directory.appendingPathComponent("paper.html")
+        let pdfURL = directory.appendingPathComponent("paper.pdf")
+        let latexURL = directory.appendingPathComponent("paper.tex")
+
+        try removeExistingFigureFiles(in: directory)
+
+        try html.write(to: htmlURL, atomically: true, encoding: .utf8)
+        try latex.write(to: latexURL, atomically: true, encoding: .utf8)
+        try pdfData.write(to: pdfURL, options: .atomic)
+
+        for (index, figureData) in figures.enumerated() {
+            let figureURL = directory.appendingPathComponent("figure_\(index + 1).png")
+            try figureData.write(to: figureURL, options: .atomic)
+        }
+
+        let manifest = RenderedPaperManifest(
+            title: title,
+            fingerprint: fingerprint,
+            renderedAt: .now,
+            figureCount: figures.count
+        )
+        try write(manifest, to: renderManifestURL(for: taskID))
+
+        return RenderedPaperBundle(
+            directoryURL: directory,
+            htmlURL: htmlURL,
+            pdfURL: pdfURL,
+            latexURL: latexURL
         )
     }
 
@@ -99,15 +200,29 @@ enum PaperArtifactStore {
         directoryURL(for: taskID).appendingPathComponent("provenance.json")
     }
 
+    private static func statusURL(for taskID: String) -> URL {
+        directoryURL(for: taskID).appendingPathComponent("status.json")
+    }
+
+    private static func renderManifestURL(for taskID: String) -> URL {
+        directoryURL(for: taskID).appendingPathComponent("rendered.json")
+    }
+
     private static func directoryURL(for taskID: String) -> URL {
         let baseURL = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask)
             .first!
             .appendingPathComponent("PaperArtifacts", isDirectory: true)
 
-        let taskURL = baseURL.appendingPathComponent(taskID, isDirectory: true)
+        let key = storageKey(for: taskID)
+        let taskURL = baseURL.appendingPathComponent(key, isDirectory: true)
         try? FileManager.default.createDirectory(at: taskURL, withIntermediateDirectories: true)
         return taskURL
+    }
+
+    private static func storageKey(for taskID: String) -> String {
+        let trimmed = taskID.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? "paper-artifact" : trimmed
     }
 
     private static func write<T: Encodable>(_ value: T, to url: URL) throws {
@@ -126,5 +241,16 @@ enum PaperArtifactStore {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         return try? decoder.decode(type, from: data)
+    }
+
+    private static func removeExistingFigureFiles(in directory: URL) throws {
+        let contents = try FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        )
+
+        for url in contents where url.lastPathComponent.hasPrefix("figure_") && url.pathExtension == "png" {
+            try? FileManager.default.removeItem(at: url)
+        }
     }
 }

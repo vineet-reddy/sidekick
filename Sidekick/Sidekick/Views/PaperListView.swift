@@ -3,38 +3,76 @@ import SwiftUI
 
 struct PaperListView: View {
     @Query(sort: \Paper.createdAt, order: .reverse) private var papers: [Paper]
+    @State private var path: [UUID] = []
+    @State private var hasAutoOpenedLatestReadyPaper = false
+
+    private let shouldAutoOpenLatestReadyPaper = QAFlags.shouldOpenLatestPaper
 
     var body: some View {
-        ZStack {
-            SidekickBackground()
+        NavigationStack(path: $path) {
+            ZStack {
+                SidekickBackground()
 
-            ScrollView {
-                if papers.isEmpty {
-                    Text("Papers will appear here as your notes develop.")
-                        .font(.subheadline)
-                        .foregroundStyle(.tertiary)
-                        .frame(maxWidth: .infinity)
-                        .padding(.top, 80)
-                } else {
-                    LazyVStack(spacing: 14) {
-                        ForEach(papers) { paper in
-                            NavigationLink {
-                                PaperDetailView(paper: paper)
-                            } label: {
-                                paperCard(for: paper)
+                ScrollView {
+                    if papers.isEmpty {
+                        Text("Papers will appear here as your notes develop.")
+                            .font(.subheadline)
+                            .foregroundStyle(.tertiary)
+                            .frame(maxWidth: .infinity)
+                            .padding(.top, 80)
+                    } else {
+                        LazyVStack(spacing: 14) {
+                            ForEach(papers) { paper in
+                                NavigationLink(value: paper.id) {
+                                    paperCard(for: paper)
+                                }
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
+                        .padding(.horizontal, 20)
+                        .padding(.top, 12)
+                        .padding(.bottom, 96)
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 12)
-                    .padding(.bottom, 96)
                 }
             }
+            .navigationTitle("Papers")
+            .navigationBarTitleDisplayMode(.inline)
+            .accessibilityIdentifier("papers.listView")
+            .navigationDestination(for: UUID.self) { paperID in
+                if let paper = papers.first(where: { $0.id == paperID }) {
+                    PaperDetailView(paper: paper)
+                } else {
+                    missingPaperView
+                }
+            }
+            .task(id: autoOpenTaskKey) {
+                autoOpenLatestReadyPaperIfNeeded()
+            }
         }
-        .navigationTitle("Papers")
-        .navigationBarTitleDisplayMode(.inline)
-        .accessibilityIdentifier("papers.listView")
+    }
+
+    private var autoOpenTaskKey: String {
+        let ids = papers.map(\.id.uuidString).joined(separator: ",")
+        return "\(shouldAutoOpenLatestReadyPaper)|\(ids)"
+    }
+
+    private var missingPaperView: some View {
+        Text("Paper not found.")
+            .font(.subheadline)
+            .foregroundStyle(.secondary)
+    }
+
+    private func autoOpenLatestReadyPaperIfNeeded() {
+        guard shouldAutoOpenLatestReadyPaper, !hasAutoOpenedLatestReadyPaper else {
+            return
+        }
+
+        guard let latestReadyPaper = papers.first(where: { $0.status == .ready }) else {
+            return
+        }
+
+        path = [latestReadyPaper.id]
+        hasAutoOpenedLatestReadyPaper = true
     }
 
     private func paperCard(for paper: Paper) -> some View {
@@ -48,7 +86,6 @@ struct PaperListView: View {
 
                 Spacer()
 
-                // Only show a pill for non-ready states
                 if paper.status == .generating {
                     StatusPill(title: "Generating...", tint: SidekickTheme.accent)
                 }

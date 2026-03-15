@@ -1,11 +1,11 @@
+import PDFKit
 import SwiftUI
-import WebKit
 
 struct PaperDetailView: View {
-    @State private var webView = WKWebView()
     @State private var shareItem: ShareItem?
     @State private var exportError: String?
     @State private var isShowingExportError = false
+    @State private var documentState: DocumentState = .loading
 
     let paper: Paper
 
@@ -16,9 +16,7 @@ struct PaperDetailView: View {
             Group {
                 switch paper.status {
                 case .ready:
-                    PaperWebView(html: PaperHTMLBuilder.html(for: paper), webView: $webView)
-                        .glassCard(padding: 0)
-                        .padding(20)
+                    readyPaperView
                 case .generating:
                     progressCard(
                         title: "Sidekick is writing",
@@ -34,14 +32,15 @@ struct PaperDetailView: View {
         }
         .navigationTitle(paper.title.isEmpty ? "Paper" : paper.title)
         .navigationBarTitleDisplayMode(.inline)
+        .task(id: paper.updatedAt) {
+            await loadDocumentIfNeeded()
+        }
         .toolbar {
-            if paper.status == .ready {
+            if case let .ready(url) = documentState {
                 ToolbarItem(placement: .topBarTrailing) {
-                    Menu("Export") {
+                    Menu("Share") {
                         Button("Share PDF") {
-                            Task {
-                                await sharePDF()
-                            }
+                            shareItem = ShareItem(url: url)
                         }
 
                         Button("Share LaTeX") {
@@ -64,6 +63,26 @@ struct PaperDetailView: View {
         })
     }
 
+    @ViewBuilder
+    private var readyPaperView: some View {
+        switch documentState {
+        case .loading:
+            progressCard(
+                title: "Preparing PDF",
+                message: "Sidekick is typesetting the final paper PDF."
+            )
+        case let .ready(url):
+            PaperPDFView(url: url)
+                .glassCard(padding: 0)
+                .padding(14)
+        case let .failed(message):
+            progressCard(
+                title: "PDF unavailable",
+                message: message
+            )
+        }
+    }
+
     private func progressCard(title: String, message: String) -> some View {
         VStack(alignment: .leading, spacing: 16) {
             Text(title)
@@ -72,7 +91,7 @@ struct PaperDetailView: View {
             Text(message)
                 .foregroundStyle(.secondary)
 
-            if paper.status == .generating {
+            if paper.status == .generating || documentState == .loading {
                 ProgressView()
                     .tint(SidekickTheme.accent)
             }
@@ -84,22 +103,29 @@ struct PaperDetailView: View {
     }
 
     private func shareLaTeX() {
-        do {
-            let url = try ExportService.exportLaTeX(for: paper)
-            shareItem = ShareItem(url: url)
-        } catch {
-            exportError = error.localizedDescription
-            isShowingExportError = true
+        Task {
+            do {
+                let url = try await ExportService.exportLaTeX(for: paper)
+                shareItem = ShareItem(url: url)
+            } catch {
+                exportError = error.localizedDescription
+                isShowingExportError = true
+            }
         }
     }
 
-    private func sharePDF() async {
+    private func loadDocumentIfNeeded() async {
+        guard paper.status == .ready else {
+            return
+        }
+
+        documentState = .loading
+
         do {
-            let url = try await ExportService.exportPDF(for: paper, webView: webView)
-            shareItem = ShareItem(url: url)
+            let url = try await ExportService.exportPDF(for: paper)
+            documentState = .ready(url)
         } catch {
-            exportError = error.localizedDescription
-            isShowingExportError = true
+            documentState = .failed(error.localizedDescription)
         }
     }
 }
@@ -109,19 +135,30 @@ private struct ShareItem: Identifiable {
     let url: URL
 }
 
-private struct PaperWebView: UIViewRepresentable {
-    let html: String
-    @Binding var webView: WKWebView
+private enum DocumentState: Equatable {
+    case loading
+    case ready(URL)
+    case failed(String)
+}
 
-    func makeUIView(context: Context) -> WKWebView {
-        webView.isOpaque = false
-        webView.backgroundColor = .clear
-        webView.scrollView.backgroundColor = .clear
-        webView.loadHTMLString(html, baseURL: nil)
-        return webView
+private struct PaperPDFView: UIViewRepresentable {
+    let url: URL
+
+    func makeUIView(context: Context) -> PDFView {
+        let pdfView = PDFView()
+        pdfView.autoScales = true
+        pdfView.displayDirection = .vertical
+        pdfView.displayMode = .singlePageContinuous
+        pdfView.backgroundColor = .clear
+        pdfView.document = PDFDocument(url: url)
+        return pdfView
     }
 
-    func updateUIView(_ webView: WKWebView, context: Context) {
-        webView.loadHTMLString(html, baseURL: nil)
+    func updateUIView(_ pdfView: PDFView, context: Context) {
+        guard pdfView.document?.documentURL != url else {
+            return
+        }
+
+        pdfView.document = PDFDocument(url: url)
     }
 }
