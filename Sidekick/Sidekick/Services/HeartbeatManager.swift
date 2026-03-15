@@ -145,6 +145,10 @@ final class HeartbeatManager: ObservableObject {
         print("[Heartbeat] Found \(inFlightPapers.count) in-flight paper(s).")
 
         for paper in inFlightPapers {
+            defer {
+                persistModelChangesIfPossible(in: modelContext, context: "paper heartbeat state")
+            }
+
             print("[Heartbeat]   Checking task \(paper.codexTaskID) for \"\(paper.title)\"...")
 
             if let run = runsByPaperID[paper.id] {
@@ -224,6 +228,8 @@ final class HeartbeatManager: ObservableObject {
             notifications.notify(paper: paper)
             paper.lastNotifiedAt = .now
         }
+
+        persistModelChangesIfPossible(in: paper.modelContext, context: "paper artifacts")
     }
 
     private func persistTaskProgress(_ snapshot: PaperTaskProgressSnapshot) {
@@ -347,6 +353,22 @@ final class HeartbeatManager: ObservableObject {
         return "status=\(snapshot.status) task_age_s=\(taskAgeSeconds) " +
             "latest_event_age_s=\(progressAgeSeconds) output_chars=\(snapshot.outputCharacterCount) " +
             "env=\"\(environmentLabel)\" network=\(networkMode) latest_event=\"\(latestEvent)\""
+    }
+
+    private func persistModelChanges(in modelContext: ModelContext?) throws {
+        guard let modelContext else {
+            return
+        }
+
+        try modelContext.save()
+    }
+
+    private func persistModelChangesIfPossible(in modelContext: ModelContext?, context: String) {
+        do {
+            try persistModelChanges(in: modelContext)
+        } catch {
+            print("[Heartbeat]   -> Failed to save \(context): \(error.localizedDescription)")
+        }
     }
 
     private func shouldRescueDeadBundledTask(
@@ -655,6 +677,7 @@ final class HeartbeatManager: ObservableObject {
 
         run.incrementAttempt(for: .plan)
         run.markRunning(stage: .plan, message: "Planning the study from notes and trusted datasets.")
+        try persistModelChanges(in: run.modelContext)
 
         do {
             let artifact = try await openAI.createResearchPlan(
@@ -666,6 +689,7 @@ final class HeartbeatManager: ObservableObject {
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .plan)
             print("[Heartbeat]   -> Plan stage completed for \(run.runID)")
             run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
+            try persistModelChanges(in: run.modelContext)
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
             handleResearchStageError(error, run: run, paper: paper, stage: .plan)
@@ -688,6 +712,7 @@ final class HeartbeatManager: ObservableObject {
                     ?? run.latestProgressMessage
                     ?? ResearchRunStage.inspect.title
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
+                try persistModelChanges(in: run.modelContext)
 
                 if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Inspect stage is attached to an incompatible repo environment; switching to responses fallback.")
@@ -753,6 +778,7 @@ final class HeartbeatManager: ObservableObject {
                 try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
                 run.activeTaskID = nil
                 run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+                try persistModelChanges(in: run.modelContext)
                 print("[Heartbeat]   -> Inspect stage completed for \(run.runID)")
                 try await advanceResearchRun(run, paper: paper, notes: notes)
 
@@ -791,6 +817,7 @@ final class HeartbeatManager: ObservableObject {
 
         run.incrementAttempt(for: .inspect)
         run.markRunning(stage: .inspect, message: "Resolving and inspecting the dataset slice.")
+        try persistModelChanges(in: run.modelContext)
 
         do {
             let taskID = try await openAI.startResearchInspectionTask(
@@ -803,6 +830,7 @@ final class HeartbeatManager: ObservableObject {
             )
             run.activeTaskID = taskID
             run.updateProgress(message: "Remote dataset inspection is running.", at: .now)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Inspect task started as \(taskID)")
         } catch {
             if shouldUseResponsesFallback(after: error) {
@@ -842,6 +870,7 @@ final class HeartbeatManager: ObservableObject {
                     ?? run.latestProgressMessage
                     ?? ResearchRunStage.analyze.title
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
+                try persistModelChanges(in: run.modelContext)
 
                 if shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Analysis stage is attached to an incompatible repo environment; switching to responses fallback.")
@@ -937,6 +966,7 @@ final class HeartbeatManager: ObservableObject {
                 try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
                 run.activeTaskID = nil
                 run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+                try persistModelChanges(in: run.modelContext)
                 print("[Heartbeat]   -> Analysis stage completed for \(run.runID)")
                 try await advanceResearchRun(run, paper: paper, notes: notes)
 
@@ -1032,6 +1062,7 @@ final class HeartbeatManager: ObservableObject {
                 ? "Re-running analysis with verification revisions."
                 : "Starting remote analysis task."
         )
+        try persistModelChanges(in: run.modelContext)
 
         do {
             let taskID = try await openAI.startResearchAnalysisTask(
@@ -1046,6 +1077,7 @@ final class HeartbeatManager: ObservableObject {
             )
             run.activeTaskID = taskID
             run.updateProgress(message: "Remote analysis is running.", at: .now)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Analysis task started as \(taskID)")
         } catch {
             if shouldUseResponsesFallback(after: error) {
@@ -1088,6 +1120,7 @@ final class HeartbeatManager: ObservableObject {
 
         run.incrementAttempt(for: .verify)
         run.markRunning(stage: .verify, message: "Verifying that the saved artifacts support a publishable paper.")
+        try persistModelChanges(in: run.modelContext)
 
         do {
             let verification = try await openAI.verifyResearchAnalysis(
@@ -1102,6 +1135,7 @@ final class HeartbeatManager: ObservableObject {
 
             if verification.decision == .reviseAnalysis {
                 run.markRunning(stage: .analyze, message: "Revising analysis from verification feedback.")
+                try persistModelChanges(in: run.modelContext)
                 print("[Heartbeat]   -> Verification requested analysis revisions for \(run.runID)")
                 try await advanceResearchRun(run, paper: paper, notes: notes)
                 return
@@ -1114,6 +1148,7 @@ final class HeartbeatManager: ObservableObject {
             }
 
             run.markRunning(stage: .write, message: ResearchRunStage.write.title)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Verify stage completed for \(run.runID)")
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
@@ -1140,6 +1175,7 @@ final class HeartbeatManager: ObservableObject {
 
         run.incrementAttempt(for: .write)
         run.markRunning(stage: .write, message: "Drafting the paper from checkpointed analysis.")
+        try persistModelChanges(in: run.modelContext)
 
         do {
             let draft = try await openAI.writeResearchPaper(
@@ -1152,6 +1188,7 @@ final class HeartbeatManager: ObservableObject {
             )
             try PaperArtifactStore.persistStageArtifact(draft, runID: run.runID, stage: .write)
             run.markRunning(stage: .typeset, message: ResearchRunStage.typeset.title)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Write stage completed for \(run.runID)")
             try await finalizeResearchRun(run, paper: paper, analysis: analysis, draft: draft)
         } catch {
@@ -1191,6 +1228,7 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.markCompleted(message: "Paper ready.")
+        try persistModelChanges(in: run.modelContext)
         print("[Heartbeat]   -> Research run complete for \(run.runID)")
     }
 
@@ -1215,6 +1253,7 @@ final class HeartbeatManager: ObservableObject {
 
         run.activeTaskID = nil
         run.markRunning(stage: .inspect, message: "Inspecting the cohort via staged responses fallback.")
+        try persistModelChanges(in: run.modelContext)
 
         do {
             let artifact = try await openAI.runResearchInspectionFallback(
@@ -1228,6 +1267,7 @@ final class HeartbeatManager: ObservableObject {
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .inspect)
             run.activeTaskID = nil
             run.markRunning(stage: .analyze, message: ResearchRunStage.analyze.title)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Inspect fallback completed for \(run.runID)")
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
@@ -1244,6 +1284,7 @@ final class HeartbeatManager: ObservableObject {
             )
             run.activeTaskID = taskID
             run.updateProgress(message: "Remote bundled inspection is running.", at: .now)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Inspect bundled fallback task started as \(taskID)")
         }
     }
@@ -1271,6 +1312,7 @@ final class HeartbeatManager: ObservableObject {
 
         run.activeTaskID = nil
         run.markRunning(stage: .analyze, message: "Running analysis via staged responses fallback.")
+        try persistModelChanges(in: run.modelContext)
 
         do {
             let artifact = try await openAI.runResearchAnalysisFallback(
@@ -1286,6 +1328,7 @@ final class HeartbeatManager: ObservableObject {
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .analyze)
             run.activeTaskID = nil
             run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Analysis fallback completed for \(run.runID)")
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
@@ -1304,6 +1347,7 @@ final class HeartbeatManager: ObservableObject {
             )
             run.activeTaskID = taskID
             run.updateProgress(message: "Remote bundled analysis is running.", at: .now)
+            try persistModelChanges(in: run.modelContext)
             print("[Heartbeat]   -> Analysis bundled fallback task started as \(taskID)")
         }
     }
@@ -1456,6 +1500,7 @@ final class HeartbeatManager: ObservableObject {
         run.activeTaskID = nil
         run.lastError = message
         run.updateProgress(message: "Retrying \(stage.title.lowercased()) soon: \(message)")
+        persistModelChangesIfPossible(in: run.modelContext, context: "research stage error")
         print("[Heartbeat]   -> Stage \(stage.rawValue) failed for \(run.runID): \(message)")
     }
 
@@ -1466,6 +1511,7 @@ final class HeartbeatManager: ObservableObject {
     ) {
         run.markFailed(message: message)
         paper.status = .failed
+        persistModelChangesIfPossible(in: run.modelContext, context: "research failure")
         print("[Heartbeat]   -> Research run failed for \(run.runID): \(message)")
     }
 
@@ -1574,6 +1620,8 @@ final class HeartbeatManager: ObservableObject {
 
         modelContext.insert(paper)
         modelContext.insert(run)
+        run.markRunning(stage: initialStage, message: initialStage.title)
+        try persistModelChanges(in: modelContext)
 
         if let plan = preparation.planArtifact {
             try PaperArtifactStore.persistStageArtifact(plan, runID: runID, stage: .plan)
@@ -1595,7 +1643,6 @@ final class HeartbeatManager: ObservableObject {
             try PaperArtifactStore.persistStageArtifact(draft, runID: runID, stage: .write)
         }
 
-        run.markRunning(stage: initialStage, message: initialStage.title)
         print("[Heartbeat]   -> Research run ID: \(runID)")
         try await advanceResearchRun(run, paper: paper, notes: notes)
     }
