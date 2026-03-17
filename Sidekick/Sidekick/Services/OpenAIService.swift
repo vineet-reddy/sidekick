@@ -170,6 +170,7 @@ final class OpenAIService: ObservableObject {
         - A single note may be too incomplete to stand alone but still become meaningful in combination with other notes.
         - Infer the latent scientific question from the combination of notes rather than requiring one polished note.
         - Do not require the notes to name a repository, portal, or dataset explicitly before choosing a fitting trusted dataset card.
+        - Treat `dataset_ids` as source-family hints for bounded discovery, not as a final execution commitment.
         - Each trusted dataset card includes a reliability tier: supported, experimental, or disabled.
         - Treat reliability as a prior, not a license to force a mismatched supported dataset onto an idea that clearly belongs elsewhere.
         - Prefer supported cards when they genuinely fit the scientific question.
@@ -359,12 +360,15 @@ final class OpenAIService: ObservableObject {
         Requirements:
         - Use only the provided notes and trusted dataset cards.
         - The notes may be typo-heavy, fragmented, or only meaningful in combination; infer the strongest coherent empirical question from the whole note set rather than waiting for polished wording.
+        - Treat the trusted dataset cards as candidate source families for a bounded discovery pass, not as a precommitted dataset choice.
+        - Quickly compare topical fit, tractability, likely reachable slice, and reliability across the candidate source families before naming one in `dataset_needs`.
         - Keep the plan concise, empirical, and executable on a first pass.
         - Dataset-specific planning guardrails below are binding. If a guardrail says a variable, design element, or comparison must be confirmed first, keep it as a contingent risk or inspection target rather than committing to it in the main question, hypotheses, methods, or figure titles.
-        - Prefer one primary trusted dataset card when it is enough for a credible first-pass paper.
+        - Prefer exactly one primary source family when it is enough for a credible first-pass paper. Supporting source families should be rare.
         - When the notes imply a broader mechanistic ambition than the reachable slice supports, rewrite the plan around the strongest honest first-pass empirical question the dataset can really answer.
         - Candidate methods must match the likely reachable slice; do not default to raw-data pipelines, large matrix reprocessing, or advanced models unless the trusted slice clearly supports them.
         - Planned figures should be real figures that the expected slice can support now, not wishlist figures for a later deeper analysis.
+        - Do not force a dataset just because it is reliable. If none of the candidate source families is a strong fit, set `dataset_id` to null and explain the block in `risks` plus `execution_notes`.
         - Do not write the paper yet.
         """
 
@@ -392,6 +396,45 @@ final class OpenAIService: ObservableObject {
         return try decodeStructuredPayload(ResearchPlanArtifact.self, from: response.outputText)
     }
 
+    func resolvePlanDatasetBinding(
+        plan: ResearchPlanArtifact,
+        noteTexts: [String]
+    ) async -> (datasetIDs: [String], datasets: [TrustedDataset]) {
+        let rankedNeeds = plan.datasetNeeds.enumerated().sorted { lhs, rhs in
+            let lhsPriority = datasetNeedPriority(lhs.element)
+            let rhsPriority = datasetNeedPriority(rhs.element)
+            if lhsPriority != rhsPriority {
+                return lhsPriority < rhsPriority
+            }
+
+            return lhs.offset < rhs.offset
+        }
+
+        var orderedDatasetIDs: [String] = []
+        var seen = Set<String>()
+
+        for (_, need) in rankedNeeds {
+            guard let datasetID = normalizedDatasetID(need.datasetID),
+                  seen.insert(datasetID).inserted else {
+                continue
+            }
+
+            orderedDatasetIDs.append(datasetID)
+        }
+
+        guard !orderedDatasetIDs.isEmpty else {
+            return ([], [])
+        }
+
+        let resolved = await trustedDatasets.taskDatasetSelection(
+            datasetIDs: orderedDatasetIDs,
+            noteTexts: noteTexts,
+            limit: max(1, orderedDatasetIDs.count)
+        )
+
+        return (resolved.map(\.id), resolved)
+    }
+
     func startResearchAnalysisTask(
         notes: [Note],
         title: String,
@@ -414,6 +457,26 @@ final class OpenAIService: ObservableObject {
         )
 
         return try await createTask(prompt: prompt, preference: .networkedSelfContained)
+    }
+
+    private func datasetNeedPriority(_ need: ResearchDatasetNeed) -> Int {
+        switch need.role.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "primary":
+            return 0
+        case "supporting":
+            return 1
+        default:
+            return 2
+        }
+    }
+
+    private func normalizedDatasetID(_ rawValue: String?) -> String? {
+        guard let rawValue else {
+            return nil
+        }
+
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        return normalized.isEmpty ? nil : normalized
     }
 
     func runNetworkedResearchAnalysisResponse(

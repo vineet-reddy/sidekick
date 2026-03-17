@@ -273,7 +273,7 @@ actor TrustedDatasetRegistry {
 
         let resolved = datasetIDs.compactMap { directByID[$0] }
         if !resolved.isEmpty {
-            // Once a run has selected explicit trusted dataset IDs, keep execution scoped to those cards.
+            // Once a stage has selected explicit source-family cards, keep that stage scoped to those cards.
             // Injecting shortlist extras here can silently widen domains or trigger unrelated local fallbacks.
             return Array(resolved.prefix(limit))
         }
@@ -333,7 +333,8 @@ actor TrustedDatasetRegistry {
             scoredEntry(
                 entry: entry,
                 directTerms: terms,
-                enrichedTerms: enrichedTerms
+                enrichedTerms: enrichedTerms,
+                hintedIDs: []
             )
         }
         .sorted { lhs, rhs in
@@ -357,18 +358,21 @@ actor TrustedDatasetRegistry {
     private func scoredEntry(
         entry: TrustedDataset,
         directTerms: Set<String>,
-        enrichedTerms: Set<String>
-    ) -> (entry: TrustedDataset, score: Double, fitScore: Double) {
+        enrichedTerms: Set<String>,
+        hintedIDs: Set<String>
+    ) -> (entry: TrustedDataset, score: Double, fitScore: Double, isHinted: Bool) {
         let fit = fitScore(
             entry: entry,
             directTerms: directTerms,
             enrichedTerms: enrichedTerms
         )
+        let isHinted = hintedIDs.contains(entry.id)
 
         return (
             entry: entry,
-            score: entry.priority + reliabilityBoost(for: entry) + fit,
-            fitScore: fit
+            score: entry.priority + reliabilityBoost(for: entry) + hintBoost(for: entry, isHinted: isHinted) + fit,
+            fitScore: fit,
+            isHinted: isHinted
         )
     }
 
@@ -425,21 +429,23 @@ actor TrustedDatasetRegistry {
         let terms = Self.tokenize(noteTexts.joined(separator: " "))
         let enrichedTerms = Self.enrichedTerms(from: terms)
         let directSources = catalog.entries.filter(\.isTrustedDirectSource)
-        let directByID = Dictionary(uniqueKeysWithValues: directSources.map { ($0.id, $0) })
-        let hintedEntries = datasetIDs.compactMap { directByID[$0] }
-        let candidatePool = hintedEntries.isEmpty ? directSources : hintedEntries
-        let hinted = !hintedEntries.isEmpty
+        let hintedIDs = Set(datasetIDs)
 
-        let scored = candidatePool
+        let scored = directSources
             .map { entry in
                 scoredEntry(
                     entry: entry,
                     directTerms: terms,
-                    enrichedTerms: enrichedTerms
+                    enrichedTerms: enrichedTerms,
+                    hintedIDs: hintedIDs
                 )
             }
             .sorted { lhs, rhs in
                 if lhs.score == rhs.score {
+                    if lhs.entry.priority == rhs.entry.priority {
+                        return lhs.entry.title < rhs.entry.title
+                    }
+
                     return lhs.entry.priority > rhs.entry.priority
                 }
 
@@ -456,14 +462,14 @@ actor TrustedDatasetRegistry {
             )
         }
 
-        let minimumFit = minimumFitScore(for: best.entry, hinted: hinted)
+        let minimumFit = minimumFitScore(for: best.entry, hinted: best.isHinted)
         guard best.fitScore >= minimumFit else {
             return TrustedSourceSelection(
                 datasets: [best.entry],
                 primaryDataset: best.entry,
                 supportTier: best.entry.resolvedSupportTier,
                 isAutoStartEligible: false,
-                message: "Queued until Sidekick finds a stronger reliable source match for this paper."
+                message: "Queued until Sidekick finds a stronger reliable source-family fit for this paper."
             )
         }
 
@@ -471,7 +477,8 @@ actor TrustedDatasetRegistry {
             scored
                 .filter { candidate in
                     candidate.entry.id == best.entry.id
-                        || (hinted && candidate.fitScore >= max(best.fitScore * 0.68, 1.4))
+                        || candidate.fitScore >= max(best.fitScore * 0.72, minimumDiscoveryCandidateFitScore(for: candidate.entry))
+                        || (candidate.isHinted && candidate.fitScore >= 0.95)
                 }
                 .prefix(max(1, limit))
                 .map(\.entry)
@@ -483,13 +490,17 @@ actor TrustedDatasetRegistry {
 
         switch tier {
         case .supported:
-            message = "Research queued."
+            if selected.count > 1 {
+                message = "Research queued. Sidekick will compare the best-fit source families before inspecting data."
+            } else {
+                message = "Research queued. Sidekick will confirm the best-fit source family before inspecting data."
+            }
             isAutoStartEligible = true
         case .experimental:
             if best.entry.id == "cellxgene-discover" {
-                message = "Experimental CELLxGENE source. Kept queued until this path is re-proven end to end."
+                message = "Experimental CELLxGENE source-family fit. Kept queued until this path is re-proven end to end."
             } else {
-                message = "Experimental source selection. Kept queued until a more reliable source is confirmed."
+                message = "Experimental source-family fit. Kept queued until a supported source is confirmed."
             }
             isAutoStartEligible = false
         case .disabled:
@@ -508,6 +519,21 @@ actor TrustedDatasetRegistry {
 
     private func reliabilityBoost(for entry: TrustedDataset) -> Double {
         officialBoost(for: entry) + supportTierBoost(for: entry.resolvedSupportTier)
+    }
+
+    private func hintBoost(for entry: TrustedDataset, isHinted: Bool) -> Double {
+        guard isHinted else {
+            return 0
+        }
+
+        switch entry.resolvedSupportTier {
+        case .supported:
+            return 0.55
+        case .experimental:
+            return 0.3
+        case .disabled:
+            return 0
+        }
     }
 
     private func officialBoost(for entry: TrustedDataset) -> Double {
@@ -542,6 +568,17 @@ actor TrustedDatasetRegistry {
             return 1.3
         case .experimental:
             return 1.7
+        case .disabled:
+            return .greatestFiniteMagnitude
+        }
+    }
+
+    private func minimumDiscoveryCandidateFitScore(for entry: TrustedDataset) -> Double {
+        switch entry.resolvedSupportTier {
+        case .supported:
+            return 1.0
+        case .experimental:
+            return 1.35
         case .disabled:
             return .greatestFiniteMagnitude
         }

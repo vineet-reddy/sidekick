@@ -588,6 +588,15 @@ final class HeartbeatManager: ObservableObject {
                 return
             }
 
+            guard try await bindPlannedSourceFamiliesIfNeeded(
+                run,
+                paper: paper,
+                notes: notes,
+                plan: plan
+            ) else {
+                return
+            }
+
             if run.activeTaskID == nil, shouldRetryResponsesFallback(for: run) {
                 do {
                     try await performInspectResponsesFallback(
@@ -838,12 +847,98 @@ final class HeartbeatManager: ObservableObject {
             )
             try PaperArtifactStore.persistStageArtifact(artifact, runID: run.runID, stage: .plan)
             print("[Heartbeat]   -> Plan stage completed for \(run.runID)")
+
+            guard try await bindPlannedSourceFamiliesIfNeeded(
+                run,
+                paper: paper,
+                notes: notes,
+                plan: artifact
+            ) else {
+                print("[Heartbeat]   -> Holding \(run.runID) after bounded source discovery found no supported fit.")
+                return
+            }
+
             run.markRunning(stage: .inspect, message: ResearchRunStage.inspect.title)
             try persistModelChanges(in: run.modelContext)
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
             handleResearchStageError(error, run: run, paper: paper, stage: .plan)
         }
+    }
+
+    private func bindPlannedSourceFamiliesIfNeeded(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        plan: ResearchPlanArtifact
+    ) async throws -> Bool {
+        let binding = await openAI.resolvePlanDatasetBinding(
+            plan: plan,
+            noteTexts: notes.map(\.content)
+        )
+
+        guard !binding.datasets.isEmpty else {
+            run.schedulingDisposition = .hold
+            paper.status = .generating
+            run.markQueued(
+                message: "Bounded source discovery could not find a strong source-family fit. Kept queued until a better fit is confirmed.",
+                queueState: .held
+            )
+            try persistModelChanges(in: run.modelContext)
+            return false
+        }
+
+        if binding.datasets.contains(where: { $0.resolvedSupportTier != .supported }) {
+            let message: String
+            let primaryTier = binding.datasets.first?.resolvedSupportTier
+
+            switch primaryTier {
+            case .supported:
+                message = "Bounded source discovery still depends on experimental source families. Kept queued until a supported-only fit is confirmed."
+            case .experimental:
+                message = "Bounded source discovery selected an experimental source family. Kept queued until a supported fit is confirmed."
+            case .disabled:
+                message = "Bounded source discovery selected a disabled source family. Kept queued until a supported fit is confirmed."
+            case nil:
+                message = "Bounded source discovery could not confirm a supported source-family fit. Kept queued until a better fit is confirmed."
+            }
+
+            run.schedulingDisposition = .hold
+            paper.status = .generating
+            run.markQueued(message: message, queueState: .held)
+            try persistModelChanges(in: run.modelContext)
+            return false
+        }
+
+        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: binding.datasets)
+        let sourceSupportTier = binding.datasets.first?.resolvedSupportTier ?? .supported
+        var didChange = false
+
+        if run.datasetIDs != binding.datasetIDs {
+            run.datasetIDs = binding.datasetIDs
+            didChange = true
+        }
+
+        if run.allowedDomains != allowedDomains {
+            run.allowedDomains = allowedDomains
+            didChange = true
+        }
+
+        if run.sourceSupportTier != sourceSupportTier {
+            run.sourceSupportTier = sourceSupportTier
+            didChange = true
+        }
+
+        if run.schedulingDisposition != .autoStart {
+            run.schedulingDisposition = .autoStart
+            didChange = true
+        }
+
+        if didChange {
+            try persistModelChanges(in: run.modelContext)
+        }
+
+        return true
     }
 
     private func executeInspectStage(
