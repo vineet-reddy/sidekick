@@ -188,6 +188,10 @@ final class ResearchRun {
         incrementAttempt(forKey: stage.rawValue)
     }
 
+    func decrementAttempt(for stage: ResearchRunStage) {
+        decrementAttempt(forKey: stage.rawValue)
+    }
+
     func resetAttemptCount(for stage: ResearchRunStage) {
         resetAttemptCount(forKey: stage.rawValue)
     }
@@ -199,6 +203,22 @@ final class ResearchRun {
     func incrementAttempt(forKey key: String) {
         var attempts = stageAttempts
         attempts[key] = (attempts[key] ?? 0) + 1
+        stageAttempts = attempts
+    }
+
+    func decrementAttempt(forKey key: String) {
+        var attempts = stageAttempts
+        let current = attempts[key] ?? 0
+        guard current > 0 else {
+            return
+        }
+
+        if current == 1 {
+            attempts.removeValue(forKey: key)
+        } else {
+            attempts[key] = current - 1
+        }
+
         stageAttempts = attempts
     }
 
@@ -572,13 +592,13 @@ nonisolated func decodeSidekickBase64Payload(_ raw: String) -> Data? {
 }
 
 private enum SidekickImageValidator {
-    private static let maximumSampleDimension = 96
-    private static let minimumContrast = 8
-    private static let minimumForegroundDelta = 12
-    private static let minimumForegroundPixels = 12
-    private static let foregroundPixelDivisor = 500
+    private nonisolated static let maximumSampleDimension = 96
+    private nonisolated static let minimumContrast = 8
+    private nonisolated static let minimumForegroundDelta = 12
+    private nonisolated static let minimumForegroundPixels = 12
+    private nonisolated static let foregroundPixelDivisor = 500
 
-    static func normalizedPNGData(from data: Data) -> Data? {
+    nonisolated static func normalizedPNGData(from data: Data) -> Data? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
               CGImageSourceGetCount(source) > 0,
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
@@ -591,7 +611,7 @@ private enum SidekickImageValidator {
         return canonicalPNGData(for: image) ?? data
     }
 
-    private static func containsVisibleContent(_ image: CGImage) -> Bool {
+    private nonisolated static func containsVisibleContent(_ image: CGImage) -> Bool {
         let sampleWidth = max(1, min(maximumSampleDimension, image.width))
         let sampleHeight = max(1, min(maximumSampleDimension, image.height))
         let pixelCount = sampleWidth * sampleHeight
@@ -648,7 +668,7 @@ private enum SidekickImageValidator {
         return (maxValue - minValue) >= minimumContrast && nonBackgroundPixels >= minimumForeground
     }
 
-    private static func canonicalPNGData(for image: CGImage) -> Data? {
+    private nonisolated static func canonicalPNGData(for image: CGImage) -> Data? {
         let encoded = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
             encoded as CFMutableData,

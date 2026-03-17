@@ -12,11 +12,19 @@ enum ExportService {
         return try exportedCopy(of: sourceURL, paperTitle: paper.title, fallbackBasename: "sidekick-paper", fileExtension: "pdf")
     }
 
-    static func latexDocument(for paper: Paper, figureCaptions: [String] = []) -> String {
+    static func latexDocument(
+        for paper: Paper,
+        figureCaptions: [String] = [],
+        plan: ResearchPlanArtifact? = nil,
+        analysis: ResearchAnalysisArtifact? = nil
+    ) -> String {
         let title = paper.title.replacingOccurrences(of: "\\", with: "\\\\")
         let normalizedMarkdown = PaperContentNormalizer.normalize(
             markdown: paper.markdown,
-            figureCaptions: figureCaptions
+            title: paper.title,
+            figureCaptions: figureCaptions,
+            plan: plan,
+            analysis: analysis
         )
         let body = LatexRenderer.render(
             markdown: LatexRenderer.strippingLeadingTitle(from: normalizedMarkdown, title: paper.title)

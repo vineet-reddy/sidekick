@@ -1,10 +1,18 @@
 import Foundation
 
 enum PaperHTMLBuilder {
-    static func html(for paper: Paper, figureCaptions: [String] = []) -> String {
+    static func html(
+        for paper: Paper,
+        figureCaptions: [String] = [],
+        plan: ResearchPlanArtifact? = nil,
+        analysis: ResearchAnalysisArtifact? = nil
+    ) -> String {
         let normalizedMarkdown = PaperContentNormalizer.normalize(
             markdown: paper.markdown,
-            figureCaptions: figureCaptions
+            title: paper.title,
+            figureCaptions: figureCaptions,
+            plan: plan,
+            analysis: analysis
         )
         var html = MarkdownHTMLRenderer.render(markdown: normalizedMarkdown)
         html = replaceFigureSources(in: html, figures: paper.figureData)
@@ -20,200 +28,170 @@ enum PaperHTMLBuilder {
           <style>
             @page {
               size: 8.5in 11in;
-              margin: 0.68in 0.72in 0.78in;
-            }
-            :root {
-              color-scheme: light only;
-              --page: #ffffff;
-              --canvas: #eef2f6;
-              --ink: #16181d;
-              --muted: #4d5562;
-              --rule: #c6ccd6;
-              --accent: #163d73;
-              --accent-soft: #eff4fb;
-              --table-rule: #667085;
+              margin: 0.82in 0.78in 0.9in;
             }
             body {
               margin: 0;
-              padding: 24px 14px 48px;
-              background: var(--canvas);
-              color: var(--ink);
-              font-family: "Baskerville", "Iowan Old Style", "Palatino Linotype", "Book Antiqua", Georgia, serif;
+              padding: 0;
+              background: #ffffff;
+              color: #000000;
+              font-family: "Times New Roman", Times, serif;
+              font-size: 10.5pt;
+              line-height: 1.34;
             }
             article {
-              box-sizing: border-box;
-              width: min(100%, 820px);
-              min-height: calc(100vh - 72px);
-              margin: 0 auto;
-              padding: 56px 64px 66px;
-              background: var(--page);
-              border: 1px solid rgba(17, 24, 39, 0.08);
-              box-shadow: 0 28px 80px rgba(16, 24, 40, 0.14);
+              margin: 0;
+              padding: 0;
+            }
+            header.paper-header {
+              margin: 0 0 18pt;
+              text-align: center;
             }
             h1, h2, h3 {
-              font-family: "Times New Roman", "Baskerville", Georgia, serif;
+              font-family: "Times New Roman", Times, serif;
               font-weight: 700;
-              color: var(--ink);
-              line-height: 1.15;
+              color: #000000;
+              line-height: 1.2;
             }
             h1 {
-              margin: 0 0 20px;
-              text-align: center;
-              font-size: 1.86rem;
-              letter-spacing: -0.025em;
+              margin: 0;
+              font-size: 16pt;
             }
             h2 {
-              margin: 28px 0 10px;
-              padding-top: 8px;
-              border-top: 1px solid var(--rule);
-              font-size: 0.98rem;
-              letter-spacing: 0.08em;
-              text-transform: uppercase;
+              margin: 18pt 0 7pt;
+              font-size: 11pt;
+              font-variant: small-caps;
+              letter-spacing: 0.03em;
             }
             h3 {
-              margin: 20px 0 8px;
-              font-size: 0.98rem;
+              margin: 14pt 0 6pt;
+              font-size: 10.5pt;
             }
             p, li {
-              color: var(--ink);
-              font-size: 0.98rem;
-              line-height: 1.5;
+              color: #000000;
+              font-size: 10.5pt;
+              line-height: 1.34;
             }
-            p { margin: 0 0 0.9em; }
-            ul, ol { margin: 0.35em 0 1em 1.35em; padding: 0; }
+            p {
+              margin: 0 0 0.62em;
+              text-align: justify;
+              text-indent: 1.15em;
+            }
+            h2 + p,
+            h3 + p,
+            .abstract p,
+            li p,
+            figure + p,
+            table + p {
+              text-indent: 0;
+            }
+            ul, ol {
+              margin: 0.28em 0 0.95em 1.25em;
+              padding: 0;
+            }
             li { margin: 0.2em 0; }
             code, pre {
               font-family: "SFMono-Regular", Menlo, Consolas, monospace;
             }
             code {
-              font-size: 0.92em;
-              background: rgba(15, 23, 42, 0.05);
-              padding: 0.08em 0.32em;
-              border-radius: 4px;
+              font-size: 0.9em;
             }
             pre {
-              margin: 1.2em 0;
-              background: #f8fafc;
-              border: 1px solid #d9e1ea;
-              border-radius: 10px;
-              padding: 14px 16px;
+              margin: 0.9em 0 1.1em;
+              padding: 10px 11px;
               overflow-x: auto;
+              border: 0.5px solid #000000;
             }
             blockquote {
-              margin: 1.2em 0;
-              padding: 0.2em 0 0.2em 16px;
-              border-left: 3px solid #cbd5e1;
-              color: var(--muted);
+              margin: 0.9em 0;
+              padding: 0 0 0 12px;
+              border-left: 1px solid #444444;
+              color: #222222;
             }
             a {
-              color: var(--accent);
-              text-decoration: none;
+              color: #000000;
+              text-decoration: underline;
             }
-            a:hover { text-decoration: underline; }
             .abstract {
-              margin: 0 auto 24px;
-              padding: 14px 18px 16px;
-              background: var(--accent-soft);
-              border: 1px solid rgba(31, 79, 140, 0.14);
+              margin: 0 0 14pt;
             }
             .abstract h2 {
-              border-top: none;
-              margin: 0 0 10px;
-              padding-top: 0;
+              margin: 0 0 6pt;
               text-align: center;
             }
-            .abstract p:last-child { margin-bottom: 0; }
+            .abstract p {
+              margin-bottom: 0;
+              text-indent: 0;
+            }
             figure.paper-figure,
             figure.missing-figure {
-              margin: 1.6em auto;
+              margin: 1.1em auto 1.2em;
               text-align: center;
             }
             figure.paper-figure img {
               display: block;
               max-width: 100%;
-              max-height: 460px;
-              margin: 0 auto 10px;
-              border: 1px solid #d5dbe3;
+              max-height: 250px;
+              margin: 0 auto 6px;
+              border: 0.5px solid #111111;
             }
             figcaption {
-              color: var(--muted);
-              font-size: 0.92rem;
-              line-height: 1.45;
+              color: #111111;
+              font-size: 9pt;
+              line-height: 1.28;
+              text-align: left;
             }
             .missing-figure__box {
               display: flex;
               align-items: center;
               justify-content: center;
-              min-height: 160px;
-              margin-bottom: 10px;
-              border: 1px dashed #b8c2cf;
-              background: #f8fafc;
-              color: var(--muted);
-              font-size: 0.95rem;
+              min-height: 120px;
+              margin-bottom: 6px;
+              border: 0.5px dashed #666666;
+              color: #444444;
+              font-size: 9pt;
             }
             .equation {
-              margin: 1.4em auto;
-              padding: 0.8em 1em;
+              margin: 1.0em auto;
+              padding: 0.4em 0.6em;
               max-width: 100%;
               overflow-x: auto;
-              background: #f7f9fc;
-              border-left: 3px solid #ccd6e2;
-              color: var(--ink);
-              font-family: "Times New Roman", "Cambria Math", Georgia, serif;
-              font-size: 1rem;
-              line-height: 1.5;
+              color: #000000;
+              font-family: "Times New Roman", Times, serif;
+              font-size: 10pt;
+              line-height: 1.3;
               text-align: center;
               white-space: pre-wrap;
             }
             table.paper-table {
               width: 100%;
-              margin: 1.4em 0;
+              margin: 0.85em 0 1.1em;
               border-collapse: collapse;
-              border-top: 1.8px solid var(--table-rule);
-              border-bottom: 1.8px solid var(--table-rule);
-              font-size: 0.93rem;
+              border-top: 1.3px solid #000000;
+              border-bottom: 1.3px solid #000000;
+              font-size: 9.1pt;
             }
             table.paper-table th,
             table.paper-table td {
-              padding: 7px 8px;
+              padding: 4px 5px;
               border: none;
               text-align: left;
               vertical-align: top;
             }
             table.paper-table thead th {
               font-weight: 700;
-              border-bottom: 1px solid var(--table-rule);
+              border-bottom: 0.7px solid #000000;
             }
             table.paper-table tbody tr + tr td {
-              border-top: 0.6px solid rgba(102, 112, 133, 0.32);
-            }
-            @media print {
-              body {
-                padding: 0;
-                background: #ffffff;
-              }
-              article {
-                width: auto;
-                min-height: auto;
-                margin: 0;
-                padding: 0;
-                border: none;
-                box-shadow: none;
-              }
-            }
-            @media (max-width: 700px) {
-              article {
-                min-height: auto;
-                padding: 26px 20px 34px;
-              }
-              h1 {
-                font-size: 1.46rem;
-              }
+              border-top: 0.35px solid rgba(0, 0, 0, 0.18);
             }
           </style>
         </head>
         <body>
           <article>
+            <header class="paper-header">
+              <h1>\(escapeHTML(paper.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Untitled Paper" : paper.title))</h1>
+            </header>
             \(html)
           </article>
         </body>
@@ -274,10 +252,26 @@ enum PaperHTMLBuilder {
         let range = NSRange(text.startIndex..<text.endIndex, in: text)
         return regex.stringByReplacingMatches(in: text, options: [], range: range, withTemplate: template)
     }
+
+    private static func escapeHTML(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
 }
 
 enum PaperContentNormalizer {
-    static func normalize(markdown: String, figureCaptions: [String] = []) -> String {
+    private static let expandedManuscriptWordThreshold = 2_200
+
+    static func normalize(
+        markdown: String,
+        title: String? = nil,
+        figureCaptions: [String] = [],
+        plan: ResearchPlanArtifact? = nil,
+        analysis: ResearchAnalysisArtifact? = nil
+    ) -> String {
         var value = markdown
 
         if let decoded = decodeJSONStringFragment(markdown) {
@@ -289,6 +283,8 @@ enum PaperContentNormalizer {
                 .replacingOccurrences(of: "\\\"", with: "\"")
                 .replacingOccurrences(of: "\\/", with: "/")
         }
+
+        value = strippingLeadingTitle(from: value, title: title)
 
         value = replacing(
             pattern: #"【[^】]+】"#,
@@ -327,6 +323,12 @@ enum PaperContentNormalizer {
         )
 
         value = materializeBareFigureReferences(in: value, figureCaptions: figureCaptions)
+        value = enrichedMarkdownIfNeeded(
+            value,
+            title: title,
+            plan: plan,
+            analysis: analysis
+        )
 
         value = droppingSections(
             titled: [
@@ -346,6 +348,37 @@ enum PaperContentNormalizer {
         }
 
         return value.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func strippingLeadingTitle(from markdown: String, title: String?) -> String {
+        guard let title = title?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty else {
+            return markdown
+        }
+
+        var lines = markdown.components(separatedBy: .newlines)
+        guard let first = lines.first?.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return markdown
+        }
+
+        let normalizedFirst = first.lowercased()
+        let acceptedTitles = [
+            title.lowercased(),
+            "# \(title)".lowercased(),
+            "## \(title)".lowercased(),
+            "### \(title)".lowercased()
+        ]
+
+        guard acceptedTitles.contains(normalizedFirst) else {
+            return markdown
+        }
+
+        lines.removeFirst()
+        while lines.first?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == true {
+            lines.removeFirst()
+        }
+
+        return lines.joined(separator: "\n")
     }
 
     private static func materializeBareFigureReferences(
@@ -421,6 +454,530 @@ enum PaperContentNormalizer {
         }
 
         return output.joined(separator: "\n")
+    }
+
+    private static func enrichedMarkdownIfNeeded(
+        _ markdown: String,
+        title: String?,
+        plan: ResearchPlanArtifact?,
+        analysis: ResearchAnalysisArtifact?
+    ) -> String {
+        guard let analysis else {
+            return markdown
+        }
+
+        let needsExpansion = markdownWordCount(markdown) < expandedManuscriptWordThreshold
+        let needsTables = !analysis.tables.isEmpty && !containsTable(in: markdown)
+        let needsLimitations = !analysis.limitations.isEmpty && !containsHeading("limitations", in: markdown)
+
+        guard needsExpansion || needsTables || needsLimitations else {
+            return markdown
+        }
+
+        var sections: [String] = []
+
+        if needsExpansion {
+            if let objectiveSection = studyObjectiveSection(from: plan) {
+                sections.append(objectiveSection)
+            }
+            if let cohortSection = cohortDetailSection(from: analysis.datasetManifest) {
+                sections.append(cohortSection)
+            }
+            if let dataAssemblySection = dataAssemblySection(
+                from: plan,
+                manifest: analysis.datasetManifest
+            ) {
+                sections.append(dataAssemblySection)
+            }
+            if let methodsSection = methodsDetailSection(from: plan, analysis: analysis) {
+                sections.append(methodsSection)
+            }
+            if let summarySection = analysisOverviewSection(from: analysis) {
+                sections.append(summarySection)
+            }
+            if let figureSection = figureContextSection(from: plan, analysis: analysis) {
+                sections.append(figureSection)
+            }
+            if let findingsSection = findingsDetailSection(from: analysis.findings) {
+                sections.append(findingsSection)
+            }
+            if let robustnessSection = robustnessSection(from: plan) {
+                sections.append(robustnessSection)
+            }
+        }
+
+        if needsTables, let tablesSection = tablesSection(from: analysis.tables) {
+            sections.append(tablesSection)
+        }
+
+        if needsLimitations, let limitationsSection = limitationsSection(from: analysis.limitations) {
+            sections.append(limitationsSection)
+        }
+
+        guard !sections.isEmpty else {
+            return markdown
+        }
+
+        return insertingSupplementarySections(
+            sections,
+            into: markdown,
+            title: title
+        )
+    }
+
+    private static func cohortDetailSection(from manifest: ResearchDatasetManifest) -> String? {
+        var paragraphs: [String] = []
+
+        let sampleDescription = manifest.sampleDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !sampleDescription.isEmpty {
+            paragraphs.append(sampleDescription)
+        }
+
+        if let rowCount = manifest.rowCount {
+            paragraphs.append("The analyzed slice contained \(formattedCount(rowCount)) records or cells in the checkpointed study population.")
+        }
+
+        if !manifest.dataSources.isEmpty {
+            paragraphs.append("Primary data sources for the final manuscript were \(serialSentence(for: manifest.dataSources)).")
+        }
+
+        if !manifest.selectedVariables.isEmpty {
+            paragraphs.append("Key analytic variables retained for the manuscript included \(serialSentence(for: manifest.selectedVariables)).")
+        }
+
+        let qualityNotes = manifest.qualityNotes
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !qualityNotes.isEmpty {
+            paragraphs.append("Important data-quality considerations included \(serialSentence(for: Array(qualityNotes.prefix(4)))).")
+        }
+
+        guard !paragraphs.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Cohort and Data Detail
+
+        \(paragraphs.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func studyObjectiveSection(from plan: ResearchPlanArtifact?) -> String? {
+        guard let plan else {
+            return nil
+        }
+
+        var paragraphs: [String] = []
+
+        let question = plan.question.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !question.isEmpty {
+            paragraphs.append("The study was organized around the following question: \(ensuredSentence(question))")
+        }
+
+        let hypotheses = plan.hypotheses
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !hypotheses.isEmpty {
+            let narrative = hypotheses.enumerated().map { index, hypothesis in
+                "\(ordinalLead(index)) \(ensuredSentence(hypothesis))"
+            }.joined(separator: " ")
+            paragraphs.append("The prespecified working hypotheses framed the analysis before any manuscript prose was written. \(narrative)")
+        }
+
+        guard !paragraphs.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Study Objective and Hypotheses
+
+        \(paragraphs.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func dataAssemblySection(
+        from plan: ResearchPlanArtifact?,
+        manifest: ResearchDatasetManifest
+    ) -> String? {
+        var paragraphs: [String] = []
+
+        if let plan, !plan.datasetNeeds.isEmpty {
+            paragraphs.append(contentsOf: plan.datasetNeeds.prefix(3).compactMap { need in
+                var sentences: [String] = []
+
+                let datasetID = need.datasetID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                if datasetID.isEmpty {
+                    sentences.append("The \(need.role) analytic source supplied the core variables required for the staged manuscript.")
+                } else {
+                    sentences.append("The \(need.role) analytic source was \(datasetID), which supplied the core variables required for the staged manuscript.")
+                }
+
+                if !need.variables.isEmpty {
+                    sentences.append("Requested variables included \(serialSentence(for: Array(need.variables.prefix(8)))).")
+                }
+
+                let rationale = need.rationale.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !rationale.isEmpty {
+                    sentences.append(ensuredSentence(rationale))
+                }
+
+                guard !sentences.isEmpty else {
+                    return nil
+                }
+
+                return sentences.joined(separator: " ")
+            })
+        }
+
+        if paragraphs.isEmpty, !manifest.primaryDatasetIDs.isEmpty {
+            paragraphs.append("The final paper drew on \(serialSentence(for: manifest.primaryDatasetIDs)) as the primary checkpointed data source.")
+        }
+
+        guard !paragraphs.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Data Assembly and Variable Definition
+
+        \(paragraphs.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func methodsDetailSection(
+        from plan: ResearchPlanArtifact?,
+        analysis: ResearchAnalysisArtifact
+    ) -> String? {
+        var paragraphs: [String] = []
+
+        if let executionNotes = plan?.executionNotes.trimmingCharacters(in: .whitespacesAndNewlines),
+           !executionNotes.isEmpty {
+            paragraphs.append(executionNotes)
+        }
+
+        if let plan, !plan.candidateMethods.isEmpty {
+            paragraphs.append("The staged analysis workflow emphasized \(serialSentence(for: Array(plan.candidateMethods.prefix(4)))).")
+        }
+
+        if !analysis.tables.isEmpty {
+            let tableTitles = analysis.tables.map(\.title).filter { !$0.isEmpty }
+            if !tableTitles.isEmpty {
+                paragraphs.append("Structured empirical outputs were checkpointed as \(serialSentence(for: tableTitles)).")
+            }
+        }
+
+        guard !paragraphs.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Analytical Detail
+
+        \(paragraphs.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func analysisOverviewSection(from analysis: ResearchAnalysisArtifact) -> String? {
+        let summary = analysis.narrativeSummary.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !summary.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Analysis Overview
+
+        \(ensuredSentence(summary))
+        """
+    }
+
+    private static func figureContextSection(
+        from plan: ResearchPlanArtifact?,
+        analysis: ResearchAnalysisArtifact
+    ) -> String? {
+        var paragraphs: [String] = []
+
+        let tableTitles = analysis.tables
+            .map(\.title)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        for figure in analysis.figures.prefix(3) {
+            var sentences: [String] = []
+            let caption = figure.caption.trimmingCharacters(in: .whitespacesAndNewlines)
+            let matchedPlan = matchingPlannedFigure(for: figure.filename, in: plan)
+
+            if caption.isEmpty {
+                sentences.append("The final manuscript includes \(figure.filename) as a retained figure artifact.")
+            } else {
+                sentences.append("The final manuscript includes \(figure.filename), captioned \"\(caption)\".")
+            }
+
+            if let matchedPlan {
+                let title = matchedPlan.title.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !title.isEmpty {
+                    sentences.append("This corresponds to the planned visualization titled \"\(title)\".")
+                }
+
+                let purpose = matchedPlan.purpose.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !purpose.isEmpty {
+                    sentences.append(ensuredSentence(purpose))
+                }
+            }
+
+            if !tableTitles.isEmpty {
+                sentences.append("It should be interpreted alongside \(serialSentence(for: Array(tableTitles.prefix(2)))) so that the visual pattern can be compared with the checkpointed numeric estimates.")
+            } else {
+                sentences.append("Its purpose is to complement the narrative findings with a direct visual summary of the checkpointed empirical pattern.")
+            }
+
+            paragraphs.append(sentences.joined(separator: " "))
+        }
+
+        guard !paragraphs.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Figure Context
+
+        \(paragraphs.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func findingsDetailSection(from findings: [ResearchFinding]) -> String? {
+        let paragraphs = findings.compactMap { finding -> String? in
+            let claim = finding.claim.trimmingCharacters(in: .whitespacesAndNewlines)
+            let estimate = finding.estimate.trimmingCharacters(in: .whitespacesAndNewlines)
+            let uncertainty = finding.uncertainty.trimmingCharacters(in: .whitespacesAndNewlines)
+            let evidence = finding.evidence.trimmingCharacters(in: .whitespacesAndNewlines)
+
+            guard !claim.isEmpty else {
+                return nil
+            }
+
+            var sentences = [claim]
+            if !estimate.isEmpty {
+                sentences.append("The staged estimate was \(estimate).")
+            }
+            if !uncertainty.isEmpty {
+                sentences.append("Reported uncertainty was \(uncertainty).")
+            }
+            if !evidence.isEmpty {
+                sentences.append("The underlying evidence was \(evidence).")
+            }
+            if let supports = finding.supportsHypothesis {
+                sentences.append(
+                    supports
+                        ? "This checkpoint supported the corresponding working hypothesis."
+                        : "This checkpoint did not support the corresponding working hypothesis."
+                )
+            }
+
+            return sentences.joined(separator: " ")
+        }
+
+        guard !paragraphs.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Expanded Results Detail
+
+        \(paragraphs.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func robustnessSection(from plan: ResearchPlanArtifact?) -> String? {
+        guard let plan else {
+            return nil
+        }
+
+        let cleaned = plan.risks
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !cleaned.isEmpty else {
+            return nil
+        }
+
+        let intro = "The execution plan carried forward several pre-analysis risks that shape how the final estimates should be interpreted."
+        let paragraphs = cleaned.prefix(4).map { ensuredSentence($0) }
+
+        return """
+        ## Robustness and Data Constraints
+
+        \(intro)
+
+        \(paragraphs.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func tablesSection(from tables: [ResearchTableArtifact]) -> String? {
+        let renderedTables = tables.compactMap { table -> String? in
+            guard !table.columns.isEmpty else {
+                return nil
+            }
+
+            let header = "| " + table.columns.map { $0.replacingOccurrences(of: "|", with: "\\|") }.joined(separator: " | ") + " |"
+            let separator = "| " + Array(repeating: "---", count: table.columns.count).joined(separator: " | ") + " |"
+            let rows = table.rows.prefix(20).map { row in
+                let paddedRow = row + Array(repeating: "", count: max(0, table.columns.count - row.count))
+                return "| " + paddedRow.prefix(table.columns.count).map {
+                    $0.replacingOccurrences(of: "|", with: "\\|")
+                }.joined(separator: " | ") + " |"
+            }
+
+            let notes = table.notes?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            let notesBlock = notes.isEmpty ? "" : "\n\n\(notes)"
+
+            return """
+            ### \(table.title.isEmpty ? table.identifier.capitalized : table.title)
+
+            \(header)
+            \(separator)
+            \(rows.joined(separator: "\n"))\(notesBlock)
+            """
+        }
+
+        guard !renderedTables.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Structured Tables
+
+        \(renderedTables.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func limitationsSection(from limitations: [String]) -> String? {
+        let cleaned = limitations
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        guard !cleaned.isEmpty else {
+            return nil
+        }
+
+        return """
+        ## Limitations
+
+        \(cleaned.joined(separator: "\n\n"))
+        """
+    }
+
+    private static func insertingSupplementarySections(
+        _ sections: [String],
+        into markdown: String,
+        title _: String?
+    ) -> String {
+        let lines = markdown.components(separatedBy: .newlines)
+        let referencesIndex = lines.firstIndex { line in
+            markdownHeadingTitle(from: line.trimmingCharacters(in: .whitespacesAndNewlines))?
+                .lowercased() == "references"
+        }
+
+        let supplement = sections.joined(separator: "\n\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let referencesIndex else {
+            return markdown + "\n\n" + supplement
+        }
+
+        let before = lines[..<referencesIndex].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        let after = lines[referencesIndex...].joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        return """
+        \(before)
+
+        \(supplement)
+
+        \(after)
+        """
+    }
+
+    private static func containsHeading(_ title: String, in markdown: String) -> Bool {
+        markdown
+            .components(separatedBy: .newlines)
+            .contains { line in
+                markdownHeadingTitle(from: line.trimmingCharacters(in: .whitespacesAndNewlines))?
+                    .lowercased() == title
+            }
+    }
+
+    private static func containsTable(in markdown: String) -> Bool {
+        markdown.contains("\n|") || markdown.hasPrefix("|")
+    }
+
+    private static func markdownWordCount(_ markdown: String) -> Int {
+        markdown
+            .replacingOccurrences(of: #"[#*`|_>\[\]\(\)]"#, with: " ", options: .regularExpression)
+            .split(whereSeparator: \.isWhitespace)
+            .count
+    }
+
+    private static func serialSentence(for items: [String]) -> String {
+        let cleaned = items
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+
+        switch cleaned.count {
+        case 0:
+            return ""
+        case 1:
+            return cleaned[0]
+        case 2:
+            return "\(cleaned[0]) and \(cleaned[1])"
+        default:
+            let head = cleaned.dropLast().joined(separator: ", ")
+            return "\(head), and \(cleaned.last!)"
+        }
+    }
+
+    private static func formattedCount(_ value: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: value)) ?? String(value)
+    }
+
+    private static func ensuredSentence(_ text: String) -> String {
+        let cleaned = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else {
+            return cleaned
+        }
+
+        if let last = cleaned.last, ".!?".contains(last) {
+            return cleaned
+        }
+
+        return cleaned + "."
+    }
+
+    private static func ordinalLead(_ index: Int) -> String {
+        switch index {
+        case 0:
+            return "First,"
+        case 1:
+            return "Second,"
+        case 2:
+            return "Third,"
+        case 3:
+            return "Fourth,"
+        default:
+            return "Additionally,"
+        }
+    }
+
+    private static func matchingPlannedFigure(
+        for filename: String,
+        in plan: ResearchPlanArtifact?
+    ) -> ResearchFigurePlan? {
+        guard let plan else {
+            return nil
+        }
+
+        let stem = URL(fileURLWithPath: filename).deletingPathExtension().lastPathComponent.lowercased()
+        return plan.plannedFigures.first { planned in
+            planned.identifier.lowercased() == stem
+        }
     }
 
     private static func decodeJSONStringFragment(_ fragment: String) -> String? {

@@ -44,6 +44,7 @@ final class HeartbeatManager: ObservableObject {
     private let lastRunKey = "com.vineet.sidekick.lastHeartbeatAt"
     private let cooldown: TimeInterval = 20 * 60
     private let remoteRetryGracePeriod: TimeInterval = 8 * 60
+    private let remoteNoSignalRetryGracePeriod: TimeInterval = 5 * 60
     private let bundledRemoteRetryGracePeriod: TimeInterval = 5 * 60
     private let failedPaperRetryCooldown: TimeInterval = 20 * 60
     private let deadBundledTaskGracePeriod: TimeInterval = 2 * 60
@@ -326,8 +327,13 @@ final class HeartbeatManager: ObservableObject {
 
         let taskAge = now.timeIntervalSince(taskStart)
         let progressAge = now.timeIntervalSince(lastProgressAt)
+        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let retryGracePeriod =
+            snapshot.outputCharacterCount == 0 && latestEvent.isEmpty && snapshot.latestEventAt == nil
+            ? remoteNoSignalRetryGracePeriod
+            : remoteRetryGracePeriod
 
-        return taskAge >= remoteRetryGracePeriod
+        return taskAge >= retryGracePeriod
             && (snapshot.outputCharacterCount == 0 || progressAge >= stalledEventGracePeriod)
     }
 
@@ -439,6 +445,10 @@ final class HeartbeatManager: ObservableObject {
             paper.status = .generating
             run.resetAttemptCount(for: .verify)
             run.markRunning(stage: .verify, message: ResearchRunStage.verify.title)
+        } else if shouldRetryQueueRetryBudgetFailure(for: run) {
+            paper.status = .generating
+            run.resetAttemptCount(for: run.currentStage)
+            run.status = .running
         } else if shouldRetryDirectFallbackStage(for: run) {
             paper.status = .generating
             run.resetAttemptCount(for: run.currentStage)
@@ -476,6 +486,7 @@ final class HeartbeatManager: ObservableObject {
     private func isFailedResearchRunRecoverable(_ run: ResearchRun) -> Bool {
         pendingAnalysisRevision(for: run.runID) != nil
             || shouldRetryLatestVerification(for: run)
+            || shouldRetryQueueRetryBudgetFailure(for: run)
             || shouldRetryDirectFallbackStage(for: run)
     }
 
@@ -503,6 +514,32 @@ final class HeartbeatManager: ObservableObject {
         }
 
         return shouldRetryResponsesFallback(for: run)
+    }
+
+    private func shouldRetryQueueRetryBudgetFailure(for run: ResearchRun) -> Bool {
+        guard run.status == .failed,
+              run.activeTaskID == nil,
+              run.currentStage == .inspect || run.currentStage == .analyze,
+              (run.lastError ?? "").localizedCaseInsensitiveContains("exceeded the retry budget.") else {
+            return false
+        }
+
+        switch run.currentStage {
+        case .inspect:
+            return PaperArtifactStore.stageArtifact(
+                ResearchInspectionArtifact.self,
+                runID: run.runID,
+                stage: .inspect
+            ) == nil
+        case .analyze:
+            return PaperArtifactStore.stageArtifact(
+                ResearchAnalysisArtifact.self,
+                runID: run.runID,
+                stage: .analyze
+            ) == nil
+        default:
+            return false
+        }
     }
 
     private func advanceResearchRun(
@@ -811,9 +848,11 @@ final class HeartbeatManager: ObservableObject {
             switch result {
             case let .waiting(snapshot):
                 persistTaskProgress(snapshot)
-                let message = snapshot.latestEventText
-                    ?? run.latestProgressMessage
-                    ?? ResearchRunStage.inspect.title
+                let message = progressMessage(
+                    for: snapshot,
+                    stage: .inspect,
+                    fallback: run.latestProgressMessage ?? ResearchRunStage.inspect.title
+                )
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
                 try persistModelChanges(in: run.modelContext)
 
@@ -878,6 +917,7 @@ final class HeartbeatManager: ObservableObject {
                 if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .inspect) {
                     print("[Heartbeat]   -> Inspect stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
+                    refundRetryBudgetIfNeeded(run: run, stage: .inspect, snapshot: snapshot)
 
                     if await prefersBundledResearchFallback(run: run, notes: notes),
                        shouldUseResponsesFallback(for: snapshot) {
@@ -1089,9 +1129,11 @@ final class HeartbeatManager: ObservableObject {
             switch result {
             case let .waiting(snapshot):
                 persistTaskProgress(snapshot)
-                let message = snapshot.latestEventText
-                    ?? run.latestProgressMessage
-                    ?? ResearchRunStage.analyze.title
+                let message = progressMessage(
+                    for: snapshot,
+                    stage: .analyze,
+                    fallback: run.latestProgressMessage ?? ResearchRunStage.analyze.title
+                )
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
                 try persistModelChanges(in: run.modelContext)
 
@@ -1162,6 +1204,7 @@ final class HeartbeatManager: ObservableObject {
                 if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .analyze) {
                     print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
                     run.activeTaskID = nil
+                    refundRetryBudgetIfNeeded(run: run, stage: .analyze, snapshot: snapshot)
 
                     if revisionRequest != nil,
                        await prefersBundledResearchFallback(run: run, notes: notes) {
@@ -1915,13 +1958,82 @@ final class HeartbeatManager: ObservableObject {
         let progressAge = now.timeIntervalSince(lastProgress)
         let latestProgress = run.latestProgressMessage?.lowercased() ?? ""
         let networkMode = snapshot.environmentNetworkMode?.lowercased() ?? ""
+        let noSignalRemoteTask = isNoSignalRemoteTask(snapshot)
         let retryGracePeriod =
             latestProgress.contains("bundled") && networkMode == "on"
             ? bundledRemoteRetryGracePeriod
-            : remoteRetryGracePeriod
+            : (noSignalRemoteTask ? remoteNoSignalRetryGracePeriod : remoteRetryGracePeriod)
 
         return taskAge >= retryGracePeriod
             && (snapshot.outputCharacterCount == 0 || progressAge >= stalledEventGracePeriod)
+    }
+
+    private func refundRetryBudgetIfNeeded(
+        run: ResearchRun,
+        stage: ResearchRunStage,
+        snapshot: PaperTaskProgressSnapshot
+    ) {
+        guard isNoSignalRemoteTask(snapshot) else {
+            return
+        }
+
+        run.decrementAttempt(for: stage)
+    }
+
+    private func isNoSignalRemoteTask(_ snapshot: PaperTaskProgressSnapshot) -> Bool {
+        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return snapshot.outputCharacterCount == 0
+            && latestEvent.isEmpty
+            && snapshot.latestEventAt == nil
+    }
+
+    private func progressMessage(
+        for snapshot: PaperTaskProgressSnapshot,
+        stage: ResearchRunStage,
+        fallback: String
+    ) -> String {
+        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !latestEvent.isEmpty {
+            return latestEvent
+        }
+
+        let status = snapshot.status.lowercased()
+        let environmentLabel = snapshot.environmentLabel?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let environment = environmentLabel?.isEmpty == false
+            ? environmentLabel!
+            : (snapshot.environmentID ?? "the remote worker")
+
+        let taskStart = snapshot.taskCreatedAt ?? snapshot.assistantTurnCreatedAt ?? snapshot.observedAt
+        let ageText = conciseElapsedTime(since: taskStart, now: snapshot.observedAt)
+
+        switch status {
+        case "pending", "queued":
+            return "Queued on \(environment) \(ageText). Waiting for the remote worker to start \(stage.title.lowercased())."
+        case "in_progress", "incomplete":
+            return "Running on \(environment) \(ageText). Waiting for the first research update."
+        default:
+            return fallback
+        }
+    }
+
+    private func conciseElapsedTime(since start: Date, now: Date) -> String {
+        let seconds = max(0, Int(now.timeIntervalSince(start)))
+        if seconds < 60 {
+            return "for \(seconds)s"
+        }
+
+        let minutes = seconds / 60
+        if minutes < 60 {
+            return "for \(minutes)m"
+        }
+
+        let hours = minutes / 60
+        let remainderMinutes = minutes % 60
+        if remainderMinutes == 0 {
+            return "for \(hours)h"
+        }
+
+        return "for \(hours)h \(remainderMinutes)m"
     }
 
     private func shouldUseResponsesFallback(for snapshot: PaperTaskProgressSnapshot) -> Bool {

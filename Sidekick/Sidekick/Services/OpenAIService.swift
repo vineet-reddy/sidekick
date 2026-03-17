@@ -1086,7 +1086,7 @@ final class OpenAIService: ObservableObject {
         }
 
         let instructions = """
-        You are writing a concise professional paper from verified research artifacts.
+        You are writing a full professional manuscript from verified research artifacts.
         Use the supplied plan, analysis, and verification only. Do not invent new results.
 
         Return strict JSON only with this exact shape:
@@ -1096,11 +1096,16 @@ final class OpenAIService: ObservableObject {
         }
 
         Requirements:
-        - Write a compact empirical paper, not a planning memo.
-        - Prefer standard sections such as Abstract, Introduction, Data, Methods, Results, Discussion, and References when they fit.
-        - When referencing figures, use bare filenames like `figure_1.png`.
+        - Write a serious empirical paper, not a planning memo or short abstract.
+        - The manuscript should read like a real arXiv-style paper and should usually typeset to roughly 6-7 pages at standard academic density unless the verified evidence is genuinely too limited.
+        - Target approximately 2,600-3,800 words when the supplied artifacts support that depth; a short 1,200-1,800 word report is usually not acceptable.
+        - Prefer standard sections such as Abstract, Introduction, Data, Methods, Results, Discussion, Limitations, and References when they fit.
+        - Give the Introduction, Data/Methods, Results, and Discussion enough detail that a scientist would believe the analysis was actually carried out.
+        - Reproduce at least one structured markdown table whenever `analysis.tables` contains a materially useful table.
+        - Reference every available figure asset in the narrative results or discussion using bare filenames like `figure_1.png`.
         - Only state empirical results that are supported by `supported_claims`.
         - Treat `weak_or_unsupported_claims`, `model_warnings`, and `sample_warnings` as limitations, caveats, or omissions rather than results.
+        - Avoid bullet-heavy formatting except where a conventional reference list or table note truly requires it.
         - Do not include tool traces, logs, reproducibility checklists, repo paths, or app-meta commentary.
         """
 
@@ -1184,7 +1189,10 @@ final class OpenAIService: ObservableObject {
                "notes": "short summary of data access and limits"
              }
            }
-        9. The markdown must read like a serious paper suitable for an arXiv-style PDF, not a planning memo. Prefer standard sections such as Abstract, Introduction, Data, Methods, Results, Discussion, and References when they fit.
+        9. The markdown must read like a serious paper suitable for an arXiv-style PDF, not a planning memo. Prefer standard sections such as Abstract, Introduction, Data, Methods, Results, Discussion, Limitations, and References when they fit.
+        9a. Unless the verified evidence is genuinely sparse, aim for a manuscript that would typeset to roughly 6-7 pages at standard academic density rather than a short 2-page report.
+        9aa. When the artifacts are rich enough, target roughly 2,600-3,800 words instead of a thin summary.
+        9b. When the analysis supports it, include at least one substantive markdown table and discuss it in the Results section.
         10. When you reference figures in markdown, use bare filenames like `figure_1.png` only. Do not use repo paths such as `research/figures/figure_1.png`.
         11. If you generate figure files during the run, you must also include the same PNG bytes in `figures[].base64_data`. Do not rely on repo snapshots or diffs as the only transport for figures.
         12. Do not include repo citations, line markers, path citations, tool traces, execution logs, reproducibility checklists, PR notes, or literal escape sequences.
@@ -1713,7 +1721,8 @@ final class OpenAIService: ObservableObject {
             candidates = prioritized
 
         case .selfContainedBundle:
-            var prioritized = environmentPool
+            let preferredPool = preferredSelfContainedEnvironmentPool(from: environmentPool)
+            var prioritized = preferredPool
                 .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
 
             if let remembered = await environmentRouter.cached(for: preference),
@@ -1725,8 +1734,8 @@ final class OpenAIService: ObservableObject {
             candidates = prioritized
 
         case .networkedSelfContained:
-            let networkEnabled = environmentPool.filter { $0.agentNetworkAccess?.mode?.lowercased() == "on" }
-            var prioritized = (networkEnabled.isEmpty ? environmentPool : networkEnabled)
+            let preferredPool = preferredNetworkedSelfContainedEnvironmentPool(from: environmentPool)
+            var prioritized = preferredPool
                 .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
 
             if let remembered = await environmentRouter.cached(for: preference),
@@ -1739,6 +1748,52 @@ final class OpenAIService: ObservableObject {
         }
 
         return candidates
+    }
+
+    private func preferredSelfContainedEnvironmentPool(
+        from environments: [CloudTaskEnvironment]
+    ) -> [CloudTaskEnvironment] {
+        let codexPython = environments.filter { environment in
+            environment.hasPythonRuntime
+                && environment.agentNetworkAccess?.presetAllowlist?.lowercased() == "codex"
+        }
+
+        if !codexPython.isEmpty {
+            return codexPython
+        }
+
+        let nonRepositoryPython = environments.filter { environment in
+            environment.hasPythonRuntime && !(environment.label ?? "").contains("/")
+        }
+
+        return nonRepositoryPython.isEmpty ? environments : nonRepositoryPython
+    }
+
+    private func preferredNetworkedSelfContainedEnvironmentPool(
+        from environments: [CloudTaskEnvironment]
+    ) -> [CloudTaskEnvironment] {
+        let codexNetworkedPython = environments.filter { environment in
+            environment.hasPythonRuntime
+                && environment.agentNetworkAccess?.mode?.lowercased() == "on"
+                && environment.agentNetworkAccess?.presetAllowlist?.lowercased() == "codex"
+        }
+
+        if !codexNetworkedPython.isEmpty {
+            return codexNetworkedPython
+        }
+
+        let nonRepositoryNetworkedPython = environments.filter { environment in
+            environment.hasPythonRuntime
+                && environment.agentNetworkAccess?.mode?.lowercased() == "on"
+                && !(environment.label ?? "").contains("/")
+        }
+
+        if !nonRepositoryNetworkedPython.isEmpty {
+            return nonRepositoryNetworkedPython
+        }
+
+        let networkEnabled = environments.filter { $0.agentNetworkAccess?.mode?.lowercased() == "on" }
+        return networkEnabled.isEmpty ? environments : networkEnabled
     }
 
     private func decodeTaskID(from data: Data) throws -> String {
@@ -1808,10 +1863,10 @@ final class OpenAIService: ObservableObject {
                 score += 500
             }
 
-            if preset == "all" {
-                score += 150
-            } else if preset == "codex" {
-                score += 75
+            if preset == "codex" {
+                score += 350
+            } else if preset == "all" {
+                score += 50
             }
 
             if label.contains("/") {
@@ -1833,10 +1888,10 @@ final class OpenAIService: ObservableObject {
                 score -= 8_000
             }
 
-            if preset == "all" {
-                score += 150
-            } else if preset == "codex" {
-                score += 75
+            if preset == "codex" {
+                score += 750
+            } else if preset == "all" {
+                score += 50
             }
 
             if label.contains("/") {
@@ -3013,7 +3068,7 @@ private enum OpenAIWorkload {
     }
 }
 
-private enum CloudTaskEnvironmentPreference {
+private enum CloudTaskEnvironmentPreference: String, Codable {
     case repositoryBound
     case selfContainedBundle
     case networkedSelfContained
@@ -3056,12 +3111,36 @@ private actor OpenAIModelRouter {
 }
 
 private actor OpenAIEnvironmentRouter {
+    private struct PersistedState: Codable {
+        let repositoryBoundEnvironment: CloudTaskEnvironment?
+        let selfContainedBundleEnvironment: CloudTaskEnvironment?
+        let networkedSelfContainedEnvironment: CloudTaskEnvironment?
+        let repositoryBoundQuarantine: [String: Date]
+        let selfContainedBundleQuarantine: [String: Date]
+        let networkedSelfContainedQuarantine: [String: Date]
+    }
+
+    private let defaults: UserDefaults
+    private let stateKey = "com.vineet.sidekick.openai-environment-router"
     private var repositoryBoundEnvironment: CloudTaskEnvironment?
     private var selfContainedBundleEnvironment: CloudTaskEnvironment?
     private var networkedSelfContainedEnvironment: CloudTaskEnvironment?
     private var repositoryBoundQuarantine: [String: Date] = [:]
     private var selfContainedBundleQuarantine: [String: Date] = [:]
     private var networkedSelfContainedQuarantine: [String: Date] = [:]
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+
+        let persisted = Self.loadPersistedState(from: defaults)
+        let now = Date()
+        repositoryBoundEnvironment = persisted?.repositoryBoundEnvironment
+        selfContainedBundleEnvironment = persisted?.selfContainedBundleEnvironment
+        networkedSelfContainedEnvironment = persisted?.networkedSelfContainedEnvironment
+        repositoryBoundQuarantine = (persisted?.repositoryBoundQuarantine ?? [:]).filter { $0.value > now }
+        selfContainedBundleQuarantine = (persisted?.selfContainedBundleQuarantine ?? [:]).filter { $0.value > now }
+        networkedSelfContainedQuarantine = (persisted?.networkedSelfContainedQuarantine ?? [:]).filter { $0.value > now }
+    }
 
     func cached(for preference: CloudTaskEnvironmentPreference) -> CloudTaskEnvironment? {
         switch preference {
@@ -3078,11 +3157,16 @@ private actor OpenAIEnvironmentRouter {
         switch preference {
         case .repositoryBound:
             repositoryBoundEnvironment = environment
+            repositoryBoundQuarantine.removeValue(forKey: environment.id)
         case .selfContainedBundle:
             selfContainedBundleEnvironment = environment
+            selfContainedBundleQuarantine.removeValue(forKey: environment.id)
         case .networkedSelfContained:
             networkedSelfContainedEnvironment = environment
+            networkedSelfContainedQuarantine.removeValue(forKey: environment.id)
         }
+
+        persistState()
     }
 
     func quarantine(
@@ -3109,6 +3193,8 @@ private actor OpenAIEnvironmentRouter {
                 networkedSelfContainedEnvironment = nil
             }
         }
+
+        persistState()
     }
 
     func quarantinedIDs(for preference: CloudTaskEnvironmentPreference) -> Set<String> {
@@ -3125,9 +3211,50 @@ private actor OpenAIEnvironmentRouter {
     }
 
     private func pruneExpiredQuarantines(now: Date) {
-        repositoryBoundQuarantine = repositoryBoundQuarantine.filter { $0.value > now }
-        selfContainedBundleQuarantine = selfContainedBundleQuarantine.filter { $0.value > now }
-        networkedSelfContainedQuarantine = networkedSelfContainedQuarantine.filter { $0.value > now }
+        let prunedRepositoryBound = repositoryBoundQuarantine.filter { $0.value > now }
+        let prunedSelfContained = selfContainedBundleQuarantine.filter { $0.value > now }
+        let prunedNetworked = networkedSelfContainedQuarantine.filter { $0.value > now }
+        let didChange =
+            prunedRepositoryBound != repositoryBoundQuarantine
+            || prunedSelfContained != selfContainedBundleQuarantine
+            || prunedNetworked != networkedSelfContainedQuarantine
+
+        repositoryBoundQuarantine = prunedRepositoryBound
+        selfContainedBundleQuarantine = prunedSelfContained
+        networkedSelfContainedQuarantine = prunedNetworked
+
+        if didChange {
+            persistState()
+        }
+    }
+
+    private func persistState() {
+        let state = PersistedState(
+            repositoryBoundEnvironment: repositoryBoundEnvironment,
+            selfContainedBundleEnvironment: selfContainedBundleEnvironment,
+            networkedSelfContainedEnvironment: networkedSelfContainedEnvironment,
+            repositoryBoundQuarantine: repositoryBoundQuarantine,
+            selfContainedBundleQuarantine: selfContainedBundleQuarantine,
+            networkedSelfContainedQuarantine: networkedSelfContainedQuarantine
+        )
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+
+        guard let data = try? encoder.encode(state) else {
+            return
+        }
+
+        defaults.set(data, forKey: stateKey)
+    }
+
+    private static func loadPersistedState(from defaults: UserDefaults) -> PersistedState? {
+        guard let data = defaults.data(forKey: "com.vineet.sidekick.openai-environment-router") else {
+            return nil
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return try? decoder.decode(PersistedState.self, from: data)
     }
 }
 
@@ -3190,7 +3317,7 @@ private struct PaperResponseFigure: Decodable {
     }
 }
 
-private struct CloudTaskEnvironment: Decodable {
+private struct CloudTaskEnvironment: Codable {
     let id: String
     let label: String?
     let isPinned: Bool?
@@ -3212,7 +3339,7 @@ private struct CloudTaskEnvironment: Decodable {
     }
 }
 
-private struct CloudTaskAgentNetworkAccess: Decodable {
+private struct CloudTaskAgentNetworkAccess: Codable {
     let mode: String?
     let presetAllowlist: String?
 

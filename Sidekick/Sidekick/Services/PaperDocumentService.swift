@@ -1,5 +1,6 @@
 import Foundation
 import UIKit
+import WebKit
 
 @MainActor
 enum PaperDocumentService {
@@ -17,7 +18,7 @@ enum PaperDocumentService {
         }
     }
 
-    private static let renderVersion = 6
+    private static let renderVersion = 9
 
     static func ensurePDF(for paper: Paper) async throws -> URL {
         try await ensureRenderedBundle(for: paper).pdfURL
@@ -42,6 +43,11 @@ enum PaperDocumentService {
 
     private static func ensureRenderedBundle(for paper: Paper) async throws -> PaperArtifactStore.RenderedPaperBundle {
         let taskID = artifactKey(for: paper)
+        let plan = PaperArtifactStore.stageArtifact(
+            ResearchPlanArtifact.self,
+            runID: taskID,
+            stage: .plan
+        )
         let analysis = PaperArtifactStore.stageArtifact(
             ResearchAnalysisArtifact.self,
             runID: taskID,
@@ -85,9 +91,19 @@ enum PaperDocumentService {
         }
 
         print("[PaperDocs] rendering bundle task=\(taskID)")
-        let html = PaperHTMLBuilder.html(for: paper, figureCaptions: figureCaptions)
-        let latex = ExportService.latexDocument(for: paper, figureCaptions: figureCaptions)
-        let pdfData = try renderPDF(from: html)
+        let html = PaperHTMLBuilder.html(
+            for: paper,
+            figureCaptions: figureCaptions,
+            plan: plan,
+            analysis: analysis
+        )
+        let latex = ExportService.latexDocument(
+            for: paper,
+            figureCaptions: figureCaptions,
+            plan: plan,
+            analysis: analysis
+        )
+        let pdfData = try await renderPDF(from: html)
 
         return try PaperArtifactStore.persistRenderedBundle(
             taskID: taskID,
@@ -133,9 +149,27 @@ enum PaperDocumentService {
         paper.updatedAt = originalUpdatedAt
     }
 
-    private static func renderPDF(from html: String) throws -> Data {
+    private static func renderPDF(from html: String) async throws -> Data {
         print("[PaperDocs] renderPDF start html_chars=\(html.count)")
-        let formatter = UIMarkupTextPrintFormatter(markupText: html)
+        let webView = WKWebView(frame: CGRect(x: 0, y: 0, width: 612, height: 792))
+        webView.isOpaque = false
+        webView.backgroundColor = .white
+        webView.scrollView.backgroundColor = .white
+        webView.scrollView.isScrollEnabled = false
+
+        let navigationDelegate = PaperRenderNavigationDelegate()
+        webView.navigationDelegate = navigationDelegate
+        webView.loadHTMLString(html, baseURL: nil)
+
+        do {
+            try await navigationDelegate.waitForLoad()
+            try await waitForWebContentReady(in: webView)
+        } catch {
+            print("[PaperDocs] renderPDF web load failed error=\(error.localizedDescription)")
+            throw DocumentError.renderFailed
+        }
+
+        let formatter = webView.viewPrintFormatter()
         let renderer = PagedPaperRenderer()
         renderer.addPrintFormatter(formatter, startingAtPageAt: 0)
 
@@ -156,11 +190,84 @@ enum PaperDocumentService {
         print("[PaperDocs] renderPDF done bytes=\(data.length) pages=\(renderer.numberOfPages)")
         return data as Data
     }
+
+    private static func waitForWebContentReady(in webView: WKWebView) async throws {
+        for _ in 0 ..< 60 {
+            let readyState = try await webView.evaluateJavaScript("document.readyState") as? String
+            let imagesReady = try await webView.evaluateJavaScript(
+                "Array.from(document.images || []).every(img => img.complete)"
+            ) as? Bool
+
+            if readyState == "complete", imagesReady ?? true {
+                return
+            }
+
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+
+        throw DocumentError.renderFailed
+    }
+}
+
+private final class PaperRenderNavigationDelegate: NSObject, WKNavigationDelegate {
+    private enum LoadState {
+        case idle
+        case waiting(CheckedContinuation<Void, Error>)
+        case finished
+    }
+
+    private var state: LoadState = .idle
+
+    func waitForLoad() async throws {
+        if case .finished = state {
+            return
+        }
+
+        try await withCheckedThrowingContinuation { continuation in
+            state = .waiting(continuation)
+        }
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard case let .waiting(continuation) = state else {
+            state = .finished
+            return
+        }
+
+        state = .finished
+        continuation.resume()
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFail navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        failLoad(with: error)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        failLoad(with: error)
+    }
+
+    private func failLoad(with error: Error) {
+        guard case let .waiting(continuation) = state else {
+            state = .finished
+            return
+        }
+
+        state = .finished
+        continuation.resume(throwing: error)
+    }
 }
 
 private final class PagedPaperRenderer: UIPrintPageRenderer {
     private let resolvedPaperRect = CGRect(x: 0, y: 0, width: 612, height: 792)
-    private let resolvedPrintableRect = CGRect(x: 36, y: 36, width: 540, height: 720)
+    private let resolvedPrintableRect = CGRect(x: 47, y: 48, width: 518, height: 690)
 
     override var paperRect: CGRect {
         resolvedPaperRect
@@ -168,5 +275,54 @@ private final class PagedPaperRenderer: UIPrintPageRenderer {
 
     override var printableRect: CGRect {
         resolvedPrintableRect
+    }
+
+    override func drawPage(at pageIndex: Int, in printableRect: CGRect) {
+        super.drawPage(at: pageIndex, in: printableRect)
+        drawMarginWatermark()
+        drawPageNumber(pageIndex + 1)
+    }
+
+    private func drawMarginWatermark() {
+        guard let context = UIGraphicsGetCurrentContext() else {
+            return
+        }
+
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 8, weight: .regular),
+            .foregroundColor: UIColor(white: 0.42, alpha: 0.6)
+        ]
+        let text = "Made with Sidekick"
+        let size = (text as NSString).size(withAttributes: attributes)
+
+        context.saveGState()
+        context.translateBy(x: 16, y: resolvedPaperRect.midY)
+        context.rotate(by: -.pi / 2)
+        (text as NSString).draw(
+            in: CGRect(
+                x: -size.width / 2,
+                y: 0,
+                width: size.width,
+                height: size.height
+            ),
+            withAttributes: attributes
+        )
+        context.restoreGState()
+    }
+
+    private func drawPageNumber(_ pageNumber: Int) {
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont(name: "TimesNewRomanPSMT", size: 9) ?? UIFont.systemFont(ofSize: 9),
+            .foregroundColor: UIColor(white: 0.18, alpha: 0.85)
+        ]
+        let text = "\(pageNumber)"
+        let size = (text as NSString).size(withAttributes: attributes)
+        let rect = CGRect(
+            x: resolvedPaperRect.midX - (size.width / 2),
+            y: resolvedPaperRect.maxY - 24,
+            width: size.width,
+            height: size.height
+        )
+        (text as NSString).draw(in: rect, withAttributes: attributes)
     }
 }
