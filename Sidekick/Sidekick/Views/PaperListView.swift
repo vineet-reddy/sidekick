@@ -105,6 +105,7 @@ struct PaperListView: View {
 
     private func paperCard(for paper: Paper) -> some View {
         let run = runsByPaperID[paper.id]
+        let shouldShowSummary = !(paper.status == .generating && paper.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
@@ -127,7 +128,7 @@ struct PaperListView: View {
                 Spacer()
             }
 
-            if !paper.summary.isEmpty {
+            if shouldShowSummary, !paper.summary.isEmpty {
                 Text(paper.summary)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)

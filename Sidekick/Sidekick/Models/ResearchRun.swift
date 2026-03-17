@@ -255,8 +255,10 @@ final class ResearchRun {
         switch status {
         case .queued:
             switch queueState {
-            case .queued, .held:
+            case .queued:
                 return "Queued"
+            case .held:
+                return "Held"
             case .waitingForCurrentPaper:
                 return "Waiting"
             case .nextInLine:

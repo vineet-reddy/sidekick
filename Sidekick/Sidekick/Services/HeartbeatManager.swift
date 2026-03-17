@@ -2984,12 +2984,23 @@ final class HeartbeatManager: ObservableObject {
             || isPromotableExploratoryCluster(cluster)
     }
 
+    private func selectedPresentationClusters(from clusters: [NoteCluster]) -> [NoteCluster] {
+        deduplicatedClusters(
+            from: clusters.filter { !$0.suggestedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        )
+    }
+
     private func selectedSubmissionClusters(from clusters: [NoteCluster]) -> [NoteCluster] {
+        deduplicatedClusters(
+            from: clusters.filter(isSubmissionCandidate)
+        )
+    }
+
+    private func deduplicatedClusters(from clusters: [NoteCluster]) -> [NoteCluster] {
         let candidates = clusters
-            .filter(isSubmissionCandidate)
             .sorted { lhs, rhs in
-                let lhsPriority = submissionPriorityScore(for: lhs)
-                let rhsPriority = submissionPriorityScore(for: rhs)
+                let lhsPriority = clusterPriorityScore(for: lhs)
+                let rhsPriority = clusterPriorityScore(for: rhs)
                 if lhsPriority != rhsPriority {
                     return lhsPriority > rhsPriority
                 }
@@ -3036,7 +3047,7 @@ final class HeartbeatManager: ObservableObject {
             }
 
             guard !overlapsExistingSelection else {
-                print("[Heartbeat]   Skipping overlapping cluster \"\(cluster.suggestedTitle)\" to avoid duplicate auto-runs.")
+                print("[Heartbeat]   Skipping overlapping cluster \"\(cluster.suggestedTitle)\" to avoid duplicate paper candidates.")
                 continue
             }
 
@@ -3050,10 +3061,28 @@ final class HeartbeatManager: ObservableObject {
         return selected
     }
 
-    private func submissionPriorityScore(for cluster: NoteCluster) -> Double {
+    private func clusterPriorityScore(for cluster: NoteCluster) -> Double {
         let noteCount = Double(Set(cluster.noteIDs).count)
         let datasetCount = Double(Set(cluster.datasetIDs).count)
-        let readinessBonus: Double = cluster.isAutomaticallyRunnable ? 40 : 30
+        let readinessBonus: Double
+
+        if cluster.isAutomaticallyRunnable {
+            readinessBonus = 48
+        } else if isPromotableTrustedPartialCluster(cluster) {
+            readinessBonus = 38
+        } else if isPromotableExploratoryCluster(cluster) {
+            readinessBonus = 34
+        } else {
+            switch cluster.readinessMode {
+            case .trustedReady:
+                readinessBonus = 32
+            case .trustedPartial:
+                readinessBonus = 24
+            case .exploratoryReady:
+                readinessBonus = 18
+            }
+        }
+
         let noteCoverageBonus = min(noteCount, 4.0) * 12
         let datasetPenalty = max(0, datasetCount - 1) * 2
 
@@ -3082,16 +3111,21 @@ final class HeartbeatManager: ObservableObject {
         }
 
         let clusters = try await assessNotesWithRescue(notes)
-        let runnableClusters = selectedSubmissionClusters(from: clusters)
+        let surfacedClusters = selectedPresentationClusters(from: clusters)
+        let runnableClusters = surfacedClusters.filter(isSubmissionCandidate)
+        let heldClusters = surfacedClusters.filter { !isSubmissionCandidate($0) }
         let promotedClusters = runnableClusters.filter { isPromotableTrustedPartialCluster($0) && !$0.isAutomaticallyRunnable }
         print(
             "[Heartbeat] Got \(clusters.count) cluster(s). " +
+                "Surfaced candidates: \(surfacedClusters.count). " +
                 "Submission candidates: \(runnableClusters.count). " +
+                "Held candidates: \(heldClusters.count). " +
                 "Promoted partial clusters: \(promotedClusters.count)"
         )
 
         var submitted = 0
-        for cluster in runnableClusters {
+        for cluster in surfacedClusters {
+            let shouldAutoStart = isSubmissionCandidate(cluster)
             let clusterNotes = notes.filter { cluster.noteIDs.contains($0.id) }
             guard !clusterNotes.isEmpty else {
                 continue
@@ -3128,11 +3162,16 @@ final class HeartbeatManager: ObservableObject {
             }
 
             phase = .submittingPaper(cluster.suggestedTitle)
-            print("[Heartbeat]   Starting staged research run: \"\(cluster.suggestedTitle)\"...")
+            if shouldAutoStart {
+                print("[Heartbeat]   Starting staged research run: \"\(cluster.suggestedTitle)\"...")
+            } else {
+                print("[Heartbeat]   Holding staged research candidate: \"\(cluster.suggestedTitle)\"...")
+            }
             try await beginResearchRun(
                 cluster: cluster,
                 notes: clusterNotes,
-                modelContext: modelContext
+                modelContext: modelContext,
+                forceHold: !shouldAutoStart
             )
 
             submitted += 1
@@ -3213,13 +3252,21 @@ final class HeartbeatManager: ObservableObject {
     private func beginResearchRun(
         cluster: NoteCluster,
         notes: [Note],
-        modelContext: ModelContext
+        modelContext: ModelContext,
+        forceHold: Bool = false
     ) async throws {
         let preparation = try await openAI.prepareResearchRun(
             notes: notes,
             title: cluster.suggestedTitle,
             theme: cluster.theme,
             datasetIDs: cluster.datasetIDs
+        )
+        let schedulingDisposition: ResearchRunSchedulingDisposition = forceHold ? .hold : preparation.schedulingDisposition
+        let initialQueueState: ResearchRunQueueState = schedulingDisposition == .autoStart ? .queued : .held
+        let initialStatusMessage = initialResearchRunMessage(
+            for: cluster,
+            preparation: preparation,
+            forceHold: forceHold
         )
         let runIDPrefix = preparation.draftArtifact == nil ? "run" : "local"
         let runID = "\(runIDPrefix)-\(UUID().uuidString)"
@@ -3242,16 +3289,16 @@ final class HeartbeatManager: ObservableObject {
             currentStage: initialStage,
             status: .queued,
             executionBackend: .automatic,
-            queueState: preparation.schedulingDisposition == .autoStart ? .queued : .held,
-            schedulingDisposition: preparation.schedulingDisposition,
+            queueState: initialQueueState,
+            schedulingDisposition: schedulingDisposition,
             sourceSupportTier: preparation.sourceSupportTier
         )
 
         modelContext.insert(paper)
         modelContext.insert(run)
         run.markQueued(
-            message: preparation.initialStatusMessage,
-            queueState: preparation.schedulingDisposition == .autoStart ? .queued : .held
+            message: initialStatusMessage,
+            queueState: initialQueueState
         )
         try persistModelChanges(in: modelContext)
 
@@ -3276,6 +3323,33 @@ final class HeartbeatManager: ObservableObject {
         }
 
         print("[Heartbeat]   -> Research run ID: \(runID)")
+    }
+
+    private func initialResearchRunMessage(
+        for cluster: NoteCluster,
+        preparation: ResearchRunPreparation,
+        forceHold: Bool
+    ) -> String {
+        guard forceHold else {
+            return preparation.initialStatusMessage
+        }
+
+        if preparation.schedulingDisposition == .hold {
+            return preparation.initialStatusMessage
+        }
+
+        switch cluster.readinessMode {
+        case .trustedReady:
+            return preparation.initialStatusMessage
+        case .trustedPartial:
+            if Set(cluster.noteIDs).count <= 1 {
+                return "Potential paper identified, but this note is still too partial to auto-start. Kept held until more context or a tighter question arrives."
+            }
+
+            return "Potential paper identified, but the notes are still partial. Kept held until the question is better bounded."
+        case .exploratoryReady:
+            return "Potential paper identified, but Sidekick still needs a stronger reliable source-family fit before starting it."
+        }
     }
 }
 
