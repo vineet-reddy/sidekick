@@ -183,7 +183,7 @@ nonisolated struct TrustedDataset: Codable, Hashable, Sendable {
         case "brfss-2015-github-mirror", "cbioportal-public", "nci-gdc-api", "mast-observations":
             return .supported
         case "cellxgene-discover":
-            return .experimental
+            return .disabled
         default:
             return .experimental
         }
@@ -548,12 +548,19 @@ actor TrustedDatasetRegistry {
     }
 
     private static func loadInitialCatalog() -> TrustedDatasetCatalog {
-        if let cached = loadCatalog(from: cacheFileURL()) {
-            return cached
+        let cached = loadCatalog(from: cacheFileURL())
+        let bundled = loadCatalog(from: Bundle.main.url(forResource: "trusted_datasets", withExtension: "json"))
+
+        if let cached, let bundled {
+            return bundled.version >= cached.version ? bundled : cached
         }
 
-        if let bundled = loadCatalog(from: Bundle.main.url(forResource: "trusted_datasets", withExtension: "json")) {
+        if let bundled {
             return bundled
+        }
+
+        if let cached {
+            return cached
         }
 
         print("[TrustedDatasets] Missing bundled registry. Falling back to an empty catalog.")

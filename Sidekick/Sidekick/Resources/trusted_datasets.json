@@ -269,7 +269,7 @@
       "entry_type": "direct_source",
       "status": "trusted",
       "trust_tier": "official",
-      "support_tier": "experimental",
+      "support_tier": "disabled",
       "source_type": "portal",
       "title": "CZ CELLxGENE Discover",
       "handle": "https://cellxgene.cziscience.com/",
