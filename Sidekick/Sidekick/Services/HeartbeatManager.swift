@@ -44,19 +44,21 @@ final class HeartbeatManager: ObservableObject {
     private let lastRunKey = "com.vineet.sidekick.lastHeartbeatAt"
     private let cooldown: TimeInterval = 20 * 60
     private let remoteRetryGracePeriod: TimeInterval = 8 * 60
-    private let remoteNoSignalRetryGracePeriod: TimeInterval = 5 * 60
+    private let remoteNoSignalRetryGracePeriod: TimeInterval = 2 * 60
     private let bundledRemoteRetryGracePeriod: TimeInterval = 5 * 60
     private let failedPaperRetryCooldown: TimeInterval = 20 * 60
     private let deadBundledTaskGracePeriod: TimeInterval = 2 * 60
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
     private let maxResearchStageAttempts = 3
+    private let maxNoSignalRemoteTaskRestartsPerStage = 1
     private let maxAnalysisRevisionCycles = 6
     private let maxNoteAssessmentPasses = 3
     private let maxConcurrentOAuthRemoteRuns = 1
     private let maxConcurrentAPIKeyRemoteRuns = 2
     private let analysisRevisionCycleAttemptKey = "analysis_revision_cycle"
     private let analysisRevisionCycleLimitMessage = "Analysis revision cycles exceeded the retry budget."
+    private let noSignalRemoteRetryAttemptKeyPrefix = "no_signal_remote_retry"
 
     init(
         openAI: OpenAIService,
@@ -923,7 +925,26 @@ final class HeartbeatManager: ObservableObject {
                 }
 
                 if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .inspect) {
-                    print("[Heartbeat]   -> Inspect stage stalled for \(run.runID); restarting from checkpoint.")
+                    let noSignalTask = isNoSignalRemoteTask(snapshot)
+                    if noSignalTask {
+                        let restartCount = incrementNoSignalRestartCount(for: run, stage: .inspect)
+                        await quarantineEnvironmentForSilentTask(snapshot)
+                        guard restartCount <= maxNoSignalRemoteTaskRestartsPerStage else {
+                            print("[Heartbeat]   -> Inspect stage for \(run.runID) exhausted the silent-worker budget; moving on.")
+                            markResearchRunFailed(
+                                run,
+                                paper: paper,
+                                message: noSignalFailureMessage(for: .inspect)
+                            )
+                            return
+                        }
+
+                        print("[Heartbeat]   -> Inspect stage for \(run.runID) never emitted progress; retrying on a fresh worker.")
+                    } else {
+                        resetNoSignalRestartCount(for: run, stage: .inspect)
+                        print("[Heartbeat]   -> Inspect stage stalled for \(run.runID); restarting from checkpoint.")
+                    }
+
                     run.activeTaskID = nil
                     refundRetryBudgetIfNeeded(run: run, stage: .inspect, snapshot: snapshot)
 
@@ -943,7 +964,13 @@ final class HeartbeatManager: ObservableObject {
                         return
                     }
 
-                    try await startResearchInspectionTask(run, paper: paper, notes: notes, plan: plan)
+                    try await startResearchInspectionTask(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        preserveNoSignalRestartBudget: noSignalTask
+                    )
                 }
 
             case let .completed(snapshot, artifact):
@@ -1047,7 +1074,8 @@ final class HeartbeatManager: ObservableObject {
         _ run: ResearchRun,
         paper: Paper,
         notes: [Note],
-        plan: ResearchPlanArtifact
+        plan: ResearchPlanArtifact,
+        preserveNoSignalRestartBudget: Bool = false
     ) async throws {
         guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
             markResearchRunFailed(
@@ -1056,6 +1084,10 @@ final class HeartbeatManager: ObservableObject {
                 message: "Dataset inspection exceeded the retry budget."
             )
             return
+        }
+
+        if !preserveNoSignalRestartBudget {
+            resetNoSignalRestartCount(for: run, stage: .inspect)
         }
 
         let shouldUseBundledFallback = await prefersBundledResearchFallback(run: run, notes: notes)
@@ -1235,7 +1267,26 @@ final class HeartbeatManager: ObservableObject {
                 }
 
                 if shouldRestartResearchTask(run: run, snapshot: snapshot, stage: .analyze) {
-                    print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
+                    let noSignalTask = isNoSignalRemoteTask(snapshot)
+                    if noSignalTask {
+                        let restartCount = incrementNoSignalRestartCount(for: run, stage: .analyze)
+                        await quarantineEnvironmentForSilentTask(snapshot)
+                        guard restartCount <= maxNoSignalRemoteTaskRestartsPerStage else {
+                            print("[Heartbeat]   -> Analysis stage for \(run.runID) exhausted the silent-worker budget; moving on.")
+                            markResearchRunFailed(
+                                run,
+                                paper: paper,
+                                message: noSignalFailureMessage(for: .analyze)
+                            )
+                            return
+                        }
+
+                        print("[Heartbeat]   -> Analysis stage for \(run.runID) never emitted progress; retrying on a fresh worker.")
+                    } else {
+                        resetNoSignalRestartCount(for: run, stage: .analyze)
+                        print("[Heartbeat]   -> Analysis stage stalled for \(run.runID); restarting from checkpoint.")
+                    }
+
                     run.activeTaskID = nil
                     refundRetryBudgetIfNeeded(run: run, stage: .analyze, snapshot: snapshot)
 
@@ -1281,7 +1332,8 @@ final class HeartbeatManager: ObservableObject {
                         notes: notes,
                         plan: plan,
                         inspection: inspection,
-                        revisionRequest: revisionRequest
+                        revisionRequest: revisionRequest,
+                        preserveNoSignalRestartBudget: noSignalTask
                     )
                 }
 
@@ -1472,7 +1524,8 @@ final class HeartbeatManager: ObservableObject {
         notes: [Note],
         plan: ResearchPlanArtifact,
         inspection: ResearchInspectionArtifact,
-        revisionRequest: ResearchVerificationArtifact?
+        revisionRequest: ResearchVerificationArtifact?,
+        preserveNoSignalRestartBudget: Bool = false
     ) async throws {
         let isRevisionRetry = revisionRequest != nil
 
@@ -1483,6 +1536,10 @@ final class HeartbeatManager: ObservableObject {
                 message: "Analysis exceeded the retry budget."
             )
             return
+        }
+
+        if !preserveNoSignalRestartBudget {
+            resetNoSignalRestartCount(for: run, stage: .analyze)
         }
 
         let shouldUseBundledFallback: Bool
@@ -1759,6 +1816,8 @@ final class HeartbeatManager: ObservableObject {
         plan: ResearchPlanArtifact,
         incrementAttempt: Bool
     ) async throws {
+        resetNoSignalRestartCount(for: run, stage: .inspect)
+
         if incrementAttempt {
             guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
                 markResearchRunFailed(
@@ -1816,6 +1875,8 @@ final class HeartbeatManager: ObservableObject {
         plan: ResearchPlanArtifact,
         incrementAttempt: Bool
     ) async throws {
+        resetNoSignalRestartCount(for: run, stage: .inspect)
+
         if incrementAttempt {
             guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
                 markResearchRunFailed(
@@ -1893,6 +1954,8 @@ final class HeartbeatManager: ObservableObject {
         revisionRequest: ResearchVerificationArtifact?,
         incrementAttempt: Bool
     ) async throws {
+        resetNoSignalRestartCount(for: run, stage: .analyze)
+
         if incrementAttempt {
             guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
                 markResearchRunFailed(
@@ -1954,6 +2017,8 @@ final class HeartbeatManager: ObservableObject {
         revisionRequest: ResearchVerificationArtifact?,
         incrementAttempt: Bool
     ) async throws {
+        resetNoSignalRestartCount(for: run, stage: .analyze)
+
         if incrementAttempt {
             guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
                 markResearchRunFailed(
@@ -2068,6 +2133,39 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.decrementAttempt(for: stage)
+    }
+
+    private func noSignalRetryAttemptKey(for stage: ResearchRunStage) -> String {
+        "\(noSignalRemoteRetryAttemptKeyPrefix):\(stage.rawValue)"
+    }
+
+    private func incrementNoSignalRestartCount(
+        for run: ResearchRun,
+        stage: ResearchRunStage
+    ) -> Int {
+        let key = noSignalRetryAttemptKey(for: stage)
+        run.incrementAttempt(forKey: key)
+        return run.attemptCount(forKey: key)
+    }
+
+    private func resetNoSignalRestartCount(
+        for run: ResearchRun,
+        stage: ResearchRunStage
+    ) {
+        run.resetAttemptCount(forKey: noSignalRetryAttemptKey(for: stage))
+    }
+
+    private func noSignalFailureMessage(for stage: ResearchRunStage) -> String {
+        "The ChatGPT remote worker stayed silent while \(stage.title.lowercased()) on two fresh attempts, so Sidekick moved on to the next queued paper. Retry this paper later."
+    }
+
+    private func quarantineEnvironmentForSilentTask(_ snapshot: PaperTaskProgressSnapshot) async {
+        let networkMode = snapshot.environmentNetworkMode?.lowercased() ?? ""
+        if networkMode == "off" {
+            await openAI.quarantineSelfContainedBundleEnvironment(snapshot.environmentID)
+        } else {
+            await openAI.quarantineRepositoryBoundEnvironment(snapshot.environmentID)
+        }
     }
 
     private func isNoSignalRemoteTask(_ snapshot: PaperTaskProgressSnapshot) -> Bool {

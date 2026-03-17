@@ -567,6 +567,15 @@ final class OpenAIService: ObservableObject {
         await environmentRouter.quarantine(environmentID, for: .selfContainedBundle)
     }
 
+    func quarantineRepositoryBoundEnvironment(_ environmentID: String?) async {
+        guard let environmentID,
+              !environmentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return
+        }
+
+        await environmentRouter.quarantine(environmentID, for: .repositoryBound)
+    }
+
     func quarantineNetworkedSelfContainedEnvironment(_ environmentID: String?) async {
         guard let environmentID,
               !environmentID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
@@ -1717,6 +1726,7 @@ final class OpenAIService: ObservableObject {
     ) async throws -> String {
         let environments = try await candidateEnvironments(for: preference)
         let branch = taskBranch(for: preference)
+        let workerPrompt = queuedRemoteTaskPrompt(from: prompt)
         var lastError: Error?
         var skippedLabels: [String] = []
 
@@ -1735,7 +1745,7 @@ final class OpenAIService: ObservableObject {
                         "content": [
                             [
                                 "content_type": "text",
-                                "text": prompt
+                                "text": workerPrompt
                             ]
                         ]
                     ]
@@ -1780,6 +1790,16 @@ final class OpenAIService: ObservableObject {
     private func taskBranch(for _: CloudTaskEnvironmentPreference) -> String {
         // The current task backend requires a branch for every task creation request.
         return resolvedTaskBranch()
+    }
+
+    private func queuedRemoteTaskPrompt(from prompt: String) -> String {
+        """
+        You are running as a queued remote research worker.
+        While the task is active, emit brief plain-text progress updates at major milestones so Sidekick can tell the worker is alive.
+        Keep those progress updates short, avoid braces or JSON, and keep the final assistant message in the exact output format requested by the user.
+
+        \(prompt)
+        """
     }
 
     private func fetchTask(taskID: String) async throws -> CloudTaskDetails {
