@@ -62,6 +62,8 @@ final class OpenAIService: ObservableObject {
     private let apiKeychain = KeychainStore(service: "com.vineet.sidekick.openai-api")
     private let apiKeyAccount = "user-api-key"
     private let qaAPIKeyEnvironmentVariable = "SIDEKICK_QA_OPENAI_API_KEY"
+    private let qaForceNoSignalRemoteTasksEnvironmentVariable = "SIDEKICK_QA_FORCE_NO_SIGNAL_REMOTE_TASKS"
+    private let qaForceNoSignalRemoteTaskAgeSecondsEnvironmentVariable = "SIDEKICK_QA_FORCE_NO_SIGNAL_TASK_AGE_SECONDS"
     private let apiKeyFailureMessageDefaultsKey = "com.vineet.sidekick.openai-api.failure-message"
     private let apiKeyFailureFingerprintDefaultsKey = "com.vineet.sidekick.openai-api.failure-fingerprint"
 
@@ -874,6 +876,10 @@ final class OpenAIService: ObservableObject {
     }
 
     func checkResearchInspectionTask(_ taskID: String) async throws -> ResearchInspectionTaskCheckResult {
+        if let forcedSnapshot = qaForcedNoSignalTaskSnapshot(taskID: taskID) {
+            return .waiting(forcedSnapshot)
+        }
+
         let task = try await fetchTask(taskID: taskID)
         let snapshot = task.progressSnapshot(taskID: taskID)
         persistDebugPayload(Data(task.outputText.utf8), named: "inspection-task-output-\(taskID).txt")
@@ -894,6 +900,10 @@ final class OpenAIService: ObservableObject {
     }
 
     func checkResearchAnalysisTask(_ taskID: String) async throws -> ResearchAnalysisTaskCheckResult {
+        if let forcedSnapshot = qaForcedNoSignalTaskSnapshot(taskID: taskID) {
+            return .waiting(forcedSnapshot)
+        }
+
         let task = try await fetchTask(taskID: taskID)
         let snapshot = task.progressSnapshot(taskID: taskID)
         persistDebugPayload(Data(task.outputText.utf8), named: "analysis-task-output-\(taskID).txt")
@@ -3176,6 +3186,30 @@ final class OpenAIService: ObservableObject {
         }
 
         return value
+    }
+
+    private func qaForcedNoSignalTaskSnapshot(taskID: String) -> PaperTaskProgressSnapshot? {
+        guard ProcessInfo.processInfo.environment[qaForceNoSignalRemoteTasksEnvironmentVariable] == "1" else {
+            return nil
+        }
+
+        let rawAge = ProcessInfo.processInfo.environment[qaForceNoSignalRemoteTaskAgeSecondsEnvironmentVariable] ?? ""
+        let ageSeconds = max(5, Double(rawAge) ?? 125)
+        let createdAt = Date().addingTimeInterval(-ageSeconds)
+
+        return PaperTaskProgressSnapshot(
+            taskID: taskID,
+            status: "in_progress",
+            observedAt: .now,
+            taskCreatedAt: createdAt,
+            assistantTurnCreatedAt: nil,
+            latestEventAt: nil,
+            latestEventText: nil,
+            outputCharacterCount: 0,
+            environmentID: "qa-silent-worker",
+            environmentLabel: "QA silent worker",
+            environmentNetworkMode: "on"
+        )
     }
 
     private func storedAPIKey() -> String? {
