@@ -172,12 +172,25 @@ struct PaperListView: View {
             EmptyView()
         case .generating:
             if let run {
-                StatusPill(title: run.listStatusLabel, tint: SidekickTheme.accent)
+                StatusPill(title: run.listStatusLabel, tint: statusTint(for: run))
             } else {
                 StatusPill(title: "Generating...", tint: SidekickTheme.accent)
             }
         case .failed:
             StatusPill(title: "Needs retry", tint: .red)
+        }
+    }
+
+    private func statusTint(for run: ResearchRun) -> Color {
+        switch run.status {
+        case .queued:
+            return run.queueState == .held ? .orange : .secondary
+        case .running:
+            return SidekickTheme.accent
+        case .completed:
+            return .green
+        case .failed:
+            return .red
         }
     }
 }

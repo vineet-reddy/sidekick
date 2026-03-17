@@ -143,6 +143,7 @@ struct AppShellView: View {
     @Environment(\.modelContext) private var modelContext
     @Environment(\.scenePhase) private var scenePhase
     @Query(sort: \Paper.updatedAt, order: .reverse) private var papers: [Paper]
+    @Query(sort: \ResearchRun.updatedAt, order: .reverse) private var runs: [ResearchRun]
 
     @EnvironmentObject private var heartbeat: HeartbeatManager
     @EnvironmentObject private var notifications: NotificationService
@@ -194,7 +195,17 @@ struct AppShellView: View {
     }
 
     private var inFlightPaperCount: Int {
-        papers.filter { $0.status == .generating }.count
+        let activePaperIDs = Set(
+            runs.compactMap { run in
+                (run.status == .running || run.isSchedulerEligible) ? run.paperID : nil
+            }
+        )
+        let trackedRunPaperIDs = Set(runs.map(\.paperID))
+        let untrackedGeneratingCount = papers.filter { paper in
+            paper.status == .generating && !trackedRunPaperIDs.contains(paper.id)
+        }.count
+
+        return activePaperIDs.count + untrackedGeneratingCount
     }
 
     private var foregroundHeartbeatTaskKey: String {

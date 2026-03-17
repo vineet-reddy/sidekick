@@ -37,6 +37,35 @@ enum ResearchRunStatus: String, Codable {
     case failed
 }
 
+enum ResearchExecutionBackend: String, Codable {
+    case automatic
+    case chatGPTOAuth = "chatgpt_oauth"
+    case openAIAPIKey = "openai_api_key"
+
+    var title: String {
+        switch self {
+        case .automatic:
+            return "Automatic"
+        case .chatGPTOAuth:
+            return "ChatGPT"
+        case .openAIAPIKey:
+            return "API key"
+        }
+    }
+}
+
+enum ResearchRunQueueState: String, Codable {
+    case queued
+    case waitingForCurrentPaper = "waiting_for_current_paper"
+    case nextInLine = "next_in_line"
+    case held
+}
+
+enum ResearchRunSchedulingDisposition: String, Codable {
+    case autoStart = "auto_start"
+    case hold
+}
+
 enum ResearchRunPipelineStepState {
     case pending
     case active
@@ -58,6 +87,10 @@ final class ResearchRun {
     var registryVersion: Int
     var stageRaw: String
     var statusRaw: String
+    var executionBackendRaw: String?
+    var queueStateRaw: String?
+    var schedulingDispositionRaw: String?
+    var sourceSupportTierRaw: String?
     var activeTaskID: String?
     var lastError: String?
     var latestProgressMessage: String?
@@ -78,6 +111,10 @@ final class ResearchRun {
         registryVersion: Int,
         currentStage: ResearchRunStage = .plan,
         status: ResearchRunStatus = .queued,
+        executionBackend: ResearchExecutionBackend = .automatic,
+        queueState: ResearchRunQueueState = .queued,
+        schedulingDisposition: ResearchRunSchedulingDisposition = .autoStart,
+        sourceSupportTier: TrustedDatasetSupportTier = .experimental,
         activeTaskID: String? = nil,
         stageAttempts: [String: Int] = [:],
         lastError: String? = nil,
@@ -99,6 +136,10 @@ final class ResearchRun {
         self.registryVersion = registryVersion
         self.stageRaw = currentStage.rawValue
         self.statusRaw = status.rawValue
+        self.executionBackendRaw = executionBackend.rawValue
+        self.queueStateRaw = queueState.rawValue
+        self.schedulingDispositionRaw = schedulingDisposition.rawValue
+        self.sourceSupportTierRaw = sourceSupportTier.rawValue
         self.activeTaskID = activeTaskID
         self.lastError = lastError
         self.latestProgressMessage = latestProgressMessage
@@ -159,8 +200,51 @@ final class ResearchRun {
         }
     }
 
+    var executionBackend: ResearchExecutionBackend {
+        get {
+            if let raw = executionBackendRaw,
+               let backend = ResearchExecutionBackend(rawValue: raw) {
+                return backend
+            }
+
+            return status == .queued ? .automatic : .chatGPTOAuth
+        }
+        set {
+            executionBackendRaw = newValue.rawValue
+            touch()
+        }
+    }
+
+    var queueState: ResearchRunQueueState {
+        get { ResearchRunQueueState(rawValue: queueStateRaw ?? "") ?? .queued }
+        set {
+            queueStateRaw = newValue.rawValue
+            touch()
+        }
+    }
+
+    var schedulingDisposition: ResearchRunSchedulingDisposition {
+        get { ResearchRunSchedulingDisposition(rawValue: schedulingDispositionRaw ?? "") ?? .autoStart }
+        set {
+            schedulingDispositionRaw = newValue.rawValue
+            touch()
+        }
+    }
+
+    var sourceSupportTier: TrustedDatasetSupportTier {
+        get { TrustedDatasetSupportTier(rawValue: sourceSupportTierRaw ?? "") ?? .experimental }
+        set {
+            sourceSupportTierRaw = newValue.rawValue
+            touch()
+        }
+    }
+
     var isTerminal: Bool {
         status == .completed || status == .failed
+    }
+
+    var isSchedulerEligible: Bool {
+        status == .queued && schedulingDisposition == .autoStart
     }
 
     var currentStageTitle: String {
@@ -170,7 +254,14 @@ final class ResearchRun {
     var listStatusLabel: String {
         switch status {
         case .queued:
-            return "Queued"
+            switch queueState {
+            case .queued, .held:
+                return "Queued"
+            case .waitingForCurrentPaper:
+                return "Waiting"
+            case .nextInLine:
+                return "Next in line"
+            }
         case .running:
             return currentStage.title
         case .completed:
@@ -233,6 +324,7 @@ final class ResearchRun {
     func markRunning(stage: ResearchRunStage, message: String? = nil, activeTaskID: String? = nil) {
         currentStage = stage
         status = .running
+        queueState = .queued
         self.activeTaskID = activeTaskID
         lastError = nil
         if let message {
@@ -244,6 +336,7 @@ final class ResearchRun {
 
     func markCompleted(message: String? = nil) {
         status = .completed
+        queueState = .queued
         activeTaskID = nil
         lastError = nil
         if let message {
@@ -255,10 +348,26 @@ final class ResearchRun {
 
     func markFailed(message: String) {
         status = .failed
+        queueState = .queued
         activeTaskID = nil
         lastError = message
         latestProgressMessage = message
         latestProgressAt = .now
+        touch()
+    }
+
+    func markQueued(
+        message: String?,
+        queueState: ResearchRunQueueState = .queued
+    ) {
+        status = .queued
+        self.queueState = queueState
+        activeTaskID = nil
+        lastError = nil
+        if let message {
+            latestProgressMessage = message
+            latestProgressAt = .now
+        }
         touch()
     }
 
@@ -278,6 +387,10 @@ final class ResearchRun {
         let orderedStages = ResearchRunStage.allCases
         guard let currentIndex = orderedStages.firstIndex(of: currentStage),
               let targetIndex = orderedStages.firstIndex(of: stage) else {
+            return .pending
+        }
+
+        if status == .queued {
             return .pending
         }
 
@@ -597,6 +710,9 @@ private enum SidekickImageValidator {
     private nonisolated static let minimumForegroundDelta = 12
     private nonisolated static let minimumForegroundPixels = 12
     private nonisolated static let foregroundPixelDivisor = 500
+    private nonisolated static let minimumPrintablePixelArea = 300_000
+    private nonisolated static let minimumPrintableLongestSide = 900
+    private nonisolated static let minimumPrintableShortestSide = 320
 
     nonisolated static func normalizedPNGData(from data: Data) -> Data? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil),
@@ -604,7 +720,8 @@ private enum SidekickImageValidator {
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
               image.width > 0,
               image.height > 0,
-              containsVisibleContent(image) else {
+              containsVisibleContent(image),
+              hasPrintableResolution(image) else {
             return nil
         }
 
@@ -668,6 +785,17 @@ private enum SidekickImageValidator {
         return (maxValue - minValue) >= minimumContrast && nonBackgroundPixels >= minimumForeground
     }
 
+    private nonisolated static func hasPrintableResolution(_ image: CGImage) -> Bool {
+        let width = image.width
+        let height = image.height
+        let longestSide = max(width, height)
+        let shortestSide = min(width, height)
+        let pixelArea = width * height
+
+        return shortestSide >= minimumPrintableShortestSide
+            && (longestSide >= minimumPrintableLongestSide || pixelArea >= minimumPrintablePixelArea)
+    }
+
     private nonisolated static func canonicalPNGData(for image: CGImage) -> Data? {
         let encoded = NSMutableData()
         guard let destination = CGImageDestinationCreateWithData(
@@ -697,6 +825,9 @@ nonisolated struct ResearchRunPreparation {
     let selectedDatasetIDs: [String]
     let allowedDomains: [String]
     let registryVersion: Int
+    let sourceSupportTier: TrustedDatasetSupportTier
+    let schedulingDisposition: ResearchRunSchedulingDisposition
+    let initialStatusMessage: String
     let planArtifact: ResearchPlanArtifact?
     let inspectionArtifact: ResearchInspectionArtifact?
     let analysisArtifact: ResearchAnalysisArtifact?

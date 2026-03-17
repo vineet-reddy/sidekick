@@ -25,7 +25,7 @@ struct PaperDetailView: View {
                     readyPaperView
                 case .generating:
                     progressCard(
-                        title: researchRun?.currentStageTitle ?? "Sidekick is working",
+                        title: detailTitle,
                         message: researchRun?.latestProgressMessage
                             ?? "This paper is still running in the background. The app will notify you when it lands."
                     )
@@ -116,6 +116,23 @@ struct PaperDetailView: View {
 
     private var researchRun: ResearchRun? {
         runs.latestRun(for: paper.id)
+    }
+
+    private var detailTitle: String {
+        guard let researchRun else {
+            return "Sidekick is working"
+        }
+
+        switch researchRun.status {
+        case .queued:
+            return researchRun.listStatusLabel
+        case .running:
+            return researchRun.currentStageTitle
+        case .completed:
+            return "Paper ready"
+        case .failed:
+            return "The paper stalled"
+        }
     }
 
     private func progressCard(title: String, message: String) -> some View {

@@ -2,7 +2,11 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var auth: AuthService
+    @EnvironmentObject private var openAI: OpenAIService
     @EnvironmentObject private var heartbeat: HeartbeatManager
+    @State private var apiKeyDraft = ""
+    @State private var apiKeyStatusMessage: String?
+    @State private var apiKeyStatusIsError = false
 
     var body: some View {
         ZStack {
@@ -28,6 +32,67 @@ struct SettingsView: View {
                         }
                         .buttonStyle(.bordered)
                         .font(.subheadline)
+                    }
+                    .glassCard(padding: 22)
+
+                    VStack(alignment: .leading, spacing: 14) {
+                        Text("OpenAI API Key")
+                            .font(.headline)
+
+                        Text(
+                            openAI.hasUserAPIKeyOverride
+                                ? "API key mode takes priority over the ChatGPT queue and can run multiple remote papers at once."
+                                : "Optional override. If you add your own OpenAI API key, Sidekick will prefer it over the single-file ChatGPT queue."
+                        )
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+
+                        StatusPill(
+                            title: openAI.hasUserAPIKeyOverride ? "API key active" : "Using ChatGPT queue",
+                            tint: openAI.hasUserAPIKeyOverride ? .green : SidekickTheme.accent
+                        )
+
+                        if let hint = openAI.userAPIKeyHint {
+                            Text(hint)
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+
+                        if let errorMessage = openAI.userAPIKeyErrorMessage, !errorMessage.isEmpty {
+                            Text(errorMessage)
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+
+                        SecureField("sk-...", text: $apiKeyDraft)
+                            .textInputAutocapitalization(.never)
+                            .autocorrectionDisabled()
+                            .textContentType(.password)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 12)
+                            .background(.white.opacity(0.72))
+                            .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+
+                        HStack(spacing: 12) {
+                            Button(openAI.hasUserAPIKeyOverride ? "Update key" : "Save key") {
+                                saveAPIKey()
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            if openAI.hasUserAPIKeyOverride {
+                                Button("Remove key", role: .destructive) {
+                                    removeAPIKey()
+                                }
+                                .buttonStyle(.bordered)
+                            }
+                        }
+                        .font(.subheadline)
+
+                        if let apiKeyStatusMessage, !apiKeyStatusMessage.isEmpty {
+                            Text(apiKeyStatusMessage)
+                                .font(.caption)
+                                .foregroundStyle(apiKeyStatusIsError ? .red : .secondary)
+                        }
                     }
                     .glassCard(padding: 22)
 
@@ -62,5 +127,29 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .accessibilityIdentifier("settings.view")
+    }
+
+    private func saveAPIKey() {
+        do {
+            try openAI.saveUserAPIKey(apiKeyDraft)
+            apiKeyDraft = ""
+            apiKeyStatusIsError = false
+            apiKeyStatusMessage = "Stored securely in Keychain. New queued papers will prefer the API path."
+        } catch {
+            apiKeyStatusIsError = true
+            apiKeyStatusMessage = error.localizedDescription
+        }
+    }
+
+    private func removeAPIKey() {
+        do {
+            try openAI.clearUserAPIKey()
+            apiKeyDraft = ""
+            apiKeyStatusIsError = false
+            apiKeyStatusMessage = "Removed from Keychain. Sidekick will return to the ChatGPT queue."
+        } catch {
+            apiKeyStatusIsError = true
+            apiKeyStatusMessage = error.localizedDescription
+        }
     }
 }

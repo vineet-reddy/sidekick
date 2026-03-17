@@ -127,11 +127,15 @@ enum PaperHTMLBuilder {
             figure.missing-figure {
               margin: 1.1em auto 1.2em;
               text-align: center;
+              break-inside: avoid;
+              page-break-inside: avoid;
             }
             figure.paper-figure img {
               display: block;
               max-width: 100%;
-              max-height: 250px;
+              width: auto;
+              height: auto;
+              max-height: 3.9in;
               margin: 0 auto 6px;
               border: 0.5px solid #111111;
             }

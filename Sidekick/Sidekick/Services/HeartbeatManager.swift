@@ -25,7 +25,7 @@ enum HeartbeatPhase: Equatable {
                 return "All caught up."
             }
 
-            return count == 1 ? "1 new paper started." : "\(count) new papers started."
+            return count == 1 ? "1 new paper queued." : "\(count) new papers queued."
         }
     }
 }
@@ -53,6 +53,8 @@ final class HeartbeatManager: ObservableObject {
     private let maxResearchStageAttempts = 3
     private let maxAnalysisRevisionCycles = 6
     private let maxNoteAssessmentPasses = 3
+    private let maxConcurrentOAuthRemoteRuns = 1
+    private let maxConcurrentAPIKeyRemoteRuns = 2
     private let analysisRevisionCycleAttemptKey = "analysis_revision_cycle"
     private let analysisRevisionCycleLimitMessage = "Analysis revision cycles exceeded the retry budget."
 
@@ -107,10 +109,12 @@ final class HeartbeatManager: ObservableObject {
             phase = .checkingPapers
             print("[Heartbeat] Phase: checking in-flight papers...")
             try await resolveInFlightPapers(modelContext: modelContext)
+            try await admitQueuedResearchRunsIfPossible(modelContext: modelContext)
 
             phase = .assessingNotes
             print("[Heartbeat] Phase: assessing notes...")
             let submitted = try await discoverNewPaperCandidates(modelContext: modelContext)
+            try await admitQueuedResearchRunsIfPossible(modelContext: modelContext)
 
             try modelContext.save()
             lastError = nil
@@ -159,6 +163,10 @@ final class HeartbeatManager: ObservableObject {
             print("[Heartbeat]   Checking task \(paper.codexTaskID) for \"\(paper.title)\"...")
 
             if let run = runsByPaperID[paper.id] {
+                if run.status == .queued {
+                    continue
+                }
+
                 do {
                     try await resolveResearchRun(run, paper: paper, notesByID: notesByID)
                 } catch {
@@ -1053,6 +1061,31 @@ final class HeartbeatManager: ObservableObject {
         let shouldUseBundledFallback = await prefersBundledResearchFallback(run: run, notes: notes)
         run.incrementAttempt(for: .inspect)
 
+        if resolvedExecutionBackend(for: run) == .openAIAPIKey {
+            do {
+                if shouldUseBundledFallback {
+                    try await performInspectResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        incrementAttempt: false
+                    )
+                } else {
+                    try await performInspectNetworkedResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        incrementAttempt: false
+                    )
+                }
+            } catch {
+                handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
+            }
+            return
+        }
+
         if shouldUseBundledFallback {
             print("[Heartbeat]   -> Inspect stage for \(run.runID) is supported by a bundled cohort fallback; skipping the live remote path.")
             do {
@@ -1463,6 +1496,37 @@ final class HeartbeatManager: ObservableObject {
             run.incrementAttempt(for: .analyze)
         }
 
+        if resolvedExecutionBackend(for: run) == .openAIAPIKey {
+            let shouldUseBundledAPIExecution = await prefersBundledResearchFallback(run: run, notes: notes)
+
+            do {
+                if shouldUseBundledAPIExecution {
+                    try await performAnalyzeResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        inspection: inspection,
+                        revisionRequest: revisionRequest,
+                        incrementAttempt: false
+                    )
+                } else {
+                    try await performAnalyzeNetworkedResponsesFallback(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        inspection: inspection,
+                        revisionRequest: revisionRequest,
+                        incrementAttempt: false
+                    )
+                }
+            } catch {
+                handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
+            }
+            return
+        }
+
         if shouldUseBundledFallback {
             print("[Heartbeat]   -> Analysis stage for \(run.runID) is supported by a bundled cohort fallback; skipping the live remote path.")
             do {
@@ -1708,7 +1772,13 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.activeTaskID = nil
-        run.markRunning(stage: .inspect, message: "Inspecting the dataset via direct Code Interpreter fallback.")
+        let isAPIKeyExecution = resolvedExecutionBackend(for: run) == .openAIAPIKey
+        run.markRunning(
+            stage: .inspect,
+            message: isAPIKeyExecution
+                ? "Inspecting the dataset with your OpenAI API key."
+                : "Inspecting the dataset via direct Code Interpreter fallback."
+        )
         try persistModelChanges(in: run.modelContext)
 
         let artifact = try await openAI.runNetworkedResearchInspectionResponse(
@@ -1759,7 +1829,13 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.activeTaskID = nil
-        run.markRunning(stage: .inspect, message: "Inspecting the dataset via bundled Code Interpreter fallback.")
+        let isAPIKeyExecution = resolvedExecutionBackend(for: run) == .openAIAPIKey
+        run.markRunning(
+            stage: .inspect,
+            message: isAPIKeyExecution
+                ? "Inspecting the bundled dataset slice with your OpenAI API key."
+                : "Inspecting the dataset via bundled Code Interpreter fallback."
+        )
         try persistModelChanges(in: run.modelContext)
 
         do {
@@ -1789,7 +1865,8 @@ final class HeartbeatManager: ObservableObject {
             print("[Heartbeat]   -> Inspect bundled Code Interpreter fallback completed for \(run.runID)")
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
-            guard shouldUseBundledResearchTaskFallback(after: error) else {
+            guard !isAPIKeyExecution,
+                  shouldUseBundledResearchTaskFallback(after: error) else {
                 throw error
             }
 
@@ -1829,7 +1906,13 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.activeTaskID = nil
-        run.markRunning(stage: .analyze, message: "Running analysis via direct Code Interpreter fallback.")
+        let isAPIKeyExecution = resolvedExecutionBackend(for: run) == .openAIAPIKey
+        run.markRunning(
+            stage: .analyze,
+            message: isAPIKeyExecution
+                ? "Running the analysis with your OpenAI API key."
+                : "Running analysis via direct Code Interpreter fallback."
+        )
         try persistModelChanges(in: run.modelContext)
 
         let artifact = try await openAI.runNetworkedResearchAnalysisResponse(
@@ -1884,7 +1967,13 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.activeTaskID = nil
-        run.markRunning(stage: .analyze, message: "Running analysis via bundled Code Interpreter fallback.")
+        let isAPIKeyExecution = resolvedExecutionBackend(for: run) == .openAIAPIKey
+        run.markRunning(
+            stage: .analyze,
+            message: isAPIKeyExecution
+                ? "Running bundled analysis with your OpenAI API key."
+                : "Running analysis via bundled Code Interpreter fallback."
+        )
         try persistModelChanges(in: run.modelContext)
 
         do {
@@ -1916,7 +2005,8 @@ final class HeartbeatManager: ObservableObject {
             print("[Heartbeat]   -> Analysis bundled Code Interpreter fallback completed for \(run.runID)")
             try await advanceResearchRun(run, paper: paper, notes: notes)
         } catch {
-            guard shouldUseBundledResearchTaskFallback(after: error) else {
+            guard !isAPIKeyExecution,
+                  shouldUseBundledResearchTaskFallback(after: error) else {
                 throw error
             }
 
@@ -2387,6 +2477,12 @@ final class HeartbeatManager: ObservableObject {
     ) {
         let message = error.localizedDescription
 
+        if let blockingAPIKeyMessage = blockingAPIKeyFailureMessage(for: error, run: run) {
+            openAI.recordUserAPIKeyFailure(blockingAPIKeyMessage)
+            markResearchRunFailed(run, paper: paper, message: blockingAPIKeyMessage)
+            return
+        }
+
         if run.attemptCount(for: stage) >= maxResearchStageAttempts {
             markResearchRunFailed(run, paper: paper, message: message)
             return
@@ -2418,6 +2514,245 @@ final class HeartbeatManager: ObservableObject {
         }
     }
 
+    private func blockingAPIKeyFailureMessage(
+        for error: Error,
+        run: ResearchRun
+    ) -> String? {
+        guard resolvedExecutionBackend(for: run) == .openAIAPIKey else {
+            return nil
+        }
+
+        let normalized = error.localizedDescription.lowercased()
+        let indicators = [
+            "incorrect api key",
+            "invalid api key",
+            "api key provided",
+            "missing scopes",
+            "insufficient permissions",
+            "insufficient_quota",
+            "billing",
+            "account is not active",
+            "organization",
+            "project",
+            "authentication"
+        ]
+
+        guard indicators.contains(where: normalized.contains) else {
+            return nil
+        }
+
+        return "The configured OpenAI API key was rejected. Update or remove it in Settings before retrying queued papers. \(error.localizedDescription)"
+    }
+
+    private func admitQueuedResearchRunsIfPossible(modelContext: ModelContext) async throws {
+        let runs = try modelContext.fetch(
+            FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.createdAt, order: .forward)])
+        )
+        guard !runs.isEmpty else {
+            return
+        }
+
+        let papers = try modelContext.fetch(FetchDescriptor<Paper>())
+        let notes = try modelContext.fetch(FetchDescriptor<Note>())
+        let papersByID = Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0) })
+        let notesByID = Dictionary(uniqueKeysWithValues: notes.map { ($0.id, $0) })
+        var activeCounts = backendActiveCounts(for: runs)
+
+        let queuedRuns = runs.filter(\.isSchedulerEligible).sorted { lhs, rhs in
+            if lhs.createdAt != rhs.createdAt {
+                return lhs.createdAt < rhs.createdAt
+            }
+
+            return lhs.runID < rhs.runID
+        }
+
+        for run in queuedRuns {
+            let backend = resolvedExecutionBackend(for: run)
+            if backend == .openAIAPIKey, openAI.hasBlockingUserAPIKeyError {
+                continue
+            }
+
+            guard activeCounts[backend, default: 0] < maxConcurrentRemoteRuns(for: backend) else {
+                continue
+            }
+
+            guard let paper = papersByID[run.paperID] else {
+                continue
+            }
+
+            let sourceNotes = run.sourceNoteIDs.compactMap { notesByID[$0] }
+            guard !sourceNotes.isEmpty else {
+                markResearchRunFailed(
+                    run,
+                    paper: paper,
+                    message: "The source notes for this queued paper could not be found."
+                )
+                continue
+            }
+
+            try startQueuedResearchRun(
+                run,
+                paper: paper,
+                notes: sourceNotes,
+                backend: backend
+            )
+            activeCounts[backend, default: 0] += 1
+        }
+
+        refreshQueuedRunPresentation(runs, activeCounts: activeCounts)
+        try persistModelChanges(in: modelContext)
+    }
+
+    private func startQueuedResearchRun(
+        _ run: ResearchRun,
+        paper: Paper,
+        notes: [Note],
+        backend: ResearchExecutionBackend
+    ) throws {
+        run.executionBackend = backend
+        paper.status = .generating
+        run.markRunning(
+            stage: run.currentStage,
+            message: backendStartMessage(for: run, backend: backend)
+        )
+        try persistModelChanges(in: run.modelContext)
+        scheduleResearchRunAdvance(run, paper: paper, notes: notes)
+    }
+
+    private func refreshQueuedRunPresentation(
+        _ runs: [ResearchRun],
+        activeCounts: [ResearchExecutionBackend: Int]
+    ) {
+        let groupedQueuedRuns = Dictionary(grouping: runs.filter { $0.status == .queued }) { run in
+            resolvedExecutionBackend(for: run)
+        }
+
+        for run in runs where run.status == .queued && run.schedulingDisposition == .hold {
+            run.markQueued(
+                message: heldQueueMessage(for: run),
+                queueState: .held
+            )
+        }
+
+        for (backend, queuedRuns) in groupedQueuedRuns {
+            let eligibleQueuedRuns = queuedRuns
+                .filter(\.isSchedulerEligible)
+                .sorted { lhs, rhs in
+                    if lhs.createdAt != rhs.createdAt {
+                        return lhs.createdAt < rhs.createdAt
+                    }
+
+                    return lhs.runID < rhs.runID
+                }
+
+            if backend == .openAIAPIKey,
+               let blockingMessage = openAI.userAPIKeyErrorMessage,
+               openAI.hasBlockingUserAPIKeyError {
+                for run in eligibleQueuedRuns {
+                    run.markQueued(
+                        message: blockingMessage,
+                        queueState: .held
+                    )
+                }
+                continue
+            }
+
+            for (index, run) in eligibleQueuedRuns.enumerated() {
+                let queueState: ResearchRunQueueState
+                let message: String
+
+                if activeCounts[backend, default: 0] >= maxConcurrentRemoteRuns(for: backend) {
+                    if index == 0 {
+                        queueState = .nextInLine
+                        message = nextInLineMessage(for: backend)
+                    } else {
+                        queueState = .waitingForCurrentPaper
+                        message = waitingQueueMessage(for: backend)
+                    }
+                } else {
+                    queueState = .queued
+                    message = "Research queued."
+                }
+
+                run.markQueued(message: message, queueState: queueState)
+            }
+        }
+    }
+
+    private func backendActiveCounts(for runs: [ResearchRun]) -> [ResearchExecutionBackend: Int] {
+        runs.reduce(into: [ResearchExecutionBackend: Int]()) { result, run in
+            guard run.status == .running else {
+                return
+            }
+
+            result[resolvedExecutionBackend(for: run), default: 0] += 1
+        }
+    }
+
+    private func resolvedExecutionBackend(for run: ResearchRun) -> ResearchExecutionBackend {
+        switch run.executionBackend {
+        case .automatic:
+            return openAI.hasUserAPIKeyOverride ? .openAIAPIKey : .chatGPTOAuth
+        case let backend:
+            return backend
+        }
+    }
+
+    private func maxConcurrentRemoteRuns(for backend: ResearchExecutionBackend) -> Int {
+        switch backend {
+        case .automatic, .chatGPTOAuth:
+            return maxConcurrentOAuthRemoteRuns
+        case .openAIAPIKey:
+            return maxConcurrentAPIKeyRemoteRuns
+        }
+    }
+
+    private func backendStartMessage(
+        for run: ResearchRun,
+        backend: ResearchExecutionBackend
+    ) -> String {
+        switch backend {
+        case .automatic, .chatGPTOAuth:
+            return "Starting queued research with the ChatGPT remote queue."
+        case .openAIAPIKey:
+            return "Starting queued research with your OpenAI API key."
+        }
+    }
+
+    private func heldQueueMessage(for run: ResearchRun) -> String {
+        let existing = run.latestProgressMessage?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !existing.isEmpty {
+            return existing
+        }
+
+        switch run.sourceSupportTier {
+        case .supported:
+            return "Research queued."
+        case .experimental:
+            return "Experimental source selection. Kept queued until a more reliable source is confirmed."
+        case .disabled:
+            return "This source family is disabled for automatic paper generation."
+        }
+    }
+
+    private func nextInLineMessage(for backend: ResearchExecutionBackend) -> String {
+        switch backend {
+        case .automatic, .chatGPTOAuth:
+            return "Waiting for the current paper to finish. This one is next in line."
+        case .openAIAPIKey:
+            return "Waiting for an API-key research slot. This paper is next in line."
+        }
+    }
+
+    private func waitingQueueMessage(for backend: ResearchExecutionBackend) -> String {
+        switch backend {
+        case .automatic, .chatGPTOAuth:
+            return "Waiting for the current paper to finish. Sidekick runs one ChatGPT-backed paper at a time."
+        case .openAIAPIKey:
+            return "Waiting for currently running API-key papers to finish."
+        }
+    }
+
     private func isPromotableTrustedPartialCluster(_ cluster: NoteCluster) -> Bool {
         guard cluster.readinessMode == .trustedPartial,
               !cluster.datasetIDs.isEmpty else {
@@ -2427,8 +2762,19 @@ final class HeartbeatManager: ObservableObject {
         return Set(cluster.noteIDs).count >= 2
     }
 
+    private func isPromotableExploratoryCluster(_ cluster: NoteCluster) -> Bool {
+        guard cluster.readinessMode == .exploratoryReady,
+              !cluster.datasetIDs.isEmpty else {
+            return false
+        }
+
+        return Set(cluster.noteIDs).count >= 2
+    }
+
     private func isSubmissionCandidate(_ cluster: NoteCluster) -> Bool {
-        cluster.isAutomaticallyRunnable || isPromotableTrustedPartialCluster(cluster)
+        cluster.isAutomaticallyRunnable
+            || isPromotableTrustedPartialCluster(cluster)
+            || isPromotableExploratoryCluster(cluster)
     }
 
     private func selectedSubmissionClusters(from clusters: [NoteCluster]) -> [NoteCluster] {
@@ -2687,12 +3033,19 @@ final class HeartbeatManager: ObservableObject {
             allowedDomains: preparation.allowedDomains,
             registryVersion: preparation.registryVersion,
             currentStage: initialStage,
-            status: .running
+            status: .queued,
+            executionBackend: .automatic,
+            queueState: preparation.schedulingDisposition == .autoStart ? .queued : .held,
+            schedulingDisposition: preparation.schedulingDisposition,
+            sourceSupportTier: preparation.sourceSupportTier
         )
 
         modelContext.insert(paper)
         modelContext.insert(run)
-        run.markRunning(stage: initialStage, message: initialStage.title)
+        run.markQueued(
+            message: preparation.initialStatusMessage,
+            queueState: preparation.schedulingDisposition == .autoStart ? .queued : .held
+        )
         try persistModelChanges(in: modelContext)
 
         if let plan = preparation.planArtifact {
@@ -2716,13 +3069,6 @@ final class HeartbeatManager: ObservableObject {
         }
 
         print("[Heartbeat]   -> Research run ID: \(runID)")
-        if preparation.draftArtifact == nil {
-            scheduleResearchRunAdvance(run, paper: paper, notes: notes)
-        } else {
-            try await withResearchRunAdvanceLock(run) {
-                try await advanceResearchRun(run, paper: paper, notes: notes)
-            }
-        }
     }
 }
 

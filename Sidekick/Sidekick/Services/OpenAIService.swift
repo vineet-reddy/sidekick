@@ -1,4 +1,5 @@
 import Combine
+import CryptoKit
 import Foundation
 import zlib
 
@@ -43,8 +44,13 @@ final class OpenAIService: ObservableObject {
         }
     }
 
+    @Published private(set) var hasUserAPIKeyOverride = false
+    @Published private(set) var userAPIKeyHint: String?
+    @Published private(set) var userAPIKeyErrorMessage: String?
+
     private let auth: AuthService
     private let session: URLSession
+    private let defaults: UserDefaults
     private let backendBaseURL = URL(string: "https://chatgpt.com/backend-api")!
     private let apiBaseURL = URL(string: "https://api.openai.com/v1")!
     private let originator = "codex_cli_rs"
@@ -53,21 +59,82 @@ final class OpenAIService: ObservableObject {
     private let researchStageFallbackRouter = OpenAIResearchStageFallbackRouter()
     private let trustedDatasets: TrustedDatasetRegistry
     private let stageFallback: ResearchStageFallbackService
+    private let apiKeychain = KeychainStore(service: "com.vineet.sidekick.openai-api")
+    private let apiKeyAccount = "user-api-key"
+    private let qaAPIKeyEnvironmentVariable = "SIDEKICK_QA_OPENAI_API_KEY"
+    private let apiKeyFailureMessageDefaultsKey = "com.vineet.sidekick.openai-api.failure-message"
+    private let apiKeyFailureFingerprintDefaultsKey = "com.vineet.sidekick.openai-api.failure-fingerprint"
 
     init(
         auth: AuthService,
         session: URLSession = .shared,
-        trustedDatasets: TrustedDatasetRegistry? = nil
+        trustedDatasets: TrustedDatasetRegistry? = nil,
+        defaults: UserDefaults = .standard
     ) {
         self.auth = auth
         self.session = session
+        self.defaults = defaults
         let registry = trustedDatasets ?? TrustedDatasetRegistry(session: session)
         self.trustedDatasets = registry
         stageFallback = ResearchStageFallbackService(session: session)
+        refreshAPIKeyOverrideState()
+        restorePersistedUserAPIKeyFailureIfNeeded()
+        log(
+            "API key override \(hasUserAPIKeyOverride ? "active" : "inactive"). " +
+                "source=\(apiKeyOverrideSourceDescription())"
+        )
 
         Task {
             await registry.refreshIfNeeded()
         }
+    }
+
+    func saveUserAPIKey(_ rawValue: String) throws {
+        let normalized = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if normalized.isEmpty {
+            try clearUserAPIKey()
+            return
+        }
+
+        try apiKeychain.save(normalized, account: apiKeyAccount)
+        clearUserAPIKeyFailure()
+        refreshAPIKeyOverrideState()
+
+        Task {
+            await researchStageFallbackRouter.clear()
+        }
+    }
+
+    func clearUserAPIKey() throws {
+        try apiKeychain.delete(account: apiKeyAccount)
+        clearUserAPIKeyFailure()
+        refreshAPIKeyOverrideState()
+
+        Task {
+            await researchStageFallbackRouter.clear()
+        }
+    }
+
+    var hasBlockingUserAPIKeyError: Bool {
+        hasUserAPIKeyOverride && userAPIKeyErrorMessage != nil
+    }
+
+    func recordUserAPIKeyFailure(_ message: String) {
+        let normalized = message.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard hasUserAPIKeyOverride, !normalized.isEmpty else {
+            return
+        }
+
+        userAPIKeyErrorMessage = normalized
+        persistUserAPIKeyFailureIfNeeded(normalized)
+        log("API key override blocked. message=\(preview(normalized, limit: 220))")
+    }
+
+    func clearUserAPIKeyFailure() {
+        userAPIKeyErrorMessage = nil
+        defaults.removeObject(forKey: apiKeyFailureMessageDefaultsKey)
+        defaults.removeObject(forKey: apiKeyFailureFingerprintDefaultsKey)
     }
 
     func assessNotes(_ notes: [Note]) async throws -> [NoteCluster] {
@@ -101,6 +168,10 @@ final class OpenAIService: ObservableObject {
         - A single note may be too incomplete to stand alone but still become meaningful in combination with other notes.
         - Infer the latent scientific question from the combination of notes rather than requiring one polished note.
         - Do not require the notes to name a repository, portal, or dataset explicitly before choosing a fitting trusted dataset card.
+        - Each trusted dataset card includes a reliability tier: supported, experimental, or disabled.
+        - Treat reliability as a prior, not a license to force a mismatched supported dataset onto an idea that clearly belongs elsewhere.
+        - Prefer supported cards when they genuinely fit the scientific question.
+        - If the only plausible match is experimental, you may name it, but keep `is_ready` false unless the idea is still clearly bounded and the risk is worth surfacing.
         - Treat speculative fragments like "maybe", "not sure", or rough confounder ideas as hints rather than mandatory title text.
         - Prefer clusters that combine complementary fragments into one coherent empirical question.
         - Avoid redundant singleton clusters when a stronger multi-note cluster captures the same idea.
@@ -117,6 +188,11 @@ final class OpenAIService: ObservableObject {
         - trusted_ready: at least one trusted dataset card clearly fits and the notes support a bounded first-pass empirical analysis; set is_ready to true
         - trusted_partial: trusted data exists but the paper would be weak or incomplete; set is_ready to false
         - exploratory_ready: the idea likely needs unvetted external data; set is_ready to false
+
+        Dataset-tier guardrails:
+        - Do not mark a cluster `trusted_ready` just because a supported card exists somewhere in the shortlist; the supported card must honestly match the question.
+        - If the best match is experimental, prefer `trusted_partial` unless the notes already imply an unusually narrow first-pass metadata study.
+        - Do not invent a supported match when the real best-fit source family is experimental or absent.
 
         A cluster can still be trusted_ready when the notes are rough if a single trusted dataset card clearly supports a manageable study-, cohort-, atlas-, survey-, or table-level question.
         A biology or neuroscience atlas cluster can still be trusted_ready when two or more messy notes jointly point to a concrete labeled-cell comparison, even if no single note is polished.
@@ -155,6 +231,7 @@ final class OpenAIService: ObservableObject {
         let response = try await createResponse(
             for: .noteAssessment,
             tools: [],
+            responseBaseURL: codexBaseURL,
             instructions: systemInstructions,
             input: userInput
         )
@@ -205,11 +282,12 @@ final class OpenAIService: ObservableObject {
         datasetIDs: [String]
     ) async throws -> ResearchRunPreparation {
         let noteTexts = notes.map(\.content)
-        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
+        let selection = await trustedDatasets.sourceSelection(
             datasetIDs: datasetIDs,
             noteTexts: noteTexts,
             limit: 4
         )
+        let selectedDatasets = selection.datasets
         let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
         let registryVersion = await trustedDatasets.registryVersion()
 
@@ -217,6 +295,9 @@ final class OpenAIService: ObservableObject {
             selectedDatasetIDs: selectedDatasets.map(\.id),
             allowedDomains: allowedDomains,
             registryVersion: registryVersion,
+            sourceSupportTier: selection.supportTier,
+            schedulingDisposition: selection.isAutoStartEligible ? .autoStart : .hold,
+            initialStatusMessage: selection.message ?? "Research queued.",
             planArtifact: nil,
             inspectionArtifact: nil,
             analysisArtifact: nil,
@@ -391,6 +472,8 @@ final class OpenAIService: ObservableObject {
         2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
         3. Stay aligned with the inspected dataset slice unless inspection clearly missed a blocker.
         4. Access real data, run the analysis, and produce real figures when warranted.
+        4a. Every figure must be generated from this run's computed results. Do not copy images from papers, websites, or prior artifacts.
+        4b. Figures should be print-ready PNGs with readable labels in a PDF, typically about 1100-1600 px on the long side unless a different aspect ratio is clearly better for the analysis.
         5. Return strict JSON only with this exact shape:
            {
              "dataset_manifest": {
@@ -1429,6 +1512,12 @@ final class OpenAIService: ObservableObject {
         let candidates = await modelRouter.candidates(for: workload)
         var unsupportedMessages: [String] = []
         let retryDelays: [Duration] = [.seconds(1), .seconds(2)]
+        let baseURL = responseBaseURL ?? defaultResponsesBaseURL()
+        let authMode = try await responseRequestAuth(for: baseURL)
+        log(
+            "createResponse routing. workload=\(workload.description) " +
+                "base=\(baseURL.host ?? "<unknown>") auth=\(authMode.description)"
+        )
 
         for model in candidates {
             for attempt in 0 ... retryDelays.count {
@@ -1460,16 +1549,20 @@ final class OpenAIService: ObservableObject {
 
                 do {
                     let response = try await sendJSONRequest(
-                        baseURL: responseBaseURL ?? codexBaseURL,
+                        baseURL: baseURL,
                         pathComponents: ["responses"],
                         method: "POST",
                         body: body,
+                        authMode: authMode,
                         responseMode: .completed
                     )
                     log(
                         "createResponse succeeded. workload=\(workload.description) model=\(model) " +
                             "status=\(response.status) attempt=\(attempt + 1)"
                     )
+                    if case .apiKey = authMode {
+                        clearUserAPIKeyFailure()
+                    }
                     await modelRouter.remember(model: model, for: workload)
                     return response
                 } catch {
@@ -1508,6 +1601,19 @@ final class OpenAIService: ObservableObject {
         instructions: String,
         input: String
     ) async throws -> ResponseEnvelope {
+        if hasUserAPIKeyOverride {
+            let response = try await createResponse(
+                for: .researchStageFallback,
+                tools: codeInterpreterTools(),
+                toolChoice: "required",
+                responseBaseURL: apiBaseURL,
+                instructions: instructions,
+                input: input
+            )
+            await researchStageFallbackRouter.clear()
+            return response
+        }
+
         if let unavailableReason = await researchStageFallbackRouter.cachedUnavailabilityReason() {
             log(
                 "createResearchStageFallbackResponse skipping direct responses fallback " +
@@ -1563,6 +1669,17 @@ final class OpenAIService: ObservableObject {
         Follow the full user specification exactly.
         Return only the requested structured JSON artifact and nothing else.
         """
+
+        if hasUserAPIKeyOverride {
+            return try await createResponse(
+                for: .researchStageFallback,
+                tools: codeInterpreterTools(),
+                toolChoice: "required",
+                responseBaseURL: apiBaseURL,
+                instructions: instructions,
+                input: prompt
+            )
+        }
 
         do {
             return try await createResponse(
@@ -1912,12 +2029,12 @@ final class OpenAIService: ObservableObject {
         pathComponents: [String],
         method: String,
         body: [String: Any]?,
+        authMode: ResponseRequestAuth,
         responseMode: ResponseStreamMode = .completed
     ) async throws -> ResponseEnvelope {
-        let token = try await auth.validToken()
         var request = URLRequest(url: endpoint(baseURL: baseURL, path: pathComponents))
         request.httpMethod = method
-        applyAuthHeaders(to: &request, token: token)
+        applyResponseAuthHeaders(to: &request, authMode: authMode)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         log("sendJSONRequest \(method) \(request.url?.absoluteString ?? "<nil>")")
 
@@ -1950,7 +2067,7 @@ final class OpenAIService: ObservableObject {
         let token = try await auth.validToken()
         var request = URLRequest(url: endpoint(baseURL: backendBaseURL, path: pathComponents))
         request.httpMethod = method
-        applyAuthHeaders(to: &request, token: token)
+        applyOAuthHeaders(to: &request, token: token)
         log("sendBackendRequest \(method) \(request.url?.absoluteString ?? "<nil>")")
 
         if let body {
@@ -2212,7 +2329,19 @@ final class OpenAIService: ObservableObject {
         return data
     }
 
-    private func applyAuthHeaders(to request: inout URLRequest, token: String) {
+    private func applyResponseAuthHeaders(
+        to request: inout URLRequest,
+        authMode: ResponseRequestAuth
+    ) {
+        switch authMode {
+        case let .oauth(token):
+            applyOAuthHeaders(to: &request, token: token)
+        case let .apiKey(key):
+            request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        }
+    }
+
+    private func applyOAuthHeaders(to request: inout URLRequest, token: String) {
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue(originator, forHTTPHeaderField: "originator")
 
@@ -2621,7 +2750,8 @@ final class OpenAIService: ObservableObject {
             "Use Code Interpreter to decode and analyze only the supplied bundle and generate any figure bytes included in the final JSON.",
             "Do not contact external services. The supplied bundle is authoritative for this analysis pass.",
             "Prefer one concrete public dataset slice analysis over speculative multi-source synthesis.",
-            "Keep each figure compact and optimized for transport on the first try: roughly 420-600 px wide, indexed or otherwise compressed PNG, and concise captions so the final JSON stays small enough to transmit the full image bytes.",
+            "Generate real print-ready PNG figures directly from the computed results in this run. Do not copy figures from papers, websites, or old artifacts.",
+            "Figures should usually be about 1100-1600 px on the long side with readable labels, legends, and line weights for PDF output. Compress intelligently, but do not shrink the figure below roughly 900 px on the long side just to save bytes.",
             "Do not emit placeholder, solid-color, or empty image files. Keep working until you have a real plot or explain precisely why the supplied bundle cannot support one.",
             "Also write each generated figure PNG into the task workspace using the same filename and leave it in place so the final task diff or snapshot contains the real binary asset.",
             "`findings[].evidence` must cite exact counts, field names, subgroup definitions, or figure/table identifiers from this run.",
@@ -2990,6 +3120,108 @@ final class OpenAIService: ObservableObject {
         }
     }
 
+    private func defaultResponsesBaseURL() -> URL {
+        hasUserAPIKeyOverride ? apiBaseURL : codexBaseURL
+    }
+
+    private func responseRequestAuth(for baseURL: URL) async throws -> ResponseRequestAuth {
+        if baseURL.host == apiBaseURL.host,
+           let apiKey = configuredAPIKeyOverride(),
+           !apiKey.isEmpty {
+            return .apiKey(apiKey)
+        }
+
+        return .oauth(try await auth.validToken())
+    }
+
+    private func refreshAPIKeyOverrideState() {
+        let configuredKey = configuredAPIKeyOverride() ?? ""
+        hasUserAPIKeyOverride = !configuredKey.isEmpty
+        userAPIKeyHint = Self.apiKeyHint(for: configuredKey)
+    }
+
+    private func configuredAPIKeyOverride() -> String? {
+        if let qaOverride = qaAPIKeyOverride() {
+            return qaOverride
+        }
+
+        return storedAPIKey()
+    }
+
+    private func qaAPIKeyOverride() -> String? {
+        let value = ProcessInfo.processInfo.environment[qaAPIKeyEnvironmentVariable]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+
+        return value
+    }
+
+    private func storedAPIKey() -> String? {
+        let value = (try? apiKeychain.load(account: apiKeyAccount)).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let value, !value.isEmpty else {
+            return nil
+        }
+
+        return value
+    }
+
+    private func apiKeyOverrideSourceDescription() -> String {
+        if qaAPIKeyOverride() != nil {
+            return "qa_env"
+        }
+
+        if storedAPIKey() != nil {
+            return "keychain"
+        }
+
+        return "none"
+    }
+
+    private func restorePersistedUserAPIKeyFailureIfNeeded() {
+        guard qaAPIKeyOverride() == nil,
+              hasUserAPIKeyOverride,
+              let persistedMessage = defaults.string(forKey: apiKeyFailureMessageDefaultsKey),
+              let persistedFingerprint = defaults.string(forKey: apiKeyFailureFingerprintDefaultsKey),
+              persistedFingerprint == persistedAPIKeyFingerprint() else {
+            clearUserAPIKeyFailure()
+            return
+        }
+
+        userAPIKeyErrorMessage = persistedMessage
+    }
+
+    private func persistUserAPIKeyFailureIfNeeded(_ message: String) {
+        guard qaAPIKeyOverride() == nil,
+              let fingerprint = persistedAPIKeyFingerprint() else {
+            return
+        }
+
+        defaults.set(message, forKey: apiKeyFailureMessageDefaultsKey)
+        defaults.set(fingerprint, forKey: apiKeyFailureFingerprintDefaultsKey)
+    }
+
+    private func persistedAPIKeyFingerprint() -> String? {
+        guard let apiKey = storedAPIKey() else {
+            return nil
+        }
+
+        let digest = SHA256.hash(data: Data(apiKey.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func apiKeyHint(for key: String) -> String? {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count >= 8 else {
+            return nil
+        }
+
+        return "Ends with \(trimmed.suffix(4))"
+    }
+
     private var codexBaseURL: URL {
         backendBaseURL.appendingPathComponent("codex")
     }
@@ -3010,6 +3242,20 @@ private enum DatasetExecutionStage {
 private enum ResponseStreamMode {
     case created
     case completed
+}
+
+private enum ResponseRequestAuth {
+    case oauth(String)
+    case apiKey(String)
+
+    var description: String {
+        switch self {
+        case .oauth:
+            return "oauth"
+        case .apiKey:
+            return "api_key"
+        }
+    }
 }
 
 private enum OpenAIWorkload {
