@@ -163,12 +163,15 @@ final class OpenAIService: ObservableObject {
 
         let systemInstructions = """
         You are a research assistant. Group these notes into thematic research clusters.
-        Be eager with clustering, but conservative about automatic paper generation.
+        Be eager with clustering, and lean toward bounded pilot-paper generation when a plausible reliable source-family fit exists.
 
         Important note behavior assumptions:
+        - This product turns throwaway research notes into first-pass pilot papers.
         - The notes may be fragmented, typo-heavy, rushed, half-written, or internally inconsistent.
         - A single note may be too incomplete to stand alone but still become meaningful in combination with other notes.
         - Infer the latent scientific question from the combination of notes rather than requiring one polished note.
+        - It is acceptable to infer a defensible middle layer: sharpen the question, choose a narrow first-pass comparison, and fill in ordinary methodological details that the note leaves implicit.
+        - Do not require the note to already specify every cohort split, confounder, or endpoint before marking a cluster runnable.
         - Do not require the notes to name a repository, portal, or dataset explicitly before choosing a fitting trusted dataset card.
         - Treat `dataset_ids` as source-family hints for bounded discovery, not as a final execution commitment.
         - Each trusted dataset card includes a reliability tier: supported, experimental, or disabled.
@@ -188,16 +191,18 @@ final class OpenAIService: ObservableObject {
         - Prefer a single primary trusted dataset card when one card is sufficient for a strong first-pass paper; only include multiple dataset_ids when the notes clearly require cross-source validation or one source alone cannot answer the question.
 
         Readiness modes:
-        - trusted_ready: at least one trusted dataset card clearly fits and the notes support a bounded first-pass empirical analysis; set is_ready to true
-        - trusted_partial: trusted data exists but the paper would be weak or incomplete; set is_ready to false
+        - trusted_ready: at least one trusted dataset card clearly or plausibly fits and you can infer a bounded first-pass empirical analysis without inventing a fundamentally different scientific question; set is_ready to true
+        - trusted_partial: trusted data exists, but even after reasonable inference the paper would still be too ambiguous, too weak, or too mismatched to auto-run; set is_ready to false
         - exploratory_ready: the idea likely needs unvetted external data; set is_ready to false
 
         Dataset-tier guardrails:
         - Do not mark a cluster `trusted_ready` just because a supported card exists somewhere in the shortlist; the supported card must honestly match the question.
+        - When a supported card is a plausible fit and the missing details are ordinary framing choices rather than a different scientific question, prefer `trusted_ready` over `trusted_partial`.
         - If the best match is experimental, prefer `trusted_partial` unless the notes already imply an unusually narrow first-pass metadata study.
         - Do not invent a supported match when the real best-fit source family is experimental or absent.
 
         A cluster can still be trusted_ready when the notes are rough if a single trusted dataset card clearly supports a manageable study-, cohort-, atlas-, survey-, or table-level question.
+        A single messy note can still be trusted_ready when it implies a concrete pilot comparison on a supported source family, even if the exact covariates or subgroup details must be filled in during planning.
         A biology or neuroscience atlas cluster can still be trusted_ready when two or more messy notes jointly point to a concrete labeled-cell comparison, even if no single note is polished.
 
         Use only dataset_ids from the trusted dataset cards below. Prefer at most 3 dataset_ids per cluster, and prefer 1 when possible.

@@ -2966,7 +2966,12 @@ final class HeartbeatManager: ObservableObject {
             return false
         }
 
-        return Set(cluster.noteIDs).count >= 2
+        let noteCount = Set(cluster.noteIDs).count
+        if noteCount >= 2 {
+            return true
+        }
+
+        return noteCount == 1 && Set(cluster.datasetIDs).count == 1
     }
 
     private func isPromotableExploratoryCluster(_ cluster: NoteCluster) -> Bool {
