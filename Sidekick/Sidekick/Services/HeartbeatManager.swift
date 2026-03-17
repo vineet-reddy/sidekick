@@ -1051,7 +1051,8 @@ final class HeartbeatManager: ObservableObject {
                                 paper: paper,
                                 notes: notes,
                                 plan: plan,
-                                incrementAttempt: true
+                                incrementAttempt: true,
+                                preserveNoSignalRestartBudget: noSignalTask
                             )
                         } catch {
                             handleResearchStageError(error, run: run, paper: paper, stage: .inspect)
@@ -1413,7 +1414,8 @@ final class HeartbeatManager: ObservableObject {
                                 plan: plan,
                                 inspection: inspection,
                                 revisionRequest: revisionRequest,
-                                incrementAttempt: true
+                                incrementAttempt: true,
+                                preserveNoSignalRestartBudget: noSignalTask
                             )
                         } catch {
                             handleResearchStageError(error, run: run, paper: paper, stage: .analyze)
@@ -1909,9 +1911,12 @@ final class HeartbeatManager: ObservableObject {
         paper: Paper,
         notes: [Note],
         plan: ResearchPlanArtifact,
-        incrementAttempt: Bool
+        incrementAttempt: Bool,
+        preserveNoSignalRestartBudget: Bool = false
     ) async throws {
-        resetNoSignalRestartCount(for: run, stage: .inspect)
+        if !preserveNoSignalRestartBudget {
+            resetNoSignalRestartCount(for: run, stage: .inspect)
+        }
 
         if incrementAttempt {
             guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
@@ -1968,9 +1973,12 @@ final class HeartbeatManager: ObservableObject {
         paper: Paper,
         notes: [Note],
         plan: ResearchPlanArtifact,
-        incrementAttempt: Bool
+        incrementAttempt: Bool,
+        preserveNoSignalRestartBudget: Bool = false
     ) async throws {
-        resetNoSignalRestartCount(for: run, stage: .inspect)
+        if !preserveNoSignalRestartBudget {
+            resetNoSignalRestartCount(for: run, stage: .inspect)
+        }
 
         if incrementAttempt {
             guard run.attemptCount(for: .inspect) < maxResearchStageAttempts else {
@@ -2047,9 +2055,12 @@ final class HeartbeatManager: ObservableObject {
         plan: ResearchPlanArtifact,
         inspection: ResearchInspectionArtifact,
         revisionRequest: ResearchVerificationArtifact?,
-        incrementAttempt: Bool
+        incrementAttempt: Bool,
+        preserveNoSignalRestartBudget: Bool = false
     ) async throws {
-        resetNoSignalRestartCount(for: run, stage: .analyze)
+        if !preserveNoSignalRestartBudget {
+            resetNoSignalRestartCount(for: run, stage: .analyze)
+        }
 
         if incrementAttempt {
             guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {
@@ -2110,9 +2121,12 @@ final class HeartbeatManager: ObservableObject {
         plan: ResearchPlanArtifact,
         inspection: ResearchInspectionArtifact,
         revisionRequest: ResearchVerificationArtifact?,
-        incrementAttempt: Bool
+        incrementAttempt: Bool,
+        preserveNoSignalRestartBudget: Bool = false
     ) async throws {
-        resetNoSignalRestartCount(for: run, stage: .analyze)
+        if !preserveNoSignalRestartBudget {
+            resetNoSignalRestartCount(for: run, stage: .analyze)
+        }
 
         if incrementAttempt {
             guard run.attemptCount(for: .analyze) < maxResearchStageAttempts else {

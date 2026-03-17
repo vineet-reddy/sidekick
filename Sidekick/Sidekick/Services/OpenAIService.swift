@@ -1607,7 +1607,7 @@ final class OpenAIService: ObservableObject {
                     "createResponse starting. workload=\(workload.description) model=\(model) " +
                         "tool_count=\(tools.count) attempt=\(attempt + 1)"
                 )
-                let body: [String: Any] = [
+                var body: [String: Any] = [
                     "model": model,
                     "instructions": instructions,
                     "store": false,
@@ -1628,6 +1628,10 @@ final class OpenAIService: ObservableObject {
                         ]
                     ]
                 ]
+
+                if baseURL.host == apiBaseURL.host {
+                    body["reasoning"] = responseReasoningConfiguration(for: workload)
+                }
 
                 do {
                     let response = try await sendJSONRequest(
@@ -3429,6 +3433,12 @@ private enum OpenAIWorkload {
             ]
         }
     }
+}
+
+private func responseReasoningConfiguration(for _: OpenAIWorkload) -> [String: String] {
+    [
+        "effort": "low"
+    ]
 }
 
 private enum CloudTaskEnvironmentPreference: String, Codable {
