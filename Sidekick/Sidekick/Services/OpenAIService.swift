@@ -1935,12 +1935,22 @@ final class OpenAIService: ObservableObject {
         for preference: CloudTaskEnvironmentPreference
     ) async throws -> [CloudTaskEnvironment] {
         let environments = try await fetchEnvironments()
+        let compatibleEnvironments: [CloudTaskEnvironment]
+
+        switch preference {
+        case .networkedSelfContained:
+            let networkEnabled = environments.filter { $0.agentNetworkAccess?.mode?.lowercased() == "on" }
+            compatibleEnvironments = networkEnabled.isEmpty ? environments : networkEnabled
+        case .repositoryBound, .selfContainedBundle:
+            compatibleEnvironments = environments
+        }
+
         let quarantinedIDs = await environmentRouter.quarantinedIDs(for: preference)
         let viableEnvironments =
             quarantinedIDs.isEmpty
-            ? environments
-            : environments.filter { !quarantinedIDs.contains($0.id) }
-        let environmentPool = viableEnvironments.isEmpty ? environments : viableEnvironments
+            ? compatibleEnvironments
+            : compatibleEnvironments.filter { !quarantinedIDs.contains($0.id) }
+        let environmentPool = viableEnvironments.isEmpty ? compatibleEnvironments : viableEnvironments
         let candidates: [CloudTaskEnvironment]
 
         switch preference {
@@ -1959,8 +1969,14 @@ final class OpenAIService: ObservableObject {
 
         case .selfContainedBundle:
             let preferredPool = preferredSelfContainedEnvironmentPool(from: environmentPool)
-            var prioritized = preferredPool
+            let preferredIDs = Set(preferredPool.map(\.id))
+            let fallbackPool = environmentPool.filter { !preferredIDs.contains($0.id) }
+            var prioritized =
+                preferredPool
                 .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
+                + fallbackPool.sorted {
+                    environmentPriority($0, for: preference) > environmentPriority($1, for: preference)
+                }
 
             if let remembered = await environmentRouter.cached(for: preference),
                let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
@@ -1972,8 +1988,14 @@ final class OpenAIService: ObservableObject {
 
         case .networkedSelfContained:
             let preferredPool = preferredNetworkedSelfContainedEnvironmentPool(from: environmentPool)
-            var prioritized = preferredPool
+            let preferredIDs = Set(preferredPool.map(\.id))
+            let fallbackPool = environmentPool.filter { !preferredIDs.contains($0.id) }
+            var prioritized =
+                preferredPool
                 .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
+                + fallbackPool.sorted {
+                    environmentPriority($0, for: preference) > environmentPriority($1, for: preference)
+                }
 
             if let remembered = await environmentRouter.cached(for: preference),
                let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
@@ -2009,6 +2031,16 @@ final class OpenAIService: ObservableObject {
     private func preferredNetworkedSelfContainedEnvironmentPool(
         from environments: [CloudTaskEnvironment]
     ) -> [CloudTaskEnvironment] {
+        let unrestrictedNetworkedPython = environments.filter { environment in
+            environment.hasPythonRuntime
+                && environment.agentNetworkAccess?.mode?.lowercased() == "on"
+                && environment.agentNetworkAccess?.presetAllowlist?.lowercased() == "all"
+        }
+
+        if !unrestrictedNetworkedPython.isEmpty {
+            return unrestrictedNetworkedPython
+        }
+
         let codexNetworkedPython = environments.filter { environment in
             environment.hasPythonRuntime
                 && environment.agentNetworkAccess?.mode?.lowercased() == "on"
@@ -2125,10 +2157,10 @@ final class OpenAIService: ObservableObject {
                 score -= 8_000
             }
 
-            if preset == "codex" {
-                score += 750
-            } else if preset == "all" {
-                score += 50
+            if preset == "all" {
+                score += 1_000
+            } else if preset == "codex" {
+                score += 100
             }
 
             if label.contains("/") {

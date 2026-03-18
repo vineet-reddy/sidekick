@@ -48,6 +48,7 @@ final class HeartbeatManager: ObservableObject {
     private let bundledRemoteRetryGracePeriod: TimeInterval = 5 * 60
     private let failedPaperRetryCooldown: TimeInterval = 20 * 60
     private let deadBundledTaskGracePeriod: TimeInterval = 2 * 60
+    private let incompatibleNetworkedTaskGracePeriod: TimeInterval = 20
     private let stalledEventGracePeriod: TimeInterval = 4 * 60
     private let maxRemoteAttempts = 2
     private let maxResearchStageAttempts = 3
@@ -59,6 +60,7 @@ final class HeartbeatManager: ObservableObject {
     private let analysisRevisionCycleAttemptKey = "analysis_revision_cycle"
     private let analysisRevisionCycleLimitMessage = "Analysis revision cycles exceeded the retry budget."
     private let noSignalRemoteRetryAttemptKeyPrefix = "no_signal_remote_retry"
+    private let oauthDirectFallbackRecoveryAttemptKey = "oauth_direct_fallback_recovery"
 
     init(
         openAI: OpenAIService,
@@ -112,6 +114,7 @@ final class HeartbeatManager: ObservableObject {
             print("[Heartbeat] Phase: checking in-flight papers...")
             try await resolveInFlightPapers(modelContext: modelContext)
             try await reconsiderHeldResearchRunsIfNeeded(modelContext: modelContext)
+            try await reconsiderRecoverableFailedResearchRunsIfNeeded(modelContext: modelContext)
             try await admitQueuedResearchRunsIfPossible(modelContext: modelContext)
 
             phase = .assessingNotes
@@ -994,6 +997,7 @@ final class HeartbeatManager: ObservableObject {
 
             switch result {
             case let .waiting(snapshot):
+                let prefersBundledFallback = await prefersBundledResearchFallback(run: run, notes: notes)
                 persistTaskProgress(snapshot)
                 let message = progressMessage(
                     for: snapshot,
@@ -1003,7 +1007,24 @@ final class HeartbeatManager: ObservableObject {
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
                 try persistModelChanges(in: run.modelContext)
 
-                if await prefersBundledResearchFallback(run: run, notes: notes),
+                if !prefersBundledFallback,
+                   shouldRestartNetworkedTaskOnOffNetworkEnvironment(run: run, snapshot: snapshot) {
+                    let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
+                    print("[Heartbeat]   -> Inspect stage is attached to off-network environment \(environmentLabel); restarting on a network-capable worker.")
+                    await openAI.quarantineNetworkedSelfContainedEnvironment(snapshot.environmentID)
+                    run.activeTaskID = nil
+                    refundRetryBudgetIfNeeded(run: run, stage: .inspect, snapshot: snapshot)
+                    try await startResearchInspectionTask(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        preserveNoSignalRestartBudget: true
+                    )
+                    return
+                }
+
+                if prefersBundledFallback,
                    shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Inspect stage is attached to an incompatible repo environment; switching to responses fallback.")
                     run.activeTaskID = nil
@@ -1022,7 +1043,7 @@ final class HeartbeatManager: ObservableObject {
                     return
                 }
 
-                if !(await prefersBundledResearchFallback(run: run, notes: notes)),
+                if !prefersBundledFallback,
                    shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Inspect stage is attached to an incompatible repo environment; switching to direct Code Interpreter fallback.")
                     run.activeTaskID = nil
@@ -1065,7 +1086,10 @@ final class HeartbeatManager: ObservableObject {
                     let noSignalTask = isNoSignalRemoteTask(snapshot)
                     if noSignalTask {
                         let restartCount = incrementNoSignalRestartCount(for: run, stage: .inspect)
-                        await quarantineEnvironmentForSilentTask(snapshot)
+                        await quarantineEnvironmentForSilentTask(
+                            snapshot,
+                            prefersBundledFallback: prefersBundledFallback
+                        )
                         guard restartCount <= maxNoSignalRemoteTaskRestartsPerStage else {
                             print("[Heartbeat]   -> Inspect stage for \(run.runID) exhausted the silent-worker budget; moving on.")
                             markResearchRunFailed(
@@ -1085,7 +1109,7 @@ final class HeartbeatManager: ObservableObject {
                     run.activeTaskID = nil
                     refundRetryBudgetIfNeeded(run: run, stage: .inspect, snapshot: snapshot)
 
-                    if await prefersBundledResearchFallback(run: run, notes: notes),
+                    if prefersBundledFallback,
                        shouldUseResponsesFallback(for: snapshot) {
                         do {
                             try await performInspectResponsesFallback(
@@ -1331,6 +1355,7 @@ final class HeartbeatManager: ObservableObject {
 
             switch result {
             case let .waiting(snapshot):
+                let prefersBundledFallback = await prefersBundledResearchFallback(run: run, notes: notes)
                 persistTaskProgress(snapshot)
                 let message = progressMessage(
                     for: snapshot,
@@ -1340,7 +1365,26 @@ final class HeartbeatManager: ObservableObject {
                 run.updateProgress(message: message, at: snapshot.latestEventAt ?? snapshot.observedAt)
                 try persistModelChanges(in: run.modelContext)
 
-                if await prefersBundledResearchFallback(run: run, notes: notes),
+                if !prefersBundledFallback,
+                   shouldRestartNetworkedTaskOnOffNetworkEnvironment(run: run, snapshot: snapshot) {
+                    let environmentLabel = snapshot.environmentLabel ?? snapshot.environmentID ?? "<unknown>"
+                    print("[Heartbeat]   -> Analysis stage is attached to off-network environment \(environmentLabel); restarting on a network-capable worker.")
+                    await openAI.quarantineNetworkedSelfContainedEnvironment(snapshot.environmentID)
+                    run.activeTaskID = nil
+                    refundRetryBudgetIfNeeded(run: run, stage: .analyze, snapshot: snapshot)
+                    try await startResearchAnalysisTask(
+                        run,
+                        paper: paper,
+                        notes: notes,
+                        plan: plan,
+                        inspection: inspection,
+                        revisionRequest: revisionRequest,
+                        preserveNoSignalRestartBudget: true
+                    )
+                    return
+                }
+
+                if prefersBundledFallback,
                    shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Analysis stage is attached to an incompatible repo environment; switching to responses fallback.")
                     run.activeTaskID = nil
@@ -1361,7 +1405,7 @@ final class HeartbeatManager: ObservableObject {
                     return
                 }
 
-                if !(await prefersBundledResearchFallback(run: run, notes: notes)),
+                if !prefersBundledFallback,
                    shouldUseResponsesFallbackImmediately(run: run, snapshot: snapshot) {
                     print("[Heartbeat]   -> Analysis stage is attached to an incompatible repo environment; switching to direct Code Interpreter fallback.")
                     run.activeTaskID = nil
@@ -1408,7 +1452,10 @@ final class HeartbeatManager: ObservableObject {
                     let noSignalTask = isNoSignalRemoteTask(snapshot)
                     if noSignalTask {
                         let restartCount = incrementNoSignalRestartCount(for: run, stage: .analyze)
-                        await quarantineEnvironmentForSilentTask(snapshot)
+                        await quarantineEnvironmentForSilentTask(
+                            snapshot,
+                            prefersBundledFallback: prefersBundledFallback
+                        )
                         guard restartCount <= maxNoSignalRemoteTaskRestartsPerStage else {
                             print("[Heartbeat]   -> Analysis stage for \(run.runID) exhausted the silent-worker budget; moving on.")
                             markResearchRunFailed(
@@ -1429,7 +1476,7 @@ final class HeartbeatManager: ObservableObject {
                     refundRetryBudgetIfNeeded(run: run, stage: .analyze, snapshot: snapshot)
 
                     if revisionRequest != nil,
-                       await prefersBundledResearchFallback(run: run, notes: notes) {
+                       prefersBundledFallback {
                         do {
                             try await performAnalyzeResponsesFallback(
                                 run,
@@ -1446,7 +1493,7 @@ final class HeartbeatManager: ObservableObject {
                         return
                     }
 
-                    if await prefersBundledResearchFallback(run: run, notes: notes),
+                    if prefersBundledFallback,
                        shouldUseResponsesFallback(for: snapshot) {
                         do {
                             try await performAnalyzeResponsesFallback(
@@ -1974,6 +2021,17 @@ final class HeartbeatManager: ObservableObject {
 
         run.activeTaskID = nil
         let isAPIKeyExecution = resolvedExecutionBackend(for: run) == .openAIAPIKey
+        guard isAPIKeyExecution else {
+            throw NSError(
+                domain: "com.vineet.Sidekick.HeartbeatManager",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Direct Code Interpreter fallback is unavailable in ChatGPT OAuth mode."
+                ]
+            )
+        }
+
         run.markRunning(
             stage: .inspect,
             message: isAPIKeyExecution
@@ -2118,6 +2176,17 @@ final class HeartbeatManager: ObservableObject {
 
         run.activeTaskID = nil
         let isAPIKeyExecution = resolvedExecutionBackend(for: run) == .openAIAPIKey
+        guard isAPIKeyExecution else {
+            throw NSError(
+                domain: "com.vineet.Sidekick.HeartbeatManager",
+                code: 1,
+                userInfo: [
+                    NSLocalizedDescriptionKey:
+                        "Direct Code Interpreter fallback is unavailable in ChatGPT OAuth mode."
+                ]
+            )
+        }
+
         run.markRunning(
             stage: .analyze,
             message: isAPIKeyExecution
@@ -2310,13 +2379,42 @@ final class HeartbeatManager: ObservableObject {
         "The ChatGPT remote worker stayed silent while \(stage.title.lowercased()) on two fresh attempts, so Sidekick moved on to the next queued paper. Retry this paper later."
     }
 
-    private func quarantineEnvironmentForSilentTask(_ snapshot: PaperTaskProgressSnapshot) async {
-        let networkMode = snapshot.environmentNetworkMode?.lowercased() ?? ""
-        if networkMode == "off" {
+    private func quarantineEnvironmentForSilentTask(
+        _ snapshot: PaperTaskProgressSnapshot,
+        prefersBundledFallback: Bool
+    ) async {
+        if prefersBundledFallback {
             await openAI.quarantineSelfContainedBundleEnvironment(snapshot.environmentID)
         } else {
-            await openAI.quarantineRepositoryBoundEnvironment(snapshot.environmentID)
+            await openAI.quarantineNetworkedSelfContainedEnvironment(snapshot.environmentID)
         }
+    }
+
+    private func shouldRestartNetworkedTaskOnOffNetworkEnvironment(
+        run: ResearchRun,
+        snapshot: PaperTaskProgressSnapshot
+    ) -> Bool {
+        let normalizedStatus = snapshot.status.lowercased()
+        guard ["pending", "queued", "in_progress", "incomplete"].contains(normalizedStatus) else {
+            return false
+        }
+
+        let networkMode = snapshot.environmentNetworkMode?.lowercased() ?? ""
+        guard networkMode == "off" else {
+            return false
+        }
+
+        let latestEvent = snapshot.latestEventText?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard latestEvent.isEmpty, snapshot.outputCharacterCount == 0 else {
+            return false
+        }
+
+        let taskStart = snapshot.taskCreatedAt
+            ?? snapshot.assistantTurnCreatedAt
+            ?? run.currentStageStartedAt
+            ?? run.updatedAt
+
+        return Date().timeIntervalSince(taskStart) >= incompatibleNetworkedTaskGracePeriod
     }
 
     private func isNoSignalRemoteTask(_ snapshot: PaperTaskProgressSnapshot) -> Bool {
@@ -2905,6 +3003,74 @@ final class HeartbeatManager: ObservableObject {
                 run.markQueued(message: statusMessage, queueState: queueState)
                 try persistModelChanges(in: modelContext)
             }
+        }
+    }
+
+    private func reconsiderRecoverableFailedResearchRunsIfNeeded(modelContext: ModelContext) async throws {
+        let runs = try modelContext.fetch(
+            FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.createdAt, order: .forward)])
+        )
+        let recoverableRuns = runs.filter { run in
+            guard run.status == .failed,
+                  run.schedulingDisposition == .autoStart,
+                  (run.activeTaskID?.isEmpty ?? true),
+                  run.attemptCount(forKey: oauthDirectFallbackRecoveryAttemptKey) == 0 else {
+                return false
+            }
+
+            switch run.currentStage {
+            case .inspect, .analyze:
+                return isRecoverableOAuthDirectFallbackFailure(run)
+            default:
+                return false
+            }
+        }
+
+        guard !recoverableRuns.isEmpty else {
+            return
+        }
+
+        let papers = try modelContext.fetch(FetchDescriptor<Paper>())
+        let papersByID = Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0) })
+
+        for run in recoverableRuns {
+            guard let paper = papersByID[run.paperID] else {
+                continue
+            }
+
+            paper.status = .generating
+            run.incrementAttempt(forKey: oauthDirectFallbackRecoveryAttemptKey)
+            run.resetAttemptCount(for: run.currentStage)
+            run.markQueued(
+                message: recoveryMessageForOAuthDirectFallback(run.currentStage),
+                queueState: .queued
+            )
+            try persistModelChanges(in: modelContext)
+            print("[Heartbeat]   Re-queued recoverable failed run \(run.runID) after OAuth direct-fallback incompatibility.")
+        }
+    }
+
+    private func isRecoverableOAuthDirectFallbackFailure(_ run: ResearchRun) -> Bool {
+        let evidence = [
+            run.lastError ?? "",
+            run.latestProgressMessage ?? ""
+        ].joined(separator: " ").lowercased()
+        let indicators = [
+            "unsupported tool type: code_interpreter",
+            "direct code interpreter fallback is unavailable in chatgpt oauth mode"
+        ]
+
+        return indicators.contains(where: evidence.contains)
+    }
+
+    private func recoveryMessageForOAuthDirectFallback(_ stage: ResearchRunStage) -> String {
+        switch stage {
+        case .inspect:
+            return "Retrying dataset inspection on a broader network-capable worker."
+        case .analyze:
+            return "Retrying analysis on a broader network-capable worker."
+        default:
+            return "Retrying on a broader network-capable worker."
         }
     }
 
