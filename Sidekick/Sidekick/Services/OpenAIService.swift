@@ -304,7 +304,7 @@ final class OpenAIService: ObservableObject {
             allowedDomains: allowedDomains,
             registryVersion: registryVersion,
             sourceSupportTier: selection.supportTier,
-            schedulingDisposition: selection.isAutoStartEligible ? .autoStart : .hold,
+            schedulingDisposition: (selection.isAutoStartEligible || selection.allowsExploratoryAutoStart) ? .autoStart : .hold,
             initialStatusMessage: selection.message ?? "Research queued.",
             planArtifact: nil,
             inspectionArtifact: nil,
@@ -329,6 +329,7 @@ final class OpenAIService: ObservableObject {
             ? "- No trusted dataset cards were resolved for this run."
             : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
         let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .plan)
+        let exploratoryGuidance = exploratoryExecutionGuidance(for: selectedDatasets, stage: .plan)
         let notesBody = notes.map { note in
             [
                 "id": note.id.uuidString,
@@ -363,17 +364,18 @@ final class OpenAIService: ObservableObject {
         }
 
         Requirements:
-        - Use only the provided notes and trusted dataset cards.
+        - Use only the provided notes and source-family cards below.
         - The notes may be typo-heavy, fragmented, or only meaningful in combination; infer the strongest coherent empirical question from the whole note set rather than waiting for polished wording.
         - Treat the trusted dataset cards as candidate source families for a bounded discovery pass, not as a precommitted dataset choice.
         - Quickly compare topical fit, tractability, likely reachable slice, and reliability across the candidate source families before naming one in `dataset_needs`.
         - Keep the plan concise, empirical, and executable on a first pass.
+        - If the cards below are exploratory discovery catalogs or the reliable direct-source fit is weak, plan a bounded source scout across at most 3 candidate public source families and commit to the first tractable narrow slice instead of waiting for a gold-standard dataset.
         - Dataset-specific planning guardrails below are binding. If a guardrail says a variable, design element, or comparison must be confirmed first, keep it as a contingent risk or inspection target rather than committing to it in the main question, hypotheses, methods, or figure titles.
         - Prefer exactly one primary source family when it is enough for a credible first-pass paper. Supporting source families should be rare.
         - When the notes imply a broader mechanistic ambition than the reachable slice supports, rewrite the plan around the strongest honest first-pass empirical question the dataset can really answer.
         - Candidate methods must match the likely reachable slice; do not default to raw-data pipelines, large matrix reprocessing, or advanced models unless the trusted slice clearly supports them.
         - Planned figures should be real figures that the expected slice can support now, not wishlist figures for a later deeper analysis.
-        - Do not force a dataset just because it is reliable. If none of the candidate source families is a strong fit, set `dataset_id` to null and explain the block in `risks` plus `execution_notes`.
+        - Do not force a dataset just because it is reliable. If none of the candidate source families is a strong fit, either set `dataset_id` to null and explain the exploratory scouting plan, or name the strongest plausible exploratory source family for inspection.
         - Do not write the paper yet.
         """
 
@@ -386,6 +388,9 @@ final class OpenAIService: ObservableObject {
 
         Dataset-specific planning guardrails:
         \(datasetGuidance)
+
+        Exploratory scouting guidance:
+        \(exploratoryGuidance)
 
         Notes:
         \(stringify(notesBody))
@@ -528,6 +533,7 @@ final class OpenAIService: ObservableObject {
             ? "- No trusted dataset cards were resolved for this run."
             : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
         let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .analyze)
+        let exploratoryGuidance = exploratoryExecutionGuidance(for: selectedDatasets, stage: .analyze)
         let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
         let notesBody = notes.map { note in
             "- [\(note.id.uuidString)] \(note.content)"
@@ -541,13 +547,14 @@ final class OpenAIService: ObservableObject {
         1. Prefer the vetted dataset cards below and the inspected manifest before using anything else.
         2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
         3. Stay aligned with the inspected dataset slice unless inspection clearly missed a blocker.
+        3a. If inspection left the trusted set, do not resume source-shopping now; analyze the exact inspected external slice and record that provenance explicitly.
         4. Access real data, run the analysis, and produce real figures when warranted.
         4a. Every figure must be generated from this run's computed results. Do not copy images from papers, websites, or prior artifacts.
         4b. Figures should be print-ready PNGs with readable labels in a PDF, typically about 1100-1600 px on the long side unless a different aspect ratio is clearly better for the analysis.
         5. Return strict JSON only with this exact shape:
            {
              "dataset_manifest": {
-               "primary_dataset_ids": ["trusted-dataset-id"],
+               "primary_dataset_ids": ["trusted-dataset-id or external-source-id"],
                "data_sources": ["string"],
                "sample_description": "string",
                "row_count": 123,
@@ -583,7 +590,7 @@ final class OpenAIService: ObservableObject {
              ],
              "limitations": ["string"],
              "provenance": {
-               "used_dataset_ids": ["trusted-dataset-id"],
+               "used_dataset_ids": ["trusted-dataset-id or external-source-id"],
                "accessed_domains": ["domain"],
                "left_trusted_set": false,
                "external_sources": ["optional domain or source name"],
@@ -611,6 +618,9 @@ final class OpenAIService: ObservableObject {
 
         Dataset-specific execution guardrails:
         \(datasetGuidance)
+
+        Exploratory scouting guidance:
+        \(exploratoryGuidance)
 
         Notes:
         \(notesBody)
@@ -889,6 +899,7 @@ final class OpenAIService: ObservableObject {
             ? "- No trusted dataset cards were resolved for this run."
             : selectedDatasets.map { $0.taskLine() }.joined(separator: "\n")
         let datasetGuidance = datasetExecutionGuidance(for: selectedDatasets, stage: .inspect)
+        let exploratoryGuidance = exploratoryExecutionGuidance(for: selectedDatasets, stage: .inspect)
         let allowedDomainText = allowedDomains.isEmpty ? "none" : allowedDomains.joined(separator: ", ")
         let notesBody = notes.map { note in
             "- [\(note.id.uuidString)] \(note.content)"
@@ -902,10 +913,11 @@ final class OpenAIService: ObservableObject {
         1. Prefer the vetted dataset cards below before using anything else.
         2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
         3. Resolve a concrete dataset slice, inspect the schema or metadata, and report what is actually usable for analysis.
+        3a. If this run is exploratory, scout at most 3 candidate public source families total and stop searching as soon as one yields a tractable slice with real usable variables.
         4. Return strict JSON only with this exact shape:
            {
              "dataset_manifest": {
-               "primary_dataset_ids": ["trusted-dataset-id"],
+               "primary_dataset_ids": ["trusted-dataset-id or external-source-id"],
                "data_sources": ["string"],
                "sample_description": "string",
                "row_count": 123,
@@ -934,6 +946,9 @@ final class OpenAIService: ObservableObject {
 
         Dataset-specific execution guardrails:
         \(datasetGuidance)
+
+        Exploratory scouting guidance:
+        \(exploratoryGuidance)
 
         Notes:
         \(notesBody)
@@ -2801,6 +2816,41 @@ final class OpenAIService: ObservableObject {
         }
 
         return lines.joined(separator: "\n")
+    }
+
+    private func exploratoryExecutionGuidance(
+        for selectedDatasets: [TrustedDataset],
+        stage: DatasetExecutionStage
+    ) -> String {
+        let isExploratory = selectedDatasets.isEmpty
+            || selectedDatasets.contains { dataset in
+                dataset.entryType == .discoveryCatalog || dataset.resolvedSupportTier != .supported
+            }
+
+        guard isExploratory else {
+            return "- This run already has a supported direct source-family fit. Stay with it unless access truly fails."
+        }
+
+        switch stage {
+        case .plan:
+            return [
+                "- Treat this as a bounded source-scouting run: compare at most 3 candidate public source families before committing to one.",
+                "- Prefer official or curated public sources with a small tractable slice over a gold-standard dataset that is too heavy, blocked, or underspecified.",
+                "- If the best first pass will likely leave the trusted set, say so plainly in `execution_notes` and keep the question narrow enough to inspect and analyze in one pass."
+            ].joined(separator: "\n")
+        case .inspect:
+            return [
+                "- Spend at most 3 candidate source-family attempts total in this inspection pass.",
+                "- Stop scouting as soon as one public source yields a concrete analyzable slice with real variables, counts, or metadata.",
+                "- If you leave the trusted set, record the exact chosen source name and domain in `data_sources` and `quality_checks` rather than hiding the pivot."
+            ].joined(separator: "\n")
+        case .analyze:
+            return [
+                "- Do not keep browsing for a better source during analysis. Analyze the exact inspected slice you already resolved.",
+                "- If the inspected slice is external, set `provenance.left_trusted_set` to true and list the external source family and domains explicitly.",
+                "- Prefer a quick honest pilot analysis over deeper but speculative source-shopping."
+            ].joined(separator: "\n")
+        }
     }
 
     private func stagedFallbackInspectionRequirements(

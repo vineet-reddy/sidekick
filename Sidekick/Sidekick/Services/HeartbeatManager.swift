@@ -872,12 +872,22 @@ final class HeartbeatManager: ObservableObject {
         notes: [Note],
         plan: ResearchPlanArtifact
     ) async throws -> Bool {
+        let allowsExploratoryContinuation =
+            run.schedulingDisposition == .autoStart && run.sourceSupportTier == .experimental
         let binding = await openAI.resolvePlanDatasetBinding(
             plan: plan,
             noteTexts: notes.map(\.content)
         )
 
         guard !binding.datasets.isEmpty else {
+            if allowsExploratoryContinuation {
+                run.updateProgress(
+                    message: "Exploratory source scouting stayed unbound after planning. Continuing into inspection to find the first tractable public slice."
+                )
+                try persistModelChanges(in: run.modelContext)
+                return true
+            }
+
             run.schedulingDisposition = .hold
             paper.status = .generating
             run.markQueued(
@@ -889,6 +899,37 @@ final class HeartbeatManager: ObservableObject {
         }
 
         if binding.datasets.contains(where: { $0.resolvedSupportTier != .supported }) {
+            if allowsExploratoryContinuation,
+               binding.datasets.allSatisfy({ $0.resolvedSupportTier != .disabled }) {
+                let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: binding.datasets)
+                let sourceSupportTier = binding.datasets.first?.resolvedSupportTier ?? .experimental
+                var didChange = false
+
+                if run.datasetIDs != binding.datasetIDs {
+                    run.datasetIDs = binding.datasetIDs
+                    didChange = true
+                }
+
+                if run.allowedDomains != allowedDomains {
+                    run.allowedDomains = allowedDomains
+                    didChange = true
+                }
+
+                if run.sourceSupportTier != sourceSupportTier {
+                    run.sourceSupportTier = sourceSupportTier
+                    didChange = true
+                }
+
+                if didChange {
+                    run.updateProgress(
+                        message: "Exploratory source scouting picked a non-supported source family. Continuing with a narrow pilot run."
+                    )
+                    try persistModelChanges(in: run.modelContext)
+                }
+
+                return true
+            }
+
             let message: String
             let primaryTier = binding.datasets.first?.resolvedSupportTier
 

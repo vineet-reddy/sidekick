@@ -195,6 +195,7 @@ nonisolated struct TrustedSourceSelection: Sendable {
     let primaryDataset: TrustedDataset?
     let supportTier: TrustedDatasetSupportTier
     let isAutoStartEligible: Bool
+    let allowsExploratoryAutoStart: Bool
     let message: String?
 }
 
@@ -268,10 +269,20 @@ actor TrustedDatasetRegistry {
     func taskDatasetSelection(datasetIDs: [String], noteTexts: [String], limit: Int = 4) async -> [TrustedDataset] {
         await refreshIfNeeded()
 
-        let directSources = catalog.entries.filter(\.isTrustedDirectSource)
-        let directByID = Dictionary(uniqueKeysWithValues: directSources.map { ($0.id, $0) })
+        let runtimeEntries = catalog.entries.filter { entry in
+            guard entry.status == .trusted, !entry.requiresAuth else {
+                return false
+            }
 
-        let resolved = datasetIDs.compactMap { directByID[$0] }
+            if entry.entryType == .directSource {
+                return entry.resolvedSupportTier != .disabled
+            }
+
+            return entry.entryType == .discoveryCatalog
+        }
+        let runtimeByID = Dictionary(uniqueKeysWithValues: runtimeEntries.map { ($0.id, $0) })
+
+        let resolved = datasetIDs.compactMap { runtimeByID[$0] }
         if !resolved.isEmpty {
             // Once a stage has selected explicit source-family cards, keep that stage scoped to those cards.
             // Injecting shortlist extras here can silently widen domains or trigger unrelated local fallbacks.
@@ -453,22 +464,56 @@ actor TrustedDatasetRegistry {
             }
 
         guard let best = scored.first else {
+            let exploratoryCatalogs = exploratoryCatalogSelection(
+                directTerms: terms,
+                enrichedTerms: enrichedTerms,
+                limit: limit
+            )
+            if !exploratoryCatalogs.isEmpty {
+                return TrustedSourceSelection(
+                    datasets: exploratoryCatalogs,
+                    primaryDataset: exploratoryCatalogs.first,
+                    supportTier: .experimental,
+                    isAutoStartEligible: false,
+                    allowsExploratoryAutoStart: true,
+                    message: "Exploratory paper queued. Sidekick will scout a few public source families and keep the first tractable one."
+                )
+            }
+
             return TrustedSourceSelection(
                 datasets: [],
                 primaryDataset: nil,
                 supportTier: .disabled,
                 isAutoStartEligible: false,
+                allowsExploratoryAutoStart: false,
                 message: "Queued until Sidekick finds a reliable source family for these notes."
             )
         }
 
         let minimumFit = minimumFitScore(for: best.entry, hinted: best.isHinted)
         guard best.fitScore >= minimumFit else {
+            let exploratoryCatalogs = exploratoryCatalogSelection(
+                directTerms: terms,
+                enrichedTerms: enrichedTerms,
+                limit: limit
+            )
+            if !exploratoryCatalogs.isEmpty {
+                return TrustedSourceSelection(
+                    datasets: exploratoryCatalogs,
+                    primaryDataset: exploratoryCatalogs.first,
+                    supportTier: .experimental,
+                    isAutoStartEligible: false,
+                    allowsExploratoryAutoStart: true,
+                    message: "Exploratory paper queued. Sidekick could not find a strong approved fit, so it will scout a few public source families instead of waiting indefinitely."
+                )
+            }
+
             return TrustedSourceSelection(
                 datasets: [best.entry],
                 primaryDataset: best.entry,
                 supportTier: best.entry.resolvedSupportTier,
                 isAutoStartEligible: false,
+                allowsExploratoryAutoStart: false,
                 message: "Queued until Sidekick finds a stronger reliable source-family fit for this paper."
             )
         }
@@ -497,13 +542,25 @@ actor TrustedDatasetRegistry {
             }
             isAutoStartEligible = true
         case .experimental:
-            if best.entry.id == "cellxgene-discover" {
-                message = "Experimental CELLxGENE source-family fit. Kept queued until this path is re-proven end to end."
-            } else {
-                message = "Experimental source-family fit. Kept queued until a supported source is confirmed."
-            }
+            message = "Exploratory paper queued. Sidekick will try the best-fit public source family first, then pivot quickly if it is too thin or blocked."
             isAutoStartEligible = false
         case .disabled:
+            let exploratoryCatalogs = exploratoryCatalogSelection(
+                directTerms: terms,
+                enrichedTerms: enrichedTerms,
+                limit: limit
+            )
+            if !exploratoryCatalogs.isEmpty {
+                return TrustedSourceSelection(
+                    datasets: exploratoryCatalogs,
+                    primaryDataset: exploratoryCatalogs.first,
+                    supportTier: .experimental,
+                    isAutoStartEligible: false,
+                    allowsExploratoryAutoStart: true,
+                    message: "Exploratory paper queued. The direct source fit is disabled, so Sidekick will scout alternative public sources instead."
+                )
+            }
+
             message = "This source family is disabled for automatic paper generation."
             isAutoStartEligible = false
         }
@@ -513,8 +570,46 @@ actor TrustedDatasetRegistry {
             primaryDataset: best.entry,
             supportTier: tier,
             isAutoStartEligible: isAutoStartEligible,
+            allowsExploratoryAutoStart: tier == .experimental,
             message: message
         )
+    }
+
+    private func exploratoryCatalogSelection(
+        directTerms: Set<String>,
+        enrichedTerms: Set<String>,
+        limit: Int
+    ) -> [TrustedDataset] {
+        let catalogs = catalog.entries.filter { entry in
+            entry.entryType == .discoveryCatalog
+                && entry.status == .trusted
+                && !entry.requiresAuth
+        }
+
+        let scored = catalogs
+            .map { entry in
+                scoredEntry(
+                    entry: entry,
+                    directTerms: directTerms,
+                    enrichedTerms: enrichedTerms,
+                    hintedIDs: []
+                )
+            }
+            .sorted { lhs, rhs in
+                if lhs.score == rhs.score {
+                    if lhs.entry.priority == rhs.entry.priority {
+                        return lhs.entry.title < rhs.entry.title
+                    }
+
+                    return lhs.entry.priority > rhs.entry.priority
+                }
+
+                return lhs.score > rhs.score
+            }
+
+        let positiveMatches = scored.filter { $0.fitScore >= 0.6 }
+        let pool = positiveMatches.isEmpty ? scored : positiveMatches
+        return Array(pool.prefix(max(1, min(limit, 2))).map(\.entry))
     }
 
     private func reliabilityBoost(for entry: TrustedDataset) -> Double {
