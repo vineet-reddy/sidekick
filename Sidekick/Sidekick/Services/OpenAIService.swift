@@ -23,6 +23,36 @@ struct PaperArtifacts {
     let provenance: TaskOutputProvenance?
 }
 
+struct OAuthExecutionSetupSnapshot: Equatable {
+    enum Phase: String {
+        case ready
+        case connectGitHub
+        case waitingForMachine
+        case autoProvisioning
+        case waitingForEnvironment
+    }
+
+    let phase: Phase
+    let message: String?
+    let environmentLabel: String?
+    let machineLabel: String?
+
+    static let ready = OAuthExecutionSetupSnapshot(
+        phase: .ready,
+        message: nil,
+        environmentLabel: nil,
+        machineLabel: nil
+    )
+
+    var requiresGitHubConnection: Bool {
+        phase == .connectGitHub
+    }
+
+    var isReady: Bool {
+        phase == .ready
+    }
+}
+
 final class OpenAIService: ObservableObject {
     enum ServiceError: LocalizedError {
         case invalidResponse
@@ -49,6 +79,8 @@ final class OpenAIService: ObservableObject {
     @Published private(set) var userAPIKeyErrorMessage: String?
     @Published private(set) var oauthExecutionSetupMessage: String?
     @Published private(set) var oauthExecutionRequiresGitHubConnection = false
+    @Published private(set) var oauthExecutionSetup = OAuthExecutionSetupSnapshot.ready
+    @Published private(set) var oauthExecutionSetupSheetRequestID = 0
 
     private let auth: AuthService
     private let session: URLSession
@@ -69,6 +101,8 @@ final class OpenAIService: ObservableObject {
     private let qaProbeCodexEnvironmentEndpointsEnvironmentVariable = "SIDEKICK_QA_PROBE_CODEX_ENV_ENDPOINTS"
     private let apiKeyFailureMessageDefaultsKey = "com.vineet.sidekick.openai-api.failure-message"
     private let apiKeyFailureFingerprintDefaultsKey = "com.vineet.sidekick.openai-api.failure-fingerprint"
+    private let oauthSetupBootstrap = OAuthExecutionSetupBootstrapCoordinator()
+    private let sidekickRuntimeEnvironmentLabel = "Sidekick Runtime"
 
     init(
         auth: AuthService,
@@ -144,26 +178,62 @@ final class OpenAIService: ObservableObject {
 
     func refreshOAuthExecutionSetupStateIfNeeded() async -> String? {
         guard !hasUserAPIKeyOverride else {
-            await publishOAuthExecutionSetupState(message: nil, requiresGitHubConnection: false)
+            await oauthSetupBootstrap.reset()
+            await publishOAuthExecutionSetupState(.ready)
             return nil
         }
 
         do {
-            _ = try await fetchEnvironments()
-            await publishOAuthExecutionSetupState(message: nil, requiresGitHubConnection: false)
+            let environments = try await fetchEnvironments()
+            await oauthSetupBootstrap.reset()
+            let preferredEnvironment = preferredSetupEnvironment(from: environments)
+            await publishOAuthExecutionSetupState(
+                OAuthExecutionSetupSnapshot(
+                    phase: .ready,
+                    message: nil,
+                    environmentLabel: preferredEnvironment?.label,
+                    machineLabel: nil
+                )
+            )
             return nil
         } catch {
             let requiresGitHubConnection = await oauthExecutionRequiresGitHubConnection()
-            let message = oauthExecutionSetupBlockerMessage(
+            guard let message = oauthExecutionSetupBlockerMessage(
                 for: error,
                 requiresGitHubConnection: requiresGitHubConnection
-            )
-            await publishOAuthExecutionSetupState(
-                message: message,
-                requiresGitHubConnection: requiresGitHubConnection
-            )
-            return message
+            ) else {
+                await publishOAuthExecutionSetupState(.ready)
+                return nil
+            }
+
+            let snapshot: OAuthExecutionSetupSnapshot
+
+            if requiresGitHubConnection {
+                await oauthSetupBootstrap.reset()
+                snapshot = OAuthExecutionSetupSnapshot(
+                    phase: .connectGitHub,
+                    message: message,
+                    environmentLabel: nil,
+                    machineLabel: nil
+                )
+            } else {
+                snapshot = await resolvePostGitHubOAuthExecutionSetupState(
+                    fallbackMessage: message
+                )
+            }
+
+            await publishOAuthExecutionSetupState(snapshot)
+            return snapshot.message
         }
+    }
+
+    @MainActor
+    func requestOAuthExecutionSetupSheet() {
+        guard oauthExecutionSetupMessage != nil else {
+            return
+        }
+
+        oauthExecutionSetupSheetRequestID += 1
     }
 
     func oauthExecutionSetupBlockerMessage(for error: Error) -> String? {
@@ -194,12 +264,12 @@ final class OpenAIService: ObservableObject {
 
         if requiresGitHubConnection {
             return """
-            This ChatGPT account has not connected GitHub to Codex yet. Open ChatGPT Codex Environments, connect GitHub once, and Sidekick will automatically resume held papers as soon as a usable cloud environment appears. If no environment is listed after GitHub connects, create or join one there, or add your own OpenAI API key in Settings.
+            This ChatGPT account has not connected GitHub to Codex yet. Open ChatGPT Codex Environments, connect GitHub once, and keep this screen open. Sidekick will finish the Codex runtime setup automatically and resume held papers as soon as the cloud environment is ready.
             """
         }
 
         return """
-        This ChatGPT workspace does not have a usable Codex cloud environment yet. Open ChatGPT Codex Environments and create or join one there, or add your own OpenAI API key in Settings.
+        GitHub is connected, but this ChatGPT workspace does not have a usable Codex cloud environment yet. Keep this screen open while Sidekick tries to finish setup automatically. If Codex still does not expose a usable runtime, open ChatGPT Codex Environments or add your own OpenAI API key in Settings.
         """
     }
 
@@ -2057,6 +2127,272 @@ final class OpenAIService: ObservableObject {
         return environments
     }
 
+    private func resolvePostGitHubOAuthExecutionSetupState(
+        fallbackMessage: String
+    ) async -> OAuthExecutionSetupSnapshot {
+        let outcome = await autoBootstrapOAuthExecutionEnvironmentIfPossible()
+
+        if let environments = try? await fetchEnvironments() {
+            await oauthSetupBootstrap.reset()
+            let preferredEnvironment = preferredSetupEnvironment(from: environments)
+            return OAuthExecutionSetupSnapshot(
+                phase: .ready,
+                message: nil,
+                environmentLabel: preferredEnvironment?.label,
+                machineLabel: nil
+            )
+        }
+
+        switch outcome {
+        case .waitingForMachine:
+            return OAuthExecutionSetupSnapshot(
+                phase: .waitingForMachine,
+                message: """
+                GitHub is connected, but Codex has not exposed a runtime template yet. Leave this screen open. Sidekick will keep checking and will create a Sidekick runtime automatically as soon as one becomes available.
+                """,
+                environmentLabel: nil,
+                machineLabel: nil
+            )
+        case let .autoProvisioning(machineLabel):
+            let suffix: String
+            if let machineLabel, !machineLabel.isEmpty {
+                suffix = " using \(machineLabel)."
+            } else {
+                suffix = "."
+            }
+
+            return OAuthExecutionSetupSnapshot(
+                phase: .autoProvisioning,
+                message: """
+                GitHub is connected. Sidekick is creating and verifying your Codex runtime\(suffix) Keep this sheet open and your held papers will resume automatically when the environment is ready.
+                """,
+                environmentLabel: nil,
+                machineLabel: machineLabel
+            )
+        case let .waitingForEnvironment(machineLabel, detail):
+            let detailSuffix: String
+            if let detail,
+               !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                detailSuffix = " Last backend response: \(detail)"
+            } else {
+                detailSuffix = ""
+            }
+
+            let machineSuffix: String
+            if let machineLabel, !machineLabel.isEmpty {
+                machineSuffix = " Sidekick is targeting \(machineLabel)."
+            } else {
+                machineSuffix = ""
+            }
+
+            return OAuthExecutionSetupSnapshot(
+                phase: .waitingForEnvironment,
+                message: fallbackMessage + machineSuffix + detailSuffix,
+                environmentLabel: nil,
+                machineLabel: machineLabel
+            )
+        }
+    }
+
+    private func autoBootstrapOAuthExecutionEnvironmentIfPossible() async -> OAuthExecutionSetupBootstrapOutcome {
+        do {
+            let machines = try await fetchBootstrapMachines()
+            guard let machine = preferredBootstrapMachine(from: machines) else {
+                return .waitingForMachine
+            }
+
+            let shouldAttemptCreation = await oauthSetupBootstrap.beginAttempt(machineID: machine.id)
+            guard shouldAttemptCreation else {
+                return .autoProvisioning(machineLabel: machine.displayLabel)
+            }
+
+            do {
+                _ = try await createOAuthExecutionEnvironment(machineID: machine.id)
+                await oauthSetupBootstrap.finish(machineID: machine.id)
+                return .autoProvisioning(machineLabel: machine.displayLabel)
+            } catch let error as BackendRequestFailure {
+                await oauthSetupBootstrap.finish(machineID: machine.id)
+
+                if isAutoProvisioningFailure(error) {
+                    return .autoProvisioning(machineLabel: machine.displayLabel)
+                }
+
+                let normalized = error.message.lowercased()
+                if normalized.contains("machine"), normalized.contains("not found") {
+                    return .waitingForMachine
+                }
+
+                return .waitingForEnvironment(
+                    machineLabel: machine.displayLabel,
+                    detail: error.message
+                )
+            } catch {
+                await oauthSetupBootstrap.finish(machineID: machine.id)
+                return .waitingForEnvironment(
+                    machineLabel: machine.displayLabel,
+                    detail: error.localizedDescription
+                )
+            }
+        } catch {
+            return .waitingForEnvironment(machineLabel: nil, detail: error.localizedDescription)
+        }
+    }
+
+    private func fetchBootstrapMachines() async throws -> [CloudTaskMachineRecord] {
+        let data = try await sendBackendRequest(
+            pathComponents: ["wham", "machines"],
+            method: "GET",
+            body: nil
+        )
+        persistDebugPayload(data, named: "machines.json")
+
+        guard let json = try? JSONSerialization.jsonObject(with: data) else {
+            return []
+        }
+
+        let dictionaries = dictionaryArray(fromJSONObject: json)
+        let machines: [CloudTaskMachineRecord] = dictionaries.compactMap { machineDictionary in
+            guard let id = firstStringValue(
+                in: machineDictionary,
+                keys: ["id", "machine_id", "machineId"]
+            ) else {
+                return nil
+            }
+
+            return CloudTaskMachineRecord(
+                id: id,
+                label: firstStringValue(in: machineDictionary, keys: ["label", "name", "title"])
+            )
+        }
+
+        var uniqueMachines: [CloudTaskMachineRecord] = []
+        var seenMachineIDs = Set<String>()
+
+        for machine in machines where seenMachineIDs.insert(machine.id).inserted {
+            uniqueMachines.append(machine)
+        }
+
+        log("oauth setup fetched machines count=\(uniqueMachines.count)")
+        return uniqueMachines
+    }
+
+    private func createOAuthExecutionEnvironment(machineID: String) async throws -> String? {
+        let data = try await sendBackendRequest(
+            pathComponents: ["wham", "environments"],
+            method: "POST",
+            body: [
+                "machine_id": machineID,
+                "label": sidekickRuntimeEnvironmentLabel,
+                "repos": []
+            ]
+        )
+        persistDebugPayload(data, named: "environment-create-response.json")
+
+        guard !data.isEmpty,
+              let json = try? JSONSerialization.jsonObject(with: data) else {
+            return nil
+        }
+
+        if let object = json as? [String: Any] {
+            return firstStringValue(in: object, keys: ["id", "environment_id", "environmentId"])
+        }
+
+        return nil
+    }
+
+    private func preferredBootstrapMachine(
+        from machines: [CloudTaskMachineRecord]
+    ) -> CloudTaskMachineRecord? {
+        machines.max { lhs, rhs in
+            bootstrapMachinePriority(lhs) < bootstrapMachinePriority(rhs)
+        }
+    }
+
+    private func bootstrapMachinePriority(_ machine: CloudTaskMachineRecord) -> Int {
+        let label = machine.displayLabel.lowercased()
+        var score = 0
+
+        if label.contains("python") {
+            score += 40
+        }
+
+        if label.contains("codex") {
+            score += 30
+        }
+
+        if label.contains("default") {
+            score += 20
+        }
+
+        if !label.isEmpty {
+            score += 10
+        }
+
+        return score
+    }
+
+    private func preferredSetupEnvironment(
+        from environments: [CloudTaskEnvironment]
+    ) -> CloudTaskEnvironment? {
+        environments.max { lhs, rhs in
+            environmentPriority(lhs, for: .networkedSelfContained)
+                < environmentPriority(rhs, for: .networkedSelfContained)
+        }
+    }
+
+    private func isAutoProvisioningFailure(_ error: BackendRequestFailure) -> Bool {
+        let evidence = [error.message, error.rawBody].joined(separator: " ").lowercased()
+        let indicators = [
+            "already exists",
+            "duplicate",
+            "in progress",
+            "provisioning",
+            "pending"
+        ]
+
+        return indicators.contains(where: evidence.contains)
+    }
+
+    private func dictionaryArray(fromJSONObject object: Any) -> [[String: Any]] {
+        if let array = object as? [[String: Any]] {
+            return array
+        }
+
+        if let dictionary = object as? [String: Any] {
+            let preferredKeys = ["machines", "items", "results", "data"]
+
+            for key in preferredKeys {
+                if let array = dictionary[key] as? [[String: Any]] {
+                    return array
+                }
+            }
+
+            for value in dictionary.values {
+                if let array = value as? [[String: Any]], !array.isEmpty {
+                    return array
+                }
+            }
+        }
+
+        return []
+    }
+
+    private func firstStringValue(
+        in dictionary: [String: Any],
+        keys: [String]
+    ) -> String? {
+        for key in keys {
+            if let value = dictionary[key] as? String {
+                let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+                if !trimmed.isEmpty {
+                    return trimmed
+                }
+            }
+        }
+
+        return nil
+    }
+
     private func candidateEnvironments(
         for preference: CloudTaskEnvironmentPreference
     ) async throws -> [CloudTaskEnvironment] {
@@ -3491,6 +3827,7 @@ final class OpenAIService: ObservableObject {
         userAPIKeyHint = Self.apiKeyHint(for: configuredKey)
 
         if hasUserAPIKeyOverride {
+            oauthExecutionSetup = .ready
             oauthExecutionSetupMessage = nil
             oauthExecutionRequiresGitHubConnection = false
         }
@@ -3575,17 +3912,18 @@ final class OpenAIService: ObservableObject {
     }
 
     private func publishOAuthExecutionSetupState(
-        message: String?,
-        requiresGitHubConnection: Bool
+        _ snapshot: OAuthExecutionSetupSnapshot
     ) async {
         await MainActor.run {
-            guard self.oauthExecutionSetupMessage != message
-                || self.oauthExecutionRequiresGitHubConnection != requiresGitHubConnection else {
+            guard self.oauthExecutionSetup != snapshot
+                || self.oauthExecutionSetupMessage != snapshot.message
+                || self.oauthExecutionRequiresGitHubConnection != snapshot.requiresGitHubConnection else {
                 return
             }
 
-            self.oauthExecutionSetupMessage = message
-            self.oauthExecutionRequiresGitHubConnection = requiresGitHubConnection
+            self.oauthExecutionSetup = snapshot
+            self.oauthExecutionSetupMessage = snapshot.message
+            self.oauthExecutionRequiresGitHubConnection = snapshot.requiresGitHubConnection
         }
     }
 
@@ -3650,6 +3988,12 @@ private enum DatasetExecutionStage {
     case analyze
 }
 
+private enum OAuthExecutionSetupBootstrapOutcome {
+    case waitingForMachine
+    case autoProvisioning(machineLabel: String?)
+    case waitingForEnvironment(machineLabel: String?, detail: String?)
+}
+
 private enum ResponseStreamMode {
     case created
     case completed
@@ -3666,6 +4010,16 @@ private enum ResponseRequestAuth {
         case .apiKey:
             return "api_key"
         }
+    }
+}
+
+private struct CloudTaskMachineRecord: Hashable {
+    let id: String
+    let label: String?
+
+    var displayLabel: String {
+        let trimmed = label?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? id : trimmed
     }
 }
 
@@ -3777,6 +4131,46 @@ private actor OpenAIModelRouter {
 
     func remember(model: String, for workload: OpenAIWorkload) {
         rememberedModels[workload.storageKey] = model
+    }
+}
+
+private actor OAuthExecutionSetupBootstrapCoordinator {
+    private var isAttemptInFlight = false
+    private var lastAttemptedMachineID: String?
+    private var lastAttemptAt: Date?
+
+    func beginAttempt(
+        machineID: String,
+        cooldown: TimeInterval = 20
+    ) -> Bool {
+        let now = Date()
+
+        if isAttemptInFlight {
+            return false
+        }
+
+        if lastAttemptedMachineID == machineID,
+           let lastAttemptAt,
+           now.timeIntervalSince(lastAttemptAt) < cooldown {
+            return false
+        }
+
+        isAttemptInFlight = true
+        lastAttemptedMachineID = machineID
+        lastAttemptAt = now
+        return true
+    }
+
+    func finish(machineID: String) {
+        isAttemptInFlight = false
+        lastAttemptedMachineID = machineID
+        lastAttemptAt = Date()
+    }
+
+    func reset() {
+        isAttemptInFlight = false
+        lastAttemptedMachineID = nil
+        lastAttemptAt = nil
     }
 }
 

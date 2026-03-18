@@ -34,17 +34,19 @@ struct NoteListView: View {
                        !setupMessage.isEmpty,
                        !openAI.hasUserAPIKeyOverride {
                         VStack(alignment: .leading, spacing: 10) {
-                            Text(
-                                openAI.oauthExecutionRequiresGitHubConnection
-                                    ? "Connect GitHub For ChatGPT Queue"
-                                    : "ChatGPT Queue Needs Setup"
-                            )
+                            Text(setupBannerTitle)
                                 .font(.headline)
 
                             Text(setupMessage)
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
+
+                            Button("Open setup guide") {
+                                openAI.requestOAuthExecutionSetupSheet()
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .font(.subheadline)
                         }
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .glassCard(padding: 16)
@@ -229,5 +231,20 @@ struct NoteListView: View {
 
     private func delete(_ note: Note) {
         try? ContentDeletionService.deleteNote(note, modelContext: modelContext)
+    }
+
+    private var setupBannerTitle: String {
+        switch openAI.oauthExecutionSetup.phase {
+        case .connectGitHub:
+            return "Connect GitHub To Finish ChatGPT Queue"
+        case .waitingForMachine:
+            return "Waiting For ChatGPT Runtime"
+        case .autoProvisioning:
+            return "Sidekick Is Finishing ChatGPT Queue Setup"
+        case .waitingForEnvironment:
+            return "ChatGPT Queue Is Still Finishing Setup"
+        case .ready:
+            return "ChatGPT Queue Ready"
+        }
     }
 }

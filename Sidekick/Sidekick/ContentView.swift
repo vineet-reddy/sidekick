@@ -200,13 +200,18 @@ struct AppShellView: View {
                     hasDismissedOAuthSetupSheet = false
                 }
             }
+            .onChange(of: openAI.oauthExecutionSetupSheetRequestID) { _, _ in
+                hasDismissedOAuthSetupSheet = false
+            }
             .task(id: foregroundHeartbeatTaskKey) {
                 await runForegroundHeartbeatLoopIfNeeded(modelContext: modelContext)
             }
+            .task(id: oauthSetupMonitorTaskKey) {
+                await runOAuthSetupMonitorLoopIfNeeded(modelContext: modelContext)
+            }
             .sheet(isPresented: oauthSetupSheetBinding) {
                 OAuthCloudSetupView(
-                    message: openAI.oauthExecutionSetupMessage ?? "",
-                    requiresGitHubConnection: openAI.oauthExecutionRequiresGitHubConnection,
+                    snapshot: openAI.oauthExecutionSetup,
                     openCodexSetup: {
                         isShowingOAuthSetupBrowser = true
                     },
@@ -252,10 +257,17 @@ struct AppShellView: View {
         "\(scenePhase == .active)-\(inFlightPaperCount)"
     }
 
+    private var oauthSetupMonitorTaskKey: String {
+        let phase = openAI.oauthExecutionSetup.phase.rawValue
+        let hasMessage = openAI.oauthExecutionSetupMessage != nil
+        return "\(scenePhase == .active)-\(isShowingOAuthSetupBrowser)-\(hasMessage)-\(phase)"
+    }
+
     private var oauthSetupSheetBinding: Binding<Bool> {
         Binding(
             get: {
                 guard !openAI.hasUserAPIKeyOverride,
+                      !openAI.oauthExecutionSetup.isReady,
                       let message = openAI.oauthExecutionSetupMessage,
                       !message.isEmpty else {
                     return false
@@ -407,6 +419,45 @@ struct AppShellView: View {
         }
     }
 
+    private func runOAuthSetupMonitorLoopIfNeeded(modelContext: ModelContext) async {
+        guard scenePhase == .active,
+              !openAI.hasUserAPIKeyOverride,
+              openAI.oauthExecutionSetupMessage != nil || isShowingOAuthSetupBrowser else {
+            return
+        }
+
+        while !Task.isCancelled,
+              scenePhase == .active,
+              !openAI.hasUserAPIKeyOverride,
+              openAI.oauthExecutionSetupMessage != nil || isShowingOAuthSetupBrowser {
+            let setupMessage = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
+
+            if setupMessage == nil {
+                hasDismissedOAuthSetupSheet = false
+                isShowingOAuthSetupBrowser = false
+
+                if heldRunCount > 0 {
+                    await heartbeat.run(modelContext: modelContext, force: true)
+                }
+                break
+            }
+
+            let interval: Duration
+            switch openAI.oauthExecutionSetup.phase {
+            case .connectGitHub:
+                interval = isShowingOAuthSetupBrowser ? .seconds(4) : .seconds(15)
+            case .waitingForMachine, .waitingForEnvironment:
+                interval = isShowingOAuthSetupBrowser ? .seconds(4) : .seconds(10)
+            case .autoProvisioning:
+                interval = .seconds(4)
+            case .ready:
+                return
+            }
+
+            try? await Task.sleep(for: interval)
+        }
+    }
+
     private func purgeTransientQAStorage() {
         let fileManager = FileManager.default
 
@@ -454,8 +505,7 @@ struct AppShellView: View {
 }
 
 private struct OAuthCloudSetupView: View {
-    let message: String
-    let requiresGitHubConnection: Bool
+    let snapshot: OAuthExecutionSetupSnapshot
     let openCodexSetup: () -> Void
     let retrySetupCheck: () -> Void
     let dismiss: () -> Void
@@ -467,40 +517,52 @@ private struct OAuthCloudSetupView: View {
 
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("Finish ChatGPT Queue Setup")
-                                .font(.title2.weight(.bold))
+                        SectionHeader(
+                            eyebrow: "ChatGPT Queue",
+                            title: "Finish setup once, in-app",
+                            subtitle: "Open the official Codex setup page in ChatGPT. Sidekick keeps checking the backend and will resume held papers automatically."
+                        )
 
-                            Text(message)
-                                .font(.body)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack(alignment: .center, spacing: 12) {
+                                setupStateGlyph
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text(setupHeadline)
+                                        .font(.headline)
+
+                                    if let message = snapshot.message, !message.isEmpty {
+                                        Text(message)
+                                            .font(.subheadline)
+                                            .foregroundStyle(.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
+                                }
+                            }
                         }
                         .glassCard(padding: 22)
 
-                        VStack(alignment: .leading, spacing: 12) {
-                            Text("What to do")
+                        VStack(alignment: .leading, spacing: 14) {
+                            Text("Setup progress")
                                 .font(.headline)
 
-                            Text("1. Open ChatGPT Codex Environments.")
-                                .font(.subheadline)
-                            Text(
-                                requiresGitHubConnection
-                                    ? "2. Connect GitHub once when ChatGPT prompts for it."
-                                    : "2. If needed, create or join a usable Codex cloud environment."
+                            OAuthSetupStepRow(
+                                title: "Connect GitHub to Codex",
+                                detail: "This is the only step that still has to happen in ChatGPT itself.",
+                                state: githubStepState
                             )
-                                .font(.subheadline)
-                            Text(
-                                requiresGitHubConnection
-                                    ? "3. If no environment appears after GitHub connects, create or join one there."
-                                    : "3. Return to Sidekick. Held papers will resume automatically once a usable environment appears."
+
+                            OAuthSetupStepRow(
+                                title: "Sidekick provisions a runtime",
+                                detail: runtimeStepDetail,
+                                state: runtimeStepState
                             )
-                                .font(.subheadline)
-                            if requiresGitHubConnection {
-                                Text("4. Return to Sidekick. Held papers will resume automatically once a usable environment appears.")
-                                    .font(.subheadline)
-                                    .foregroundStyle(.secondary)
-                            }
+
+                            OAuthSetupStepRow(
+                                title: "Held papers resume",
+                                detail: "As soon as the runtime is ready, Sidekick starts the queue again on its own.",
+                                state: resumeStepState
+                            )
                         }
                         .glassCard(padding: 22)
 
@@ -513,32 +575,177 @@ private struct OAuthCloudSetupView: View {
                                 .foregroundStyle(.secondary)
                         }
                         .glassCard(padding: 22)
-
-                        VStack(spacing: 12) {
-                            Button(requiresGitHubConnection ? "Connect GitHub in ChatGPT" : "Open Codex Environments") {
-                                openCodexSetup()
-                            }
-                            .buttonStyle(.borderedProminent)
-
-                            Button("Retry setup check") {
-                                retrySetupCheck()
-                            }
-                            .buttonStyle(.bordered)
-
-                            Button("Keep writing notes") {
-                                dismiss()
-                            }
-                            .buttonStyle(.plain)
-                            .font(.subheadline)
-                        }
-                        .frame(maxWidth: .infinity)
                     }
                     .padding(20)
-                    .padding(.bottom, 40)
+                    .padding(.bottom, 140)
                 }
             }
             .navigationTitle("ChatGPT Queue")
             .navigationBarTitleDisplayMode(.inline)
+            .safeAreaInset(edge: .bottom) {
+                VStack(spacing: 12) {
+                    Button(primaryActionTitle) {
+                        openCodexSetup()
+                    }
+                    .buttonStyle(.borderedProminent)
+
+                    Button("Check again now") {
+                        retrySetupCheck()
+                    }
+                    .buttonStyle(.bordered)
+
+                    Button("Keep writing notes") {
+                        dismiss()
+                    }
+                    .buttonStyle(.plain)
+                    .font(.subheadline)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, 20)
+                .padding(.top, 14)
+                .padding(.bottom, 10)
+                .background(.ultraThinMaterial)
+            }
+        }
+    }
+
+    private var primaryActionTitle: String {
+        switch snapshot.phase {
+        case .connectGitHub:
+            return "Continue in ChatGPT"
+        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment:
+            return "Open Codex Setup"
+        case .ready:
+            return "Open Codex Setup"
+        }
+    }
+
+    private var setupHeadline: String {
+        switch snapshot.phase {
+        case .connectGitHub:
+            return "Connect GitHub once"
+        case .waitingForMachine:
+            return "Waiting for Codex runtime"
+        case .autoProvisioning:
+            return "Sidekick is finishing setup"
+        case .waitingForEnvironment:
+            return "Waiting for the runtime to appear"
+        case .ready:
+            return "ChatGPT Queue is ready"
+        }
+    }
+
+    private var githubStepState: OAuthSetupStepState {
+        snapshot.requiresGitHubConnection ? .current : .complete
+    }
+
+    private var runtimeStepState: OAuthSetupStepState {
+        switch snapshot.phase {
+        case .connectGitHub:
+            return .pending
+        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment:
+            return .current
+        case .ready:
+            return .complete
+        }
+    }
+
+    private var resumeStepState: OAuthSetupStepState {
+        snapshot.phase == .ready ? .complete : .pending
+    }
+
+    private var runtimeStepDetail: String {
+        switch snapshot.phase {
+        case .connectGitHub:
+            return "After GitHub is linked, Sidekick will try to create a Sidekick Runtime automatically."
+        case .waitingForMachine:
+            return "GitHub is linked. Sidekick is waiting for Codex to expose a machine template."
+        case .autoProvisioning:
+            if let machineLabel = snapshot.machineLabel, !machineLabel.isEmpty {
+                return "Sidekick is creating the runtime on \(machineLabel) and checking for readiness."
+            }
+            return "Sidekick is creating the runtime and checking for readiness."
+        case .waitingForEnvironment:
+            return "Codex setup is still settling. Sidekick keeps checking and will pick up the environment automatically."
+        case .ready:
+            if let environmentLabel = snapshot.environmentLabel, !environmentLabel.isEmpty {
+                return "Ready on \(environmentLabel)."
+            }
+            return "A usable Codex runtime is ready."
+        }
+    }
+
+    @ViewBuilder
+    private var setupStateGlyph: some View {
+        switch snapshot.phase {
+        case .connectGitHub:
+            Image(systemName: "link.badge.plus")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(SidekickTheme.accent)
+                .frame(width: 34, height: 34)
+                .background(SidekickTheme.accent.opacity(0.12), in: Circle())
+        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment:
+            ProgressView()
+                .controlSize(.regular)
+                .frame(width: 34, height: 34)
+                .background(SidekickTheme.accent.opacity(0.12), in: Circle())
+        case .ready:
+            Image(systemName: "checkmark")
+                .font(.headline.weight(.bold))
+                .foregroundStyle(.green)
+                .frame(width: 34, height: 34)
+                .background(Color.green.opacity(0.12), in: Circle())
+        }
+    }
+}
+
+private enum OAuthSetupStepState {
+    case pending
+    case current
+    case complete
+}
+
+private struct OAuthSetupStepRow: View {
+    let title: String
+    let detail: String
+    let state: OAuthSetupStepState
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            stepIcon
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(title)
+                    .font(.subheadline.weight(.semibold))
+
+                Text(detail)
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            Spacer(minLength: 0)
+        }
+    }
+
+    @ViewBuilder
+    private var stepIcon: some View {
+        switch state {
+        case .pending:
+            Circle()
+                .stroke(SidekickTheme.edge, lineWidth: 1.5)
+                .frame(width: 18, height: 18)
+                .padding(.top, 2)
+        case .current:
+            ProgressView()
+                .controlSize(.mini)
+                .frame(width: 18, height: 18)
+                .padding(.top, 2)
+        case .complete:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+                .frame(width: 18, height: 18)
+                .padding(.top, 2)
         }
     }
 }

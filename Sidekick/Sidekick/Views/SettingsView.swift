@@ -41,10 +41,8 @@ struct SettingsView: View {
                                 .font(.headline)
 
                             StatusPill(
-                                title: openAI.oauthExecutionSetupMessage == nil
-                                    ? "Ready"
-                                    : (openAI.oauthExecutionRequiresGitHubConnection ? "GitHub required" : "Setup required"),
-                                tint: openAI.oauthExecutionSetupMessage == nil ? .green : .orange
+                                title: chatGPTQueueStatusTitle,
+                                tint: chatGPTQueueStatusTint
                             )
 
                             Text(
@@ -53,6 +51,14 @@ struct SettingsView: View {
                             )
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+
+                            if openAI.oauthExecutionSetupMessage != nil {
+                                Button("Open setup guide") {
+                                    openAI.requestOAuthExecutionSetupSheet()
+                                }
+                                .buttonStyle(.borderedProminent)
+                                .font(.subheadline)
+                            }
                         }
                         .glassCard(padding: 22)
                     }
@@ -173,5 +179,26 @@ struct SettingsView: View {
             apiKeyStatusIsError = true
             apiKeyStatusMessage = error.localizedDescription
         }
+    }
+
+    private var chatGPTQueueStatusTitle: String {
+        if openAI.oauthExecutionSetupMessage == nil {
+            return "Ready"
+        }
+
+        switch openAI.oauthExecutionSetup.phase {
+        case .connectGitHub:
+            return "GitHub required"
+        case .waitingForMachine, .waitingForEnvironment:
+            return "Finishing setup"
+        case .autoProvisioning:
+            return "Auto-provisioning"
+        case .ready:
+            return "Ready"
+        }
+    }
+
+    private var chatGPTQueueStatusTint: Color {
+        openAI.oauthExecutionSetupMessage == nil ? .green : .orange
     }
 }
