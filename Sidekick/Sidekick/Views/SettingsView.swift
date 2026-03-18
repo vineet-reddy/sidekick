@@ -35,6 +35,28 @@ struct SettingsView: View {
                     }
                     .glassCard(padding: 22)
 
+                    if !openAI.hasUserAPIKeyOverride {
+                        VStack(alignment: .leading, spacing: 14) {
+                            Text("ChatGPT Queue")
+                                .font(.headline)
+
+                            StatusPill(
+                                title: openAI.oauthExecutionSetupMessage == nil
+                                    ? "Ready"
+                                    : (openAI.oauthExecutionRequiresGitHubConnection ? "GitHub required" : "Setup required"),
+                                tint: openAI.oauthExecutionSetupMessage == nil ? .green : .orange
+                            )
+
+                            Text(
+                                openAI.oauthExecutionSetupMessage
+                                    ?? "Your ChatGPT OAuth path has at least one usable Codex cloud environment."
+                            )
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                        }
+                        .glassCard(padding: 22)
+                    }
+
                     VStack(alignment: .leading, spacing: 14) {
                         Text("OpenAI API Key")
                             .font(.headline)

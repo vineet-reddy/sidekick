@@ -47,6 +47,8 @@ final class OpenAIService: ObservableObject {
     @Published private(set) var hasUserAPIKeyOverride = false
     @Published private(set) var userAPIKeyHint: String?
     @Published private(set) var userAPIKeyErrorMessage: String?
+    @Published private(set) var oauthExecutionSetupMessage: String?
+    @Published private(set) var oauthExecutionRequiresGitHubConnection = false
 
     private let auth: AuthService
     private let session: URLSession
@@ -64,6 +66,7 @@ final class OpenAIService: ObservableObject {
     private let qaAPIKeyEnvironmentVariable = "SIDEKICK_QA_OPENAI_API_KEY"
     private let qaForceNoSignalRemoteTasksEnvironmentVariable = "SIDEKICK_QA_FORCE_NO_SIGNAL_REMOTE_TASKS"
     private let qaForceNoSignalRemoteTaskAgeSecondsEnvironmentVariable = "SIDEKICK_QA_FORCE_NO_SIGNAL_TASK_AGE_SECONDS"
+    private let qaProbeCodexEnvironmentEndpointsEnvironmentVariable = "SIDEKICK_QA_PROBE_CODEX_ENV_ENDPOINTS"
     private let apiKeyFailureMessageDefaultsKey = "com.vineet.sidekick.openai-api.failure-message"
     private let apiKeyFailureFingerprintDefaultsKey = "com.vineet.sidekick.openai-api.failure-fingerprint"
 
@@ -137,6 +140,164 @@ final class OpenAIService: ObservableObject {
         userAPIKeyErrorMessage = nil
         defaults.removeObject(forKey: apiKeyFailureMessageDefaultsKey)
         defaults.removeObject(forKey: apiKeyFailureFingerprintDefaultsKey)
+    }
+
+    func refreshOAuthExecutionSetupStateIfNeeded() async -> String? {
+        guard !hasUserAPIKeyOverride else {
+            await publishOAuthExecutionSetupState(message: nil, requiresGitHubConnection: false)
+            return nil
+        }
+
+        do {
+            _ = try await fetchEnvironments()
+            await publishOAuthExecutionSetupState(message: nil, requiresGitHubConnection: false)
+            return nil
+        } catch {
+            let requiresGitHubConnection = await oauthExecutionRequiresGitHubConnection()
+            let message = oauthExecutionSetupBlockerMessage(
+                for: error,
+                requiresGitHubConnection: requiresGitHubConnection
+            )
+            await publishOAuthExecutionSetupState(
+                message: message,
+                requiresGitHubConnection: requiresGitHubConnection
+            )
+            return message
+        }
+    }
+
+    func oauthExecutionSetupBlockerMessage(for error: Error) -> String? {
+        oauthExecutionSetupBlockerMessage(for: error, requiresGitHubConnection: false)
+    }
+
+    func oauthExecutionSetupBlockerMessage(
+        for error: Error,
+        requiresGitHubConnection: Bool
+    ) -> String? {
+        guard !hasUserAPIKeyOverride else {
+            return nil
+        }
+
+        let normalized = error.localizedDescription.lowercased()
+        let indicators = [
+            "no codex cloud environments are available",
+            "no usable codex cloud environment",
+            "missing_github_connector_link",
+            "github connection not found for user",
+            "repo_not_accessible",
+            "repository is not accessible"
+        ]
+
+        guard indicators.contains(where: normalized.contains) else {
+            return nil
+        }
+
+        if requiresGitHubConnection {
+            return """
+            This ChatGPT account has not connected GitHub to Codex yet. Open ChatGPT Codex Environments, connect GitHub once, and Sidekick will automatically resume held papers as soon as a usable cloud environment appears. If no environment is listed after GitHub connects, create or join one there, or add your own OpenAI API key in Settings.
+            """
+        }
+
+        return """
+        This ChatGPT workspace does not have a usable Codex cloud environment yet. Open ChatGPT Codex Environments and create or join one there, or add your own OpenAI API key in Settings.
+        """
+    }
+
+    func runQACodexEnvironmentBootstrapProbeIfRequested() async {
+        let arguments = ProcessInfo.processInfo.arguments
+        let environment = ProcessInfo.processInfo.environment
+        let isEnabled =
+            arguments.contains("--qa-probe-codex-env-endpoints")
+            || environment[qaProbeCodexEnvironmentEndpointsEnvironmentVariable] == "1"
+
+        guard isEnabled else {
+            return
+        }
+
+        log("qa env bootstrap probe starting")
+
+        let probes: [(String, [String], String, [String: Any]?)] = [
+            ("list_environments", ["wham", "environments"], "GET", nil),
+            ("options_environments", ["wham", "environments"], "OPTIONS", nil),
+            ("list_machines", ["wham", "machines"], "GET", nil),
+            ("list_repos", ["wham", "repos"], "GET", nil),
+            ("list_repositories", ["wham", "repositories"], "GET", nil),
+            ("list_github_repos", ["wham", "github", "repos"], "GET", nil),
+            ("list_github_repositories", ["wham", "github", "repositories"], "GET", nil),
+            ("list_github_installations", ["wham", "github", "installations"], "GET", nil),
+            ("get_github_connect", ["wham", "github", "connect"], "GET", nil),
+            ("post_github_connect", ["wham", "github", "connect"], "POST", [:]),
+            ("get_github_link", ["wham", "github", "link"], "GET", nil),
+            ("post_github_link", ["wham", "github", "link"], "POST", [:]),
+            ("post_github_installations", ["wham", "github", "installations"], "POST", [:]),
+            ("post_environments_empty", ["wham", "environments"], "POST", [:]),
+            (
+                "post_environments_minimal",
+                ["wham", "environments"],
+                "POST",
+                [
+                    "machine_id": "default",
+                    "label": "Sidekick Runtime",
+                    "repos": []
+                ]
+            ),
+            (
+                "post_environments_new_environment",
+                ["wham", "environments"],
+                "POST",
+                [
+                    "new_environment": [
+                        "label": "Sidekick Runtime",
+                        "branch": "main"
+                    ]
+                ]
+            )
+        ]
+
+        var results: [[String: Any]] = []
+        results.reserveCapacity(probes.count)
+
+        for (name, path, method, body) in probes {
+            do {
+                let result = try await probeBackendRequest(
+                    name: name,
+                    pathComponents: path,
+                    method: method,
+                    body: body
+                )
+                results.append(
+                    [
+                        "name": name,
+                        "path": path.joined(separator: "/"),
+                        "method": method,
+                        "status_code": result.statusCode,
+                        "allow": result.allowHeader as Any,
+                        "content_type": result.contentType as Any,
+                        "body_preview": result.bodyPreview
+                    ]
+                )
+                log("qa env probe \(name) status=\(result.statusCode) allow=\(result.allowHeader ?? "<none>")")
+            } catch {
+                results.append(
+                    [
+                        "name": name,
+                        "path": path.joined(separator: "/"),
+                        "method": method,
+                        "error": error.localizedDescription
+                    ]
+                )
+                log("qa env probe \(name) failed error=\(error.localizedDescription)")
+            }
+        }
+
+        let payload: [String: Any] = [
+            "generated_at": ISO8601DateFormatter().string(from: Date()),
+            "results": results
+        ]
+
+        if let data = try? JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys]) {
+            persistDebugPayload(data, named: "codex-environment-bootstrap-probe.json")
+        }
     }
 
     func assessNotes(_ notes: [Note]) async throws -> [NoteCluster] {
@@ -1723,6 +1884,8 @@ final class OpenAIService: ObservableObject {
             return response
         }
 
+        let oauthUnavailableReason = "Direct Code Interpreter fallback is unavailable in ChatGPT OAuth mode."
+
         if let unavailableReason = await researchStageFallbackRouter.cachedUnavailabilityReason() {
             log(
                 "createResearchStageFallbackResponse skipping direct responses fallback " +
@@ -1731,45 +1894,8 @@ final class OpenAIService: ObservableObject {
             throw ServiceError.taskFailed(unavailableReason)
         }
 
-        do {
-            let response = try await createResponse(
-                for: .researchStageFallback,
-                tools: codeInterpreterTools(),
-                toolChoice: "required",
-                responseBaseURL: apiBaseURL,
-                instructions: instructions,
-                input: input
-            )
-            await researchStageFallbackRouter.clear()
-            return response
-        } catch {
-            guard shouldRetryResearchStageFallbackResponse(after: error) else {
-                throw error
-            }
-
-            log(
-                "createResearchStageFallbackResponse retrying via ChatGPT backend /codex/responses " +
-                    "after api failure: \(String(describing: error))"
-            )
-
-            do {
-                let response = try await createResponse(
-                    for: .researchStageFallback,
-                    tools: codeInterpreterTools(),
-                    toolChoice: "required",
-                    responseBaseURL: codexBaseURL,
-                    instructions: instructions,
-                    input: input
-                )
-                await researchStageFallbackRouter.clear()
-                return response
-            } catch {
-                if shouldRetryResearchStageFallbackResponse(after: error) {
-                    await researchStageFallbackRouter.remember(error.localizedDescription)
-                }
-                throw error
-            }
-        }
+        await researchStageFallbackRouter.remember(oauthUnavailableReason)
+        throw ServiceError.taskFailed(oauthUnavailableReason)
     }
 
     private func createResearchStageDirectResponse(prompt: String) async throws -> ResponseEnvelope {
@@ -2241,6 +2367,44 @@ final class OpenAIService: ObservableObject {
         }
 
         return data
+    }
+
+    private func probeBackendRequest(
+        name: String,
+        pathComponents: [String],
+        method: String,
+        body: [String: Any]?
+    ) async throws -> BackendProbeResponse {
+        let token = try await auth.validToken()
+        var request = URLRequest(url: endpoint(baseURL: backendBaseURL, path: pathComponents))
+        request.httpMethod = method
+        applyOAuthHeaders(to: &request, token: token)
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+
+        if let body {
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+
+        log("probeBackendRequest \(method) \(request.url?.absoluteString ?? "<nil>")")
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ServiceError.invalidResponse
+        }
+
+        let safeName = name.replacingOccurrences(of: "/", with: "_")
+        persistDebugPayload(
+            data,
+            named: "probe-\(safeName)-\(method.lowercased())-\(httpResponse.statusCode).json"
+        )
+
+        return BackendProbeResponse(
+            statusCode: httpResponse.statusCode,
+            allowHeader: httpResponse.value(forHTTPHeaderField: "Allow"),
+            contentType: httpResponse.value(forHTTPHeaderField: "Content-Type"),
+            bodyPreview: preview(String(data: data, encoding: .utf8) ?? "", limit: 1200)
+        )
     }
 
     private func sendStreamingRequest(
@@ -3325,6 +3489,11 @@ final class OpenAIService: ObservableObject {
         let configuredKey = configuredAPIKeyOverride() ?? ""
         hasUserAPIKeyOverride = !configuredKey.isEmpty
         userAPIKeyHint = Self.apiKeyHint(for: configuredKey)
+
+        if hasUserAPIKeyOverride {
+            oauthExecutionSetupMessage = nil
+            oauthExecutionRequiresGitHubConnection = false
+        }
     }
 
     private func configuredAPIKeyOverride() -> String? {
@@ -3403,6 +3572,37 @@ final class OpenAIService: ObservableObject {
         }
 
         userAPIKeyErrorMessage = persistedMessage
+    }
+
+    private func publishOAuthExecutionSetupState(
+        message: String?,
+        requiresGitHubConnection: Bool
+    ) async {
+        await MainActor.run {
+            guard self.oauthExecutionSetupMessage != message
+                || self.oauthExecutionRequiresGitHubConnection != requiresGitHubConnection else {
+                return
+            }
+
+            self.oauthExecutionSetupMessage = message
+            self.oauthExecutionRequiresGitHubConnection = requiresGitHubConnection
+        }
+    }
+
+    private func oauthExecutionRequiresGitHubConnection() async -> Bool {
+        do {
+            _ = try await sendBackendRequest(
+                pathComponents: ["wham", "github", "installations"],
+                method: "GET",
+                body: nil
+            )
+            return false
+        } catch let error as BackendRequestFailure {
+            return error.detailType == "missing_github_connector_link"
+                || error.localizedDescription.localizedCaseInsensitiveContains("github connection not found for user")
+        } catch {
+            return false
+        }
     }
 
     private func persistUserAPIKeyFailureIfNeeded(_ message: String) {
@@ -3546,6 +3746,13 @@ private struct BackendRequestFailure: LocalizedError {
     var errorDescription: String? {
         "HTTP \(statusCode): \(message)"
     }
+}
+
+private struct BackendProbeResponse {
+    let statusCode: Int
+    let allowHeader: String?
+    let contentType: String?
+    let bodyPreview: String
 }
 
 private struct BackendErrorEnvelope: Decodable {

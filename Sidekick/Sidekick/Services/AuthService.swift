@@ -4,8 +4,7 @@ import Foundation
 import Network
 import Security
 import UIKit
-
-private let defaultAuthScopes = "openid profile email offline_access"
+private let openAIEnvironmentRouterDefaultsKey = "com.vineet.sidekick.openai-environment-router"
 
 @MainActor
 final class AuthService: ObservableObject {
@@ -62,7 +61,7 @@ final class AuthService: ObservableObject {
         clientID: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_CLIENT_ID"] ?? "app_EMoamEEZ73f0CkXaXp7hrann",
         issuer: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_ISSUER"] ?? "https://auth.openai.com",
         callbackPort: UInt16 = UInt16(ProcessInfo.processInfo.environment["SIDEKICK_AUTH_CALLBACK_PORT"] ?? "") ?? 1455,
-        scopes: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_SCOPE"] ?? defaultAuthScopes
+        scopes: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_SCOPE"] ?? "openid profile email offline_access"
     ) {
         self.clientID = clientID
         self.issuer = issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -157,6 +156,7 @@ final class AuthService: ObservableObject {
         try? keychain.delete(account: refreshTokenAccount)
         try? keychain.delete(account: expiryAccount)
         try? keychain.delete(account: emailAccount)
+        clearOAuthWorkspaceState()
         isAuthenticated = false
         userEmail = nil
     }
@@ -247,6 +247,8 @@ final class AuthService: ObservableObject {
             throw AuthError.oauthError("Invalid token response.")
         }
 
+        let previousEmail = userEmail?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+
         try keychain.save(accessToken, account: accessTokenAccount)
 
         if let refreshToken = json["refresh_token"] as? String {
@@ -259,6 +261,10 @@ final class AuthService: ObservableObject {
 
         if let idToken = json["id_token"] as? String {
             if let email = extractEmail(from: idToken) {
+                let normalizedEmail = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if let previousEmail, previousEmail != normalizedEmail {
+                    clearOAuthWorkspaceState()
+                }
                 try? keychain.save(email, account: emailAccount)
                 userEmail = email
             }
@@ -270,6 +276,10 @@ final class AuthService: ObservableObject {
     private func normalizeOAuthMessage(_ raw: String) -> String {
         let plusDecoded = raw.replacingOccurrences(of: "+", with: " ")
         return plusDecoded.removingPercentEncoding ?? plusDecoded
+    }
+
+    private func clearOAuthWorkspaceState() {
+        UserDefaults.standard.removeObject(forKey: openAIEnvironmentRouterDefaultsKey)
     }
 
     // MARK: - PKCE Helpers

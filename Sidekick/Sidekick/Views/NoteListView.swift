@@ -4,6 +4,7 @@ import SwiftUI
 struct NoteListView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject private var heartbeat: HeartbeatManager
+    @EnvironmentObject private var openAI: OpenAIService
     @Query(sort: \Note.updatedAt, order: .reverse) private var notes: [Note]
 
     @State private var searchText = ""
@@ -29,6 +30,26 @@ struct NoteListView: View {
 
             ScrollView {
                 LazyVStack(spacing: 12) {
+                    if let setupMessage = openAI.oauthExecutionSetupMessage,
+                       !setupMessage.isEmpty,
+                       !openAI.hasUserAPIKeyOverride {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text(
+                                openAI.oauthExecutionRequiresGitHubConnection
+                                    ? "Connect GitHub For ChatGPT Queue"
+                                    : "ChatGPT Queue Needs Setup"
+                            )
+                                .font(.headline)
+
+                            Text(setupMessage)
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .glassCard(padding: 16)
+                    }
+
                     if filteredNotes.isEmpty && newNoteText.isEmpty {
                         Text("Jot something down below to get started.")
                             .font(.subheadline)

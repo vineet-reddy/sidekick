@@ -147,6 +147,9 @@ struct AppShellView: View {
 
     @EnvironmentObject private var heartbeat: HeartbeatManager
     @EnvironmentObject private var notifications: NotificationService
+    @EnvironmentObject private var openAI: OpenAIService
+    @State private var hasDismissedOAuthSetupSheet = false
+    @State private var isShowingOAuthSetupBrowser = false
 
     private let foregroundHeartbeatInterval: Duration = .seconds(30)
 
@@ -160,12 +163,14 @@ struct AppShellView: View {
                 resetQAContentIfNeeded(modelContext: modelContext)
                 seedQANotesIfNeeded(modelContext: modelContext)
                 quarantineRetiredLocalExecutionIfNeeded(modelContext: modelContext)
+                await openAI.runQACodexEnvironmentBootstrapProbeIfRequested()
+                _ = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
                 Task {
                     await preloadRecentReadyPapers(modelContext: modelContext)
                 }
                 if QAFlags.shouldForceHeartbeatOnLaunch {
                     await heartbeat.run(modelContext: modelContext, force: true)
-                } else if inFlightPaperCount > 0 {
+                } else if inFlightPaperCount > 0 || heldRunCount > 0 {
                     await heartbeat.run(modelContext: modelContext, force: true)
                 } else {
                     await heartbeat.runIfNeeded(modelContext: modelContext)
@@ -182,15 +187,44 @@ struct AppShellView: View {
                 }
 
                 Task {
-                    if inFlightPaperCount > 0 {
+                    _ = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
+                    if inFlightPaperCount > 0 || heldRunCount > 0 {
                         await heartbeat.run(modelContext: modelContext, force: true)
                     } else {
                         await heartbeat.runIfNeeded(modelContext: modelContext)
                     }
                 }
             }
+            .onChange(of: openAI.oauthExecutionSetupMessage) { _, newValue in
+                if newValue == nil {
+                    hasDismissedOAuthSetupSheet = false
+                }
+            }
             .task(id: foregroundHeartbeatTaskKey) {
                 await runForegroundHeartbeatLoopIfNeeded(modelContext: modelContext)
+            }
+            .sheet(isPresented: oauthSetupSheetBinding) {
+                OAuthCloudSetupView(
+                    message: openAI.oauthExecutionSetupMessage ?? "",
+                    requiresGitHubConnection: openAI.oauthExecutionRequiresGitHubConnection,
+                    openCodexSetup: {
+                        isShowingOAuthSetupBrowser = true
+                    },
+                    retrySetupCheck: {
+                        Task {
+                            _ = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
+                            if openAI.oauthExecutionSetupMessage == nil, heldRunCount > 0 {
+                                await heartbeat.run(modelContext: modelContext, force: true)
+                            }
+                        }
+                    },
+                    dismiss: {
+                        hasDismissedOAuthSetupSheet = true
+                    }
+                )
+            }
+            .sheet(isPresented: $isShowingOAuthSetupBrowser) {
+                SafariBrowserView(url: URL(string: "https://chatgpt.com/codex/settings/environments")!)
             }
     }
 
@@ -208,8 +242,35 @@ struct AppShellView: View {
         return activePaperIDs.count + untrackedGeneratingCount
     }
 
+    private var heldRunCount: Int {
+        runs.filter {
+            $0.status == .queued && $0.queueState == .held && $0.schedulingDisposition == .hold
+        }.count
+    }
+
     private var foregroundHeartbeatTaskKey: String {
         "\(scenePhase == .active)-\(inFlightPaperCount)"
+    }
+
+    private var oauthSetupSheetBinding: Binding<Bool> {
+        Binding(
+            get: {
+                guard !openAI.hasUserAPIKeyOverride,
+                      let message = openAI.oauthExecutionSetupMessage,
+                      !message.isEmpty else {
+                    return false
+                }
+
+                return !hasDismissedOAuthSetupSheet
+            },
+            set: { isPresented in
+                guard !isPresented else {
+                    return
+                }
+
+                hasDismissedOAuthSetupSheet = true
+            }
+        )
     }
 
     private func resetQAContentIfNeeded(modelContext: ModelContext) {
@@ -388,6 +449,96 @@ struct AppShellView: View {
         if let localDatasetsDirectory = applicationSupport?
             .appendingPathComponent("LocalDatasets", isDirectory: true) {
             try? fileManager.removeItem(at: localDatasetsDirectory)
+        }
+    }
+}
+
+private struct OAuthCloudSetupView: View {
+    let message: String
+    let requiresGitHubConnection: Bool
+    let openCodexSetup: () -> Void
+    let retrySetupCheck: () -> Void
+    let dismiss: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            ZStack {
+                SidekickBackground()
+
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Finish ChatGPT Queue Setup")
+                                .font(.title2.weight(.bold))
+
+                            Text(message)
+                                .font(.body)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        .glassCard(padding: 22)
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("What to do")
+                                .font(.headline)
+
+                            Text("1. Open ChatGPT Codex Environments.")
+                                .font(.subheadline)
+                            Text(
+                                requiresGitHubConnection
+                                    ? "2. Connect GitHub once when ChatGPT prompts for it."
+                                    : "2. If needed, create or join a usable Codex cloud environment."
+                            )
+                                .font(.subheadline)
+                            Text(
+                                requiresGitHubConnection
+                                    ? "3. If no environment appears after GitHub connects, create or join one there."
+                                    : "3. Return to Sidekick. Held papers will resume automatically once a usable environment appears."
+                            )
+                                .font(.subheadline)
+                            if requiresGitHubConnection {
+                                Text("4. Return to Sidekick. Held papers will resume automatically once a usable environment appears.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        .glassCard(padding: 22)
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("Alternative")
+                                .font(.headline)
+
+                            Text("If you do not want to set up ChatGPT Codex cloud, add your own OpenAI API key in Settings and Sidekick will use that path instead.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        }
+                        .glassCard(padding: 22)
+
+                        VStack(spacing: 12) {
+                            Button(requiresGitHubConnection ? "Connect GitHub in ChatGPT" : "Open Codex Environments") {
+                                openCodexSetup()
+                            }
+                            .buttonStyle(.borderedProminent)
+
+                            Button("Retry setup check") {
+                                retrySetupCheck()
+                            }
+                            .buttonStyle(.bordered)
+
+                            Button("Keep writing notes") {
+                                dismiss()
+                            }
+                            .buttonStyle(.plain)
+                            .font(.subheadline)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                    .padding(20)
+                    .padding(.bottom, 40)
+                }
+            }
+            .navigationTitle("ChatGPT Queue")
+            .navigationBarTitleDisplayMode(.inline)
         }
     }
 }

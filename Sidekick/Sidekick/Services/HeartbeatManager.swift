@@ -2525,6 +2525,7 @@ final class HeartbeatManager: ObservableObject {
     private func shouldUseBundledResearchTaskFallback(after error: Error) -> Bool {
         let message = error.localizedDescription.lowercased()
         let indicators = [
+            "direct code interpreter fallback is unavailable in chatgpt oauth mode",
             "unsupported tool type: code_interpreter",
             "missing scopes: api.responses.write",
             "insufficient permissions",
@@ -2830,6 +2831,11 @@ final class HeartbeatManager: ObservableObject {
             return
         }
 
+        if let oauthSetupMessage = blockingOAuthSetupMessage(for: error, run: run) {
+            holdResearchRunForOAuthSetup(run, paper: paper, message: oauthSetupMessage)
+            return
+        }
+
         if run.attemptCount(for: stage) >= maxResearchStageAttempts {
             markResearchRunFailed(run, paper: paper, message: message)
             return
@@ -2852,6 +2858,32 @@ final class HeartbeatManager: ObservableObject {
         paper.status = .failed
         persistModelChangesIfPossible(in: run.modelContext, context: "research failure")
         print("[Heartbeat]   -> Research run failed for \(run.runID): \(message)")
+    }
+
+    private func holdResearchRunForOAuthSetup(
+        _ run: ResearchRun,
+        paper: Paper,
+        message: String
+    ) {
+        run.executionBackend = .automatic
+        run.schedulingDisposition = .hold
+        run.stageAttempts = [:]
+        run.currentStage = .plan
+        run.markQueued(message: message, queueState: .held)
+        paper.status = .generating
+        persistModelChangesIfPossible(in: run.modelContext, context: "oauth setup hold")
+        print("[Heartbeat]   -> Held \(run.runID) until ChatGPT Codex setup is completed.")
+    }
+
+    private func blockingOAuthSetupMessage(
+        for error: Error,
+        run: ResearchRun
+    ) -> String? {
+        guard resolvedExecutionBackend(for: run) == .chatGPTOAuth else {
+            return nil
+        }
+
+        return openAI.oauthExecutionSetupBlockerMessage(for: error)
     }
 
     private func applyRecovery(_ recovery: RecoveryResult, to paper: Paper) async throws {
@@ -2938,10 +2970,13 @@ final class HeartbeatManager: ObservableObject {
                 theme: cluster.theme,
                 datasetIDs: cluster.datasetIDs
             )
-            let forceHold = !isSubmissionCandidate(cluster)
+            let oauthSetupHoldMessage = preparation.draftArtifact == nil
+                ? await openAI.refreshOAuthExecutionSetupStateIfNeeded()
+                : nil
+            let forceHold = !isSubmissionCandidate(cluster) || oauthSetupHoldMessage != nil
             let schedulingDisposition: ResearchRunSchedulingDisposition = forceHold ? .hold : preparation.schedulingDisposition
             let queueState: ResearchRunQueueState = schedulingDisposition == .autoStart ? .queued : .held
-            let statusMessage = initialResearchRunMessage(
+            let statusMessage = oauthSetupHoldMessage ?? initialResearchRunMessage(
                 for: cluster,
                 preparation: preparation,
                 forceHold: forceHold
@@ -3117,6 +3152,12 @@ final class HeartbeatManager: ObservableObject {
                     paper: paper,
                     message: "The source notes for this queued paper could not be found."
                 )
+                continue
+            }
+
+            if backend == .chatGPTOAuth,
+               let setupMessage = await openAI.refreshOAuthExecutionSetupStateIfNeeded() {
+                holdResearchRunForOAuthSetup(run, paper: paper, message: setupMessage)
                 continue
             }
 
@@ -3618,12 +3659,16 @@ final class HeartbeatManager: ObservableObject {
             theme: cluster.theme,
             datasetIDs: cluster.datasetIDs
         )
-        let schedulingDisposition: ResearchRunSchedulingDisposition = forceHold ? .hold : preparation.schedulingDisposition
+        let oauthSetupHoldMessage = preparation.draftArtifact == nil
+            ? await openAI.refreshOAuthExecutionSetupStateIfNeeded()
+            : nil
+        let shouldForceHold = forceHold || oauthSetupHoldMessage != nil
+        let schedulingDisposition: ResearchRunSchedulingDisposition = shouldForceHold ? .hold : preparation.schedulingDisposition
         let initialQueueState: ResearchRunQueueState = schedulingDisposition == .autoStart ? .queued : .held
-        let initialStatusMessage = initialResearchRunMessage(
+        let initialStatusMessage = oauthSetupHoldMessage ?? initialResearchRunMessage(
             for: cluster,
             preparation: preparation,
-            forceHold: forceHold
+            forceHold: shouldForceHold
         )
         let runIDPrefix = preparation.draftArtifact == nil ? "run" : "local"
         let runID = "\(runIDPrefix)-\(UUID().uuidString)"
