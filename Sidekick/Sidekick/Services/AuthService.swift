@@ -5,6 +5,8 @@ import Network
 import Security
 import UIKit
 
+private let defaultAuthScopes = "openid profile email offline_access"
+
 @MainActor
 final class AuthService: ObservableObject {
     enum AuthError: LocalizedError {
@@ -60,7 +62,7 @@ final class AuthService: ObservableObject {
         clientID: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_CLIENT_ID"] ?? "app_EMoamEEZ73f0CkXaXp7hrann",
         issuer: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_ISSUER"] ?? "https://auth.openai.com",
         callbackPort: UInt16 = UInt16(ProcessInfo.processInfo.environment["SIDEKICK_AUTH_CALLBACK_PORT"] ?? "") ?? 1455,
-        scopes: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_SCOPE"] ?? "openid profile email offline_access api.connectors.read api.connectors.invoke api.responses.write"
+        scopes: String = ProcessInfo.processInfo.environment["SIDEKICK_AUTH_SCOPE"] ?? defaultAuthScopes
     ) {
         self.clientID = clientID
         self.issuer = issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
@@ -125,7 +127,8 @@ final class AuthService: ObservableObject {
 
         if let oauthError = cbComponents.queryItems?.first(where: { $0.name == "error" })?.value {
             let description = cbComponents.queryItems?.first(where: { $0.name == "error_description" })?.value
-            throw AuthError.oauthError(description ?? oauthError.replacingOccurrences(of: "_", with: " "))
+            let fallback = oauthError.replacingOccurrences(of: "_", with: " ")
+            throw AuthError.oauthError(normalizeOAuthMessage(description ?? fallback))
         }
 
         guard let code = cbComponents.queryItems?.first(where: { $0.name == "code" })?.value else {
@@ -262,6 +265,11 @@ final class AuthService: ObservableObject {
         }
 
         isAuthenticated = true
+    }
+
+    private func normalizeOAuthMessage(_ raw: String) -> String {
+        let plusDecoded = raw.replacingOccurrences(of: "+", with: " ")
+        return plusDecoded.removingPercentEncoding ?? plusDecoded
     }
 
     // MARK: - PKCE Helpers
