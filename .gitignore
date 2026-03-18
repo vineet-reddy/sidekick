@@ -11,3 +11,6 @@
 /handoff.md
 /error.log
 TRUSTED_DATASET_REGISTRY_SPEC.md
+
+# Local runtime tooling state
+/.sidekick-runtime/
