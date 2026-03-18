@@ -367,9 +367,11 @@ final class OpenAIService: ObservableObject {
         - Use only the provided notes and source-family cards below.
         - The notes may be typo-heavy, fragmented, or only meaningful in combination; infer the strongest coherent empirical question from the whole note set rather than waiting for polished wording.
         - Treat the trusted dataset cards as candidate source families for a bounded discovery pass, not as a precommitted dataset choice.
+        - Discovery-catalog cards are scouting surfaces, not datasets themselves.
         - Quickly compare topical fit, tractability, likely reachable slice, and reliability across the candidate source families before naming one in `dataset_needs`.
         - Keep the plan concise, empirical, and executable on a first pass.
         - If the cards below are exploratory discovery catalogs or the reliable direct-source fit is weak, plan a bounded source scout across at most 3 candidate public source families and commit to the first tractable narrow slice instead of waiting for a gold-standard dataset.
+        - In an exploratory run, once a tractable public dataset slice is found through a discovery catalog, the run may continue into inspection and analysis without prior registry onboarding as long as provenance is recorded explicitly.
         - Dataset-specific planning guardrails below are binding. If a guardrail says a variable, design element, or comparison must be confirmed first, keep it as a contingent risk or inspection target rather than committing to it in the main question, hypotheses, methods, or figure titles.
         - Prefer exactly one primary source family when it is enough for a credible first-pass paper. Supporting source families should be rare.
         - When the notes imply a broader mechanistic ambition than the reachable slice supports, rewrite the plan around the strongest honest first-pass empirical question the dataset can really answer.
@@ -910,7 +912,7 @@ final class OpenAIService: ObservableObject {
         Resolve the best reachable dataset slice and inspect it only. Do not run the final analysis yet.
 
         Requirements:
-        1. Prefer the vetted dataset cards below before using anything else.
+        1. Prefer vetted direct-source cards below before using anything else. If the listed cards are discovery catalogs, use them only to scout candidate public sources.
         2. Keep internet usage inside the approved domains unless those sources are blocked or insufficient.
         3. Resolve a concrete dataset slice, inspect the schema or metadata, and report what is actually usable for analysis.
         3a. If this run is exploratory, scout at most 3 candidate public source families total and stop searching as soon as one yields a tractable slice with real usable variables.
@@ -935,6 +937,7 @@ final class OpenAIService: ObservableObject {
         9. If the preferred source is only partially reachable, keep the strongest narrow slice from that source instead of switching domains silently.
         10. If the first HTTP client or shell tool hits a tunnel, proxy, or CONNECT-style denial, retry the same approved source with at least one alternate approved-domain access method before concluding the source is blocked.
         11. If multiple trusted dataset cards are listed, choose one primary slice first and stay with it unless the notes explicitly require cross-source validation.
+        11a. If you leave the trusted set during exploratory scouting, that is acceptable for this run, but record the exact chosen public source and domains explicitly.
         12. The final assistant message must contain only the JSON object and nothing before or after it.
 
         Suggested title: \(title)

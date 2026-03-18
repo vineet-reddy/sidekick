@@ -111,6 +111,7 @@ final class HeartbeatManager: ObservableObject {
             phase = .checkingPapers
             print("[Heartbeat] Phase: checking in-flight papers...")
             try await resolveInFlightPapers(modelContext: modelContext)
+            try await reconsiderHeldResearchRunsIfNeeded(modelContext: modelContext)
             try await admitQueuedResearchRunsIfPossible(modelContext: modelContext)
 
             phase = .assessingNotes
@@ -2792,6 +2793,121 @@ final class HeartbeatManager: ObservableObject {
         return "The configured OpenAI API key was rejected. Update or remove it in Settings before retrying queued papers. \(error.localizedDescription)"
     }
 
+    private func reconsiderHeldResearchRunsIfNeeded(modelContext: ModelContext) async throws {
+        let runs = try modelContext.fetch(
+            FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.createdAt, order: .forward)])
+        )
+        let heldRuns = runs.filter { run in
+            run.status == .queued
+                && run.queueState == .held
+                && run.schedulingDisposition == .hold
+                && run.currentStage == .plan
+                && (run.activeTaskID?.isEmpty ?? true)
+        }
+
+        guard !heldRuns.isEmpty else {
+            return
+        }
+
+        let papers = try modelContext.fetch(FetchDescriptor<Paper>())
+        let notes = try modelContext.fetch(FetchDescriptor<Note>())
+        let papersByID = Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0) })
+        let notesByID = Dictionary(uniqueKeysWithValues: notes.map { ($0.id, $0) })
+
+        for run in heldRuns {
+            guard let paper = papersByID[run.paperID] else {
+                continue
+            }
+
+            let sourceNotes = run.sourceNoteIDs.compactMap { notesByID[$0] }
+            guard !sourceNotes.isEmpty else {
+                markResearchRunFailed(
+                    run,
+                    paper: paper,
+                    message: "The source notes for this held paper could not be found."
+                )
+                continue
+            }
+
+            let clusters = try await assessNotesWithRescue(sourceNotes)
+            guard let cluster = bestHeldRunCluster(from: clusters, sourceNoteIDs: Set(sourceNotes.map(\.id))) else {
+                continue
+            }
+
+            let preparation = try await openAI.prepareResearchRun(
+                notes: sourceNotes,
+                title: cluster.suggestedTitle,
+                theme: cluster.theme,
+                datasetIDs: cluster.datasetIDs
+            )
+            let forceHold = !isSubmissionCandidate(cluster)
+            let schedulingDisposition: ResearchRunSchedulingDisposition = forceHold ? .hold : preparation.schedulingDisposition
+            let queueState: ResearchRunQueueState = schedulingDisposition == .autoStart ? .queued : .held
+            let statusMessage = initialResearchRunMessage(
+                for: cluster,
+                preparation: preparation,
+                forceHold: forceHold
+            )
+
+            var didChange = false
+
+            if paper.title != cluster.suggestedTitle {
+                paper.title = cluster.suggestedTitle
+                didChange = true
+            }
+
+            if run.title != cluster.suggestedTitle {
+                run.title = cluster.suggestedTitle
+                didChange = true
+            }
+
+            if run.theme != cluster.theme {
+                run.theme = cluster.theme
+                didChange = true
+            }
+
+            if run.datasetIDs != preparation.selectedDatasetIDs {
+                run.datasetIDs = preparation.selectedDatasetIDs
+                didChange = true
+            }
+
+            if run.allowedDomains != preparation.allowedDomains {
+                run.allowedDomains = preparation.allowedDomains
+                didChange = true
+            }
+
+            if run.registryVersion != preparation.registryVersion {
+                run.registryVersion = preparation.registryVersion
+                didChange = true
+            }
+
+            if run.sourceSupportTier != preparation.sourceSupportTier {
+                run.sourceSupportTier = preparation.sourceSupportTier
+                didChange = true
+            }
+
+            if run.schedulingDisposition != schedulingDisposition {
+                run.schedulingDisposition = schedulingDisposition
+                didChange = true
+            }
+
+            if run.queueState != queueState {
+                run.queueState = queueState
+                didChange = true
+            }
+
+            if run.latestProgressMessage != statusMessage {
+                didChange = true
+            }
+
+            if didChange {
+                print("[Heartbeat]   Re-evaluated held run \(run.runID) under current policy.")
+                run.markQueued(message: statusMessage, queueState: queueState)
+                try persistModelChanges(in: modelContext)
+            }
+        }
+    }
+
     private func admitQueuedResearchRunsIfPossible(modelContext: ModelContext) async throws {
         let runs = try modelContext.fetch(
             FetchDescriptor<ResearchRun>(sortBy: [SortDescriptor(\.createdAt, order: .forward)])
@@ -2849,6 +2965,35 @@ final class HeartbeatManager: ObservableObject {
 
         refreshQueuedRunPresentation(runs, activeCounts: activeCounts)
         try persistModelChanges(in: modelContext)
+    }
+
+    private func bestHeldRunCluster(
+        from clusters: [NoteCluster],
+        sourceNoteIDs: Set<UUID>
+    ) -> NoteCluster? {
+        let candidates = selectedPresentationClusters(from: clusters)
+        guard !candidates.isEmpty else {
+            return nil
+        }
+
+        return candidates.max { lhs, rhs in
+            heldRunClusterScore(lhs, sourceNoteIDs: sourceNoteIDs)
+                < heldRunClusterScore(rhs, sourceNoteIDs: sourceNoteIDs)
+        }
+    }
+
+    private func heldRunClusterScore(
+        _ cluster: NoteCluster,
+        sourceNoteIDs: Set<UUID>
+    ) -> Double {
+        let noteIDs = Set(cluster.noteIDs)
+        let overlap = Double(noteIDs.intersection(sourceNoteIDs).count)
+        let exactMatchBonus: Double = noteIDs == sourceNoteIDs ? 100 : 0
+        let autoStartBonus: Double = isSubmissionCandidate(cluster) ? 20 : 0
+        let titleBonus: Double = cluster.suggestedTitle.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? 0 : 5
+        let notePenalty = Double(abs(noteIDs.count - sourceNoteIDs.count))
+
+        return exactMatchBonus + autoStartBonus + titleBonus + overlap - notePenalty
     }
 
     private func startQueuedResearchRun(

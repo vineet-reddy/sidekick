@@ -148,7 +148,7 @@ nonisolated struct TrustedDataset: Codable, Hashable, Sendable {
 
     func assessmentLine() -> String {
         let disciplinesText = disciplines.prefix(3).joined(separator: ", ")
-        return "[\(id)] \(title) | reliability: \(resolvedSupportTier.rawValue) | disciplines: \(disciplinesText) | use: \(useFor.compactPromptText(limit: 84)) | avoid: \(avoidFor.compactPromptText(limit: 68))"
+        return "[\(id)] \(title) | card: \(promptCardTypeLabel) | reliability: \(resolvedSupportTier.rawValue) | disciplines: \(disciplinesText) | use: \(useFor.compactPromptText(limit: 84)) | avoid: \(avoidFor.compactPromptText(limit: 68))"
     }
 
     func taskLine() -> String {
@@ -167,7 +167,16 @@ nonisolated struct TrustedDataset: Codable, Hashable, Sendable {
             samplingText = ""
         }
 
-        return "[\(id)] \(title) | reliability: \(resolvedSupportTier.rawValue) | disciplines: \(disciplinesText) | use: \(useFor.compactPromptText(limit: 90)) | avoid: \(avoidFor.compactPromptText(limit: 70)) | access: \(accessHint.compactPromptText(limit: 92))\(samplingText) | domains: \(domainsText)\(exampleText)"
+        return "[\(id)] \(title) | card: \(promptCardTypeLabel) | reliability: \(resolvedSupportTier.rawValue) | disciplines: \(disciplinesText) | use: \(useFor.compactPromptText(limit: 90)) | avoid: \(avoidFor.compactPromptText(limit: 70)) | access: \(accessHint.compactPromptText(limit: 92))\(samplingText) | domains: \(domainsText)\(exampleText)"
+    }
+
+    private var promptCardTypeLabel: String {
+        switch entryType {
+        case .directSource:
+            return "direct source"
+        case .discoveryCatalog:
+            return "discovery catalog"
+        }
     }
 
     private static func defaultSupportTier(
