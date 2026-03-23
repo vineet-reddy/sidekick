@@ -62,7 +62,7 @@ struct SettingsView: View {
                         Text("Execution")
                             .font(.headline)
 
-                        Text("Sidekick runs planning, data inspection, analysis, verification, and drafting on Sidekick-hosted OpenAI compute. The app keeps notes, cached artifacts, and local PDF rendering on device.")
+                        Text("Sidekick runs planning, data inspection, analysis, verification, and final paper writing on Sidekick-hosted OpenAI compute. The app keeps notes, cached artifacts, and local PDF rendering on device.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
 

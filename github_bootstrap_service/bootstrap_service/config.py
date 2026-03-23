@@ -48,7 +48,7 @@ class BootstrapServiceConfig:
     backend_max_concurrent_jobs_per_install: int = 1
     backend_artifact_ttl_seconds: int = 24 * 60 * 60
     openai_model: str = "gpt-5.4"
-    openai_reasoning_effort: str = "xhigh"
+    openai_reasoning_effort: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_estimated_input_cost_per_million: float = 0.25
     openai_estimated_output_cost_per_million: float = 2.0
@@ -117,7 +117,7 @@ class BootstrapServiceConfig:
             backend_max_concurrent_jobs_per_install=_int_env("SIDEKICK_BACKEND_MAX_CONCURRENT_JOBS_PER_INSTALL", 1),
             backend_artifact_ttl_seconds=_int_env("SIDEKICK_BACKEND_ARTIFACT_TTL_SECONDS", 24 * 60 * 60),
             openai_model=os.getenv("SIDEKICK_OPENAI_MODEL", "gpt-5.4").strip() or "gpt-5.4",
-            openai_reasoning_effort=os.getenv("SIDEKICK_OPENAI_REASONING_EFFORT", "xhigh").strip() or "xhigh",
+            openai_reasoning_effort=os.getenv("SIDEKICK_OPENAI_REASONING_EFFORT", "").strip(),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1",
             openai_estimated_input_cost_per_million=_float_env(
                 "SIDEKICK_OPENAI_INPUT_COST_PER_MILLION",

@@ -16,8 +16,6 @@ services:
         sync: false
       - key: SIDEKICK_OPENAI_MODEL
         value: gpt-5.4
-      - key: SIDEKICK_OPENAI_REASONING_EFFORT
-        value: xhigh
       - key: SIDEKICK_BACKEND_MAX_JOB_RUNTIME_SECONDS
         value: "3600"
       - key: SIDEKICK_BACKEND_MAX_DAILY_SPEND_USD

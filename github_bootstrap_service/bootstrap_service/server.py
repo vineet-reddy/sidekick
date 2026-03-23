@@ -619,7 +619,30 @@ Requirements:
             output_tokens=response.usage.output_tokens,
             estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
         )
-        bundle = _extract_json_object(response.output_text)
+        bundle = self._normalized_bundle(_extract_json_object(response.output_text), plan=plan, notes_hash=notes_hash)
+        bundle_quality_issues = _find_bundle_quality_issues(bundle)
+        if not bundle_quality_issues:
+            return bundle
+
+        revised_bundle = self._revise_bundle_after_gate_failure(
+            context=context,
+            plan=plan,
+            initial_bundle=bundle,
+            issues=bundle_quality_issues,
+            notes_hash=notes_hash,
+        )
+        revised_issues = _find_bundle_quality_issues(revised_bundle)
+        if revised_issues:
+            raise ValueError("Bundle failed publication gate: " + " ".join(revised_issues[:4]))
+        return revised_bundle
+
+    def _normalized_bundle(
+        self,
+        bundle: dict[str, Any],
+        *,
+        plan: dict[str, Any],
+        notes_hash: str,
+    ) -> dict[str, Any]:
         bundle["plan"] = plan
         bundle["draft"] = {"title": bundle.get("title", ""), "markdown": bundle.get("markdown", "")}
         bundle.setdefault(
@@ -633,10 +656,67 @@ Requirements:
                 "dataset_sources": [],
             },
         )
-        bundle_quality_issues = _find_bundle_quality_issues(bundle)
-        if bundle_quality_issues:
-            raise ValueError("Bundle failed publication gate: " + " ".join(bundle_quality_issues[:4]))
         return bundle
+
+    def _revise_bundle_after_gate_failure(
+        self,
+        *,
+        context: JobContext,
+        plan: dict[str, Any],
+        initial_bundle: dict[str, Any],
+        issues: list[str],
+        notes_hash: str,
+    ) -> dict[str, Any]:
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="analyze",
+            progress_message="Initial bundle failed publication checks. Revising analysis and manuscript.",
+        )
+        instructions = """
+You are revising a scientific paper bundle after a publication gate failure.
+You must either:
+1. produce a corrected, publication-quality empirical bundle from real public data, or
+2. return a blocked bundle that explicitly states why real publication-quality output is not yet possible.
+
+Return strict JSON only with the same bundle schema as before.
+
+Rules:
+- Address every listed gate failure directly.
+- Do not keep draft/demo/synthetic language unless you are explicitly blocking publication.
+- If the first attempt failed because the manuscript was too short, missing sections, missing references, or missing dataset accounting, fix those.
+- If real public data still cannot be obtained or analyzed, set `verification.decision` to `blocked` and explain why in `verification.summary`, `verification.required_revisions`, and provenance notes.
+- The `draft` field must mirror the final manuscript and must not be labeled as a draft.
+"""
+        input_text = json.dumps(
+            {
+                "title": context.request_payload["title"],
+                "theme": context.request_payload["theme"],
+                "notes": context.request_payload["notes"],
+                "plan": plan,
+                "notes_hash": notes_hash,
+                "failed_gate_issues": issues,
+                "previous_bundle": initial_bundle,
+            },
+            sort_keys=True,
+        )
+        response = self._openai_client.generate_json(
+            instructions=instructions,
+            input_text=input_text,
+            use_code_interpreter=True,
+            timeout_seconds=self._config.backend_max_job_runtime_seconds,
+        )
+        self._database.record_paper_job_metrics(
+            job_id=context.job["id"],
+            model=self._config.openai_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
+        )
+        return self._normalized_bundle(
+            _extract_json_object(response.output_text),
+            plan=plan,
+            notes_hash=notes_hash,
+        )
 
     def _audit_bundle(self, context: JobContext, plan: dict[str, Any], bundle: dict[str, Any]) -> None:
         self._database.update_paper_job(
