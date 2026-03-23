@@ -1,0 +1,35 @@
+[
+  {
+    "id": "empirical_dataset",
+    "label": "Empirical Dataset",
+    "description": "Requires a real empirical dataset as the primary substrate for analysis.",
+    "forbidden_primary_family_ids": [
+      "openalex_literature",
+      "pubmed_literature"
+    ]
+  },
+  {
+    "id": "bibliometric",
+    "label": "Bibliometric",
+    "description": "Uses article, author, citation, venue, or institution metadata as the primary substrate.",
+    "forbidden_primary_family_ids": []
+  },
+  {
+    "id": "literature_review",
+    "label": "Literature Review",
+    "description": "Synthesizes findings from prior papers rather than deriving new estimates from a cohort.",
+    "forbidden_primary_family_ids": []
+  },
+  {
+    "id": "methods_simulation",
+    "label": "Methods Simulation",
+    "description": "Evaluates methods or algorithms and may use benchmark or simulated data when explicitly framed that way.",
+    "forbidden_primary_family_ids": []
+  },
+  {
+    "id": "theoretical_commentary",
+    "label": "Theoretical Commentary",
+    "description": "Argumentative or conceptual analysis without a primary dataset.",
+    "forbidden_primary_family_ids": []
+  }
+]

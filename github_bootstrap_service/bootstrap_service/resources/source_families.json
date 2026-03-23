@@ -1,0 +1,62 @@
+[
+  {
+    "id": "gdc_cancer_genomics",
+    "label": "NCI GDC Cancer Genomics",
+    "family_type": "direct_runtime_source",
+    "supported_paper_modes": ["empirical_dataset"],
+    "unit_of_analysis": "patient_or_tumor_sample",
+    "modalities": ["cancer_genomics", "clinical_cohort", "survival"],
+    "trusted_domains": ["api.gdc.cancer.gov", "portal.gdc.cancer.gov", "gdc.cancer.gov"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["glioblastoma", "gbm", "tumor", "cancer", "mutation", "survival", "transcriptomic", "genomics"],
+    "minimum_case_count": 20
+  },
+  {
+    "id": "cbioportal_cancer_studies",
+    "label": "cBioPortal Cancer Studies",
+    "family_type": "direct_runtime_source",
+    "supported_paper_modes": ["empirical_dataset"],
+    "unit_of_analysis": "patient_or_tumor_sample",
+    "modalities": ["cancer_genomics", "clinical_cohort", "survival"],
+    "trusted_domains": ["www.cbioportal.org", "cbioportal.org"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["glioblastoma", "gbm", "tumor", "cancer", "mutation", "survival", "genomics"],
+    "minimum_case_count": 20
+  },
+  {
+    "id": "dandi_neurophysiology",
+    "label": "DANDI Neurophysiology",
+    "family_type": "direct_runtime_source",
+    "supported_paper_modes": ["empirical_dataset"],
+    "unit_of_analysis": "recording_session_or_subject",
+    "modalities": ["neurophysiology", "ieeg", "ecog", "spikes", "lfp"],
+    "trusted_domains": ["api.dandiarchive.org", "dandiarchive.org", "docs.dandiarchive.org"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["epilepsy", "ecog", "ieeg", "intracranial", "seizure", "neurostimulation", "rns", "lfp", "spike"],
+    "minimum_asset_count": 5
+  },
+  {
+    "id": "openneuro_neurophysiology",
+    "label": "OpenNeuro Neurophysiology",
+    "family_type": "direct_runtime_source",
+    "supported_paper_modes": ["empirical_dataset"],
+    "unit_of_analysis": "recording_session_or_subject",
+    "modalities": ["neurophysiology", "ieeg", "eeg", "ecog", "fmri"],
+    "trusted_domains": ["openneuro.org"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["epilepsy", "ieeg", "eeg", "ecog", "seizure", "neurostimulation", "pediatric"],
+    "minimum_asset_count": 1
+  },
+  {
+    "id": "openalex_literature",
+    "label": "OpenAlex Literature",
+    "family_type": "discovery_catalog",
+    "supported_paper_modes": ["bibliometric", "literature_review"],
+    "unit_of_analysis": "article",
+    "modalities": ["bibliographic", "literature"],
+    "trusted_domains": ["api.openalex.org", "openalex.org"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["citation", "bibliometric", "literature", "publication", "review"],
+    "minimum_result_count": 5
+  }
+]

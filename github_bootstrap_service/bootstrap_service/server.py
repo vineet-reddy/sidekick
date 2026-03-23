@@ -22,6 +22,7 @@ from .crypto import decrypt_text, encrypt_text
 from .database import JobClaim, SidekickDatabase, iso_now, utc_now
 from .github_client import GitHubClient, GitHubClientError
 from .openai_client import OpenAIClient
+from .resolver import ResolutionBundle, SourceFamilyResolver
 
 
 def _json_dumps(payload: dict[str, Any]) -> bytes:
@@ -144,6 +145,7 @@ def _find_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
     analysis = bundle.get("analysis") if isinstance(bundle.get("analysis"), dict) else {}
     verification = bundle.get("verification") if isinstance(bundle.get("verification"), dict) else {}
     provenance = bundle.get("provenance") if isinstance(bundle.get("provenance"), dict) else {}
+    resolver = bundle.get("resolver") if isinstance(bundle.get("resolver"), dict) else {}
     analysis_provenance = analysis.get("provenance") if isinstance(analysis.get("provenance"), dict) else {}
     dataset_manifest = analysis.get("dataset_manifest") if isinstance(analysis.get("dataset_manifest"), dict) else {}
     inspection_manifest = (
@@ -260,6 +262,37 @@ def _find_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
     if _count_citation_markers(latex) < 4:
         issues.append("LaTeX manuscript is missing sufficient citation markers.")
 
+    resolver_mode = str(resolver.get("paper_mode") or "").strip().lower()
+    resolver_status = str(resolver.get("status") or "").strip().lower()
+    resolver_candidate = resolver.get("selected_candidate") if isinstance(resolver.get("selected_candidate"), dict) else {}
+    incompatible_families = {
+        str(family_id).strip()
+        for family_id in resolver.get("incompatible_primary_family_ids") or []
+        if str(family_id).strip()
+    }
+    resolver_family_id = str(resolver_candidate.get("family_id") or "").strip()
+    resolver_dataset_id = str(resolver_candidate.get("dataset_id") or "").strip()
+    resolver_access_url = str(resolver_candidate.get("access_url") or "").strip()
+
+    if resolver_mode == "empirical_dataset":
+        if resolver_status != "resolved":
+            issues.append("Resolver did not clear the run for empirical publication.")
+        if not resolver_candidate:
+            issues.append("Resolver did not select a qualifying primary empirical dataset.")
+        if resolver_family_id and resolver_family_id in incompatible_families:
+            issues.append("Resolver selected a forbidden primary source family for an empirical paper.")
+        if resolver_candidate and not bool(resolver_candidate.get("qualifies_as_primary_data")):
+            issues.append("Resolver-selected candidate does not qualify as primary empirical data.")
+
+        dataset_accounting = set(manifest_sources) | set(primary_dataset_ids) | set(used_dataset_ids)
+        normalized_accounting = " ".join(item.lower() for item in dataset_accounting)
+        has_dataset_id = bool(resolver_dataset_id) and resolver_dataset_id.lower() in normalized_accounting
+        has_access_url = bool(resolver_access_url) and resolver_access_url.lower() in normalized_accounting
+        if resolver_dataset_id and not has_dataset_id and not has_access_url:
+            issues.append("Bundle dataset accounting does not cite the resolver-selected dataset id.")
+        if resolver_access_url and not has_access_url and not has_dataset_id:
+            issues.append("Bundle dataset accounting does not cite the resolver-selected dataset URL.")
+
     return issues
 
 
@@ -280,6 +313,12 @@ class JobContext:
     request_payload: dict[str, Any]
 
 
+class JobExecutionError(RuntimeError):
+    def __init__(self, message: str, *, stage: str):
+        super().__init__(message)
+        self.stage = stage
+
+
 class JobProcessor(threading.Thread):
     def __init__(
         self,
@@ -294,6 +333,7 @@ class JobProcessor(threading.Thread):
         self._database = database
         self._github_client = github_client
         self._openai_client = openai_client
+        self._resolver = SourceFamilyResolver()
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -359,7 +399,8 @@ class JobProcessor(threading.Thread):
 
         try:
             plan = self._generate_plan(context)
-            bundle = self._generate_bundle(context, plan)
+            resolution = self._resolve_source_family(context, plan)
+            bundle = self._generate_bundle(context, plan, resolution)
             self._audit_bundle(context, plan, bundle)
             publication = self._publish_bundle(context, bundle)
             self._persist_artifacts(context.job["id"], bundle, publication)
@@ -373,10 +414,11 @@ class JobProcessor(threading.Thread):
                 completed=True,
             )
         except Exception as error:
+            stage = getattr(error, "stage", None)
             self._database.update_paper_job(
                 context.job["id"],
                 status="failed",
-                stage=str((self._database.get_paper_job(context.job["id"]) or context.job).get("stage") or "plan"),
+                stage=str(stage or (self._database.get_paper_job(context.job["id"]) or context.job).get("stage") or "plan"),
                 progress_message=str(error),
                 error_message=str(error),
                 completed=True,
@@ -448,20 +490,49 @@ Keep the plan concise, empirical, and honest. Use web search to identify real pu
         )
         return _extract_json_object(response.output_text)
 
-    def _generate_bundle(self, context: JobContext, plan: dict[str, Any]) -> dict[str, Any]:
+    def _resolve_source_family(self, context: JobContext, plan: dict[str, Any]) -> ResolutionBundle:
         self._database.update_paper_job(
             context.job["id"],
             stage="inspect",
-            progress_message="Inspecting public data and preparing the analysis workspace.",
+            progress_message="Resolving trusted open-data sources before analysis.",
+        )
+        resolution = self._resolver.resolve(
+            title=str(context.request_payload.get("title") or ""),
+            theme=str(context.request_payload.get("theme") or ""),
+            notes=context.request_payload.get("notes") or [],
+            dataset_hints=context.request_payload.get("dataset_hints", [])
+            or context.request_payload.get("dataset_ids", []),
+        )
+        if resolution.status != "resolved":
+            raise JobExecutionError(
+                resolution.blocking_reason or resolution.summary or "No qualifying open dataset found.",
+                stage="inspect",
+            )
+
+        summary = resolution.summary
+        if plan.get("dataset_needs"):
+            summary = f"{summary} Plan requested {len(plan.get('dataset_needs') or [])} dataset roles."
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="inspect",
+            progress_message=summary,
+        )
+        return resolution
+
+    def _generate_bundle(self, context: JobContext, plan: dict[str, Any], resolution: ResolutionBundle) -> dict[str, Any]:
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="inspect",
+            progress_message="Inspecting resolver-selected public data and preparing the analysis workspace.",
         )
         self._database.update_paper_job(
             context.job["id"],
             stage="analyze",
-            progress_message="Running the empirical analysis on OpenAI-hosted compute.",
+            progress_message="Running the analysis on OpenAI-hosted compute.",
         )
         instructions = """
 You are Sidekick's publication engine running in Code Interpreter.
-Produce a real, publication-quality empirical paper from real public data, or fail closed.
+Produce a real, publication-quality scientific paper from real public data, or fail closed.
 Return strict JSON only with this exact shape:
 {
   "title": "string",
@@ -576,15 +647,17 @@ Return strict JSON only with this exact shape:
   }
 }
 Requirements:
-- Use web search to find real public datasets, cohort descriptions, and supporting literature before you analyze anything.
-- Use Code Interpreter to identify, download, inspect, and analyze real public datasets.
-- Treat any `dataset_hints` input as optional suggestions only. You may ignore them if they are stale, low quality, mismatched to the question, or prevent better open-data grounding.
+- Match the requested `resolution.paper_mode`. For `empirical_dataset`, perform real dataset analysis. For `bibliometric`, analyze real article metadata. For `literature_review`, synthesize real literature with explicit screening/accounting. Do not silently change modes.
+- Treat the `resolution` input as authoritative. The selected candidate is the primary empirical source unless the paper mode explicitly says otherwise.
+- Use web search only for supporting literature, dataset documentation, and methodological context. Do not substitute a different primary dataset unless the resolver explicitly selected it.
+- Use Code Interpreter to identify, download, inspect, and analyze the resolver-selected public dataset.
+- Treat any `dataset_hints` input as optional suggestions only. They must not override the resolved source family or selected candidate.
 - Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
 - If real public data cannot be accessed and analyzed, set `verification.decision` to `blocked`, explain exactly why, and do not fabricate results.
 - The manuscript must read like a professional arXiv paper, not a scaffold: include Abstract, Introduction, Methods, Results, Discussion, Limitations, and References.
 - The manuscript must contain inline citations and a non-trivial references section.
 - `analysis_files` must include at minimum `analysis.py`, `requirements.txt`, and `Makefile`, and the code must reproduce the figures and tables from raw/public data.
-- `manifest.dataset_sources`, `inspection.dataset_manifest.primary_dataset_ids`, `analysis.dataset_manifest.primary_dataset_ids`, and `provenance.used_dataset_ids` must all be populated with real dataset identifiers or URLs.
+- `manifest.dataset_sources`, `inspection.dataset_manifest.primary_dataset_ids`, `analysis.dataset_manifest.primary_dataset_ids`, and `provenance.used_dataset_ids` must all be populated with real dataset identifiers or URLs and must account for the resolver-selected dataset.
 - `analysis.dataset_manifest.row_count` must reflect real analyzed data and be greater than zero.
 - `verification.decision` may be `proceed` only if the evidence supports publication-quality empirical claims.
 - Keep repository paths out of the paper text; cite sources in the paper body itself.
@@ -599,6 +672,7 @@ Requirements:
                 "theme": context.request_payload["theme"],
                 "dataset_hints": context.request_payload.get("dataset_hints", [])
                 or context.request_payload.get("dataset_ids", []),
+                "resolution": resolution.as_dict(),
                 "plan": plan,
                 "notes_hash": notes_hash,
                 "notes": notes,
@@ -625,7 +699,12 @@ Requirements:
             output_tokens=response.usage.output_tokens,
             estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
         )
-        bundle = self._normalized_bundle(_extract_json_object(response.output_text), plan=plan, notes_hash=notes_hash)
+        bundle = self._normalized_bundle(
+            _extract_json_object(response.output_text),
+            plan=plan,
+            notes_hash=notes_hash,
+            resolution=resolution,
+        )
         bundle_quality_issues = _find_bundle_quality_issues(bundle)
         if not bundle_quality_issues:
             return bundle
@@ -633,6 +712,7 @@ Requirements:
         revised_bundle = self._revise_bundle_after_gate_failure(
             context=context,
             plan=plan,
+            resolution=resolution,
             initial_bundle=bundle,
             issues=bundle_quality_issues,
             notes_hash=notes_hash,
@@ -648,8 +728,10 @@ Requirements:
         *,
         plan: dict[str, Any],
         notes_hash: str,
+        resolution: ResolutionBundle,
     ) -> dict[str, Any]:
         bundle["plan"] = plan
+        bundle["resolver"] = resolution.as_dict()
         bundle["draft"] = {"title": bundle.get("title", ""), "markdown": bundle.get("markdown", "")}
         bundle.setdefault(
             "manifest",
@@ -669,6 +751,7 @@ Requirements:
         *,
         context: JobContext,
         plan: dict[str, Any],
+        resolution: ResolutionBundle,
         initial_bundle: dict[str, Any],
         issues: list[str],
         notes_hash: str,
@@ -687,7 +770,8 @@ You must either:
 Return strict JSON only with the same bundle schema as before.
 
 Rules:
-- Use web search again if needed to find valid public datasets, literature, or missing citation details.
+- Keep the `resolution` input authoritative. Do not switch to a different primary empirical source unless it is already present in the resolver bundle.
+- Use web search again if needed to find missing citation details or supporting documentation for the already-resolved source family.
 - Address every listed gate failure directly.
 - Do not keep draft/demo/synthetic language unless you are explicitly blocking publication.
 - If the first attempt failed because the manuscript was too short, missing sections, missing references, or missing dataset accounting, fix those.
@@ -700,6 +784,7 @@ Rules:
                 "theme": context.request_payload["theme"],
                 "notes": context.request_payload["notes"],
                 "plan": plan,
+                "resolution": resolution.as_dict(),
                 "notes_hash": notes_hash,
                 "failed_gate_issues": issues,
                 "previous_bundle": initial_bundle,
@@ -724,6 +809,7 @@ Rules:
             _extract_json_object(response.output_text),
             plan=plan,
             notes_hash=notes_hash,
+            resolution=resolution,
         )
 
     def _audit_bundle(self, context: JobContext, plan: dict[str, Any], bundle: dict[str, Any]) -> None:
@@ -734,7 +820,7 @@ Rules:
         )
         instructions = """
 You are a hard-nosed publication auditor.
-Review the proposed paper bundle and decide whether it is a real, publication-quality empirical paper.
+Review the proposed paper bundle and decide whether it is a real, publication-quality scientific paper grounded in the resolver-selected source family.
 Return strict JSON only with this exact shape:
 {
   "accept": true,
@@ -820,6 +906,7 @@ Generated by Sidekick.
 
 - Paper markdown: `paper.md`
 - Paper LaTeX: `paper.tex`
+- Resolver trace: `resolver.json`
 - Reproducibility entrypoint: `{bundle['manifest'].get('entrypoint', 'analysis.py')}`
 - Run command: `{bundle['manifest'].get('run_command', 'python analysis.py')}`
 """
@@ -839,6 +926,7 @@ Generated by Sidekick.
             f"{directory}/paper.tex": str(bundle.get("latex") or ""),
             f"{directory}/manifest.json": json.dumps(bundle.get("manifest") or {}, indent=2, sort_keys=True),
             f"{directory}/plan.json": json.dumps(bundle.get("plan") or {}, indent=2, sort_keys=True),
+            f"{directory}/resolver.json": json.dumps(bundle.get("resolver") or {}, indent=2, sort_keys=True),
             f"{directory}/inspection.json": json.dumps(bundle.get("inspection") or {}, indent=2, sort_keys=True),
             f"{directory}/analysis.json": json.dumps(bundle.get("analysis") or {}, indent=2, sort_keys=True),
             f"{directory}/verification.json": json.dumps(bundle.get("verification") or {}, indent=2, sort_keys=True),

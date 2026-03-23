@@ -111,6 +111,32 @@ def _valid_bundle() -> dict:
             "external_sources": ["https://dandiarchive.org/dandiset/000123"],
             "notes": "Used a public DANDI dataset and cited external literature.",
         },
+        "resolver": {
+            "paper_mode": "empirical_dataset",
+            "inferred_modalities": ["neurophysiology"],
+            "acceptable_units": ["recording_session", "subject"],
+            "incompatible_primary_family_ids": ["openalex_literature", "pubmed_literature"],
+            "status": "resolved",
+            "summary": "Selected DANDI:000123 from DANDI Neurophysiology as the primary empirical source.",
+            "blocking_reason": None,
+            "selected_candidate": {
+                "family_id": "dandi_neurophysiology",
+                "family_label": "DANDI Neurophysiology",
+                "dataset_id": "DANDI:000123",
+                "title": "Example DANDI dataset",
+                "summary": "Example empirical neurophysiology dataset.",
+                "access_url": "https://dandiarchive.org/dandiset/000123",
+                "primary_domain": "dandiarchive.org",
+                "trusted_domains": ["dandiarchive.org", "api.dandiarchive.org"],
+                "unit_of_analysis": "recording_session_or_subject",
+                "modalities": ["neurophysiology"],
+                "score": 24.0,
+                "evidence_count": 8,
+                "qualifies_as_primary_data": True,
+                "provenance_note": "Resolved deterministically from the DANDI API.",
+            },
+            "candidates": [],
+        },
         "inspection": {
             "dataset_manifest": {
                 "primary_dataset_ids": ["DANDI:000123"],
@@ -211,6 +237,18 @@ class PublicationGateTests(unittest.TestCase):
         self.assertTrue(any("banned draft/demo language" in issue for issue in issues))
         self.assertTrue(any("Verification did not approve publication" in issue for issue in issues))
         self.assertTrue(any("row count" in issue for issue in issues))
+
+    def test_rejects_bundle_that_ignores_resolver_selected_dataset(self) -> None:
+        bundle = _valid_bundle()
+        bundle["manifest"]["dataset_sources"] = ["OpenAlex:W123"]
+        bundle["analysis"]["dataset_manifest"]["primary_dataset_ids"] = ["OpenAlex:W123"]
+        bundle["inspection"]["dataset_manifest"]["primary_dataset_ids"] = ["OpenAlex:W123"]
+        bundle["provenance"]["used_dataset_ids"] = ["OpenAlex:W123"]
+        bundle["analysis"]["provenance"]["used_dataset_ids"] = ["OpenAlex:W123"]
+
+        issues = _find_bundle_quality_issues(bundle)
+        self.assertTrue(any("resolver-selected dataset id" in issue for issue in issues))
+        self.assertTrue(any("resolver-selected dataset URL" in issue for issue in issues))
 
 
 if __name__ == "__main__":
