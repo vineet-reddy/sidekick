@@ -155,6 +155,11 @@ final class GitHubService: ObservableObject {
             key: sidekickGitHubConnectSessionDefaultsKey,
             decoder: decoder
         )
+        if let activeConnectSession,
+           activeConnectSession.browserURL.host?.lowercased() != "github.com" {
+            self.activeConnectSession = nil
+            defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+        }
     }
 
     var isConnected: Bool {
