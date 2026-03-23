@@ -1,2 +1,2 @@
-// Copy to BootstrapService.xcconfig and set the deployed bootstrap URL.
-SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL = https://your-bootstrap-service.example.com
+// Copy to BootstrapService.xcconfig if you want to override the default deployed bootstrap URL.
+SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL = https://sidekick-ion1.onrender.com

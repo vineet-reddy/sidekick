@@ -79,10 +79,10 @@ final class GitHubService: ObservableObject {
         var errorDescription: String? {
             switch self {
             case .bootstrapServiceNotConfigured:
-                return "Sidekick could not find a GitHub bootstrap service URL. Configure SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL to a deployed bootstrap service before using the GitHub workspace flow."
+                return "Sidekick could not find its GitHub workspace service configuration."
             case let .bootstrapServiceUnavailable(url):
                 return """
-                Sidekick could not reach the GitHub bootstrap service at \(url.absoluteString). Start the bootstrap service or point SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL at the deployed service, then try again.
+                Sidekick could not reach its GitHub workspace service at \(url.absoluteString). Try again in a moment.
                 """
             case .invalidResponse:
                 return "The GitHub bootstrap service returned an unexpected response."
