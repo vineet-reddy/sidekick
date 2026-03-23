@@ -23,7 +23,7 @@ enum ResearchRunStage: String, Codable, CaseIterable {
         case .verify:
             return "Verifying evidence"
         case .write:
-            return "Drafting paper"
+            return "Writing paper"
         case .typeset:
             return "Typesetting PDF"
         }
