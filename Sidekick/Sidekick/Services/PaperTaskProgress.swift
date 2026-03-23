@@ -3,6 +3,7 @@ import Foundation
 nonisolated struct PaperTaskProgressSnapshot: Codable {
     let taskID: String
     let status: String
+    let backendStage: String?
     let observedAt: Date
     let taskCreatedAt: Date?
     let assistantTurnCreatedAt: Date?

@@ -167,13 +167,13 @@ final class HeartbeatManager: ObservableObject {
 
             let result = try await openAI.checkTask(run.runID)
             switch result {
-            case let .waiting(snapshot):
+            case .waiting:
                 continue
             case let .completed(snapshot, artifacts):
                 persistTaskProgress(snapshot)
                 apply(snapshot: snapshot, to: run)
                 try await applyCompletedArtifacts(artifacts, to: paper, run: run)
-            case let .failed(snapshot, message):
+            case .failed:
                 continue
             }
         }
@@ -186,20 +186,49 @@ final class HeartbeatManager: ObservableObject {
         }
 
         run.markRunning(
-            stage: stage(from: run.currentStage, backendStageRaw: snapshot.latestEventText),
+            stage: stage(
+                from: run.currentStage,
+                backendStageRaw: snapshot.backendStage,
+                backendMessage: snapshot.latestEventText
+            ),
             message: snapshot.latestEventText
         )
     }
 
-    private func stage(from current: ResearchRunStage, backendStageRaw: String?) -> ResearchRunStage {
+    private func stage(
+        from current: ResearchRunStage,
+        backendStageRaw: String?,
+        backendMessage: String?
+    ) -> ResearchRunStage {
         let normalized = backendStageRaw?
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
-        guard !normalized.isEmpty else {
+
+        switch normalized {
+        case let value where value.contains("plan"):
+            return .plan
+        case let value where value.contains("inspect"):
+            return .inspect
+        case let value where value.contains("analy"):
+            return .analyze
+        case let value where value.contains("verify"):
+            return .verify
+        case let value where value.contains("draft"),
+             let value where value.contains("publish"),
+             let value where value.contains("write"):
+            return .write
+        default:
+            break
+        }
+
+        let fallback = backendMessage?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        guard !fallback.isEmpty else {
             return current
         }
 
-        switch normalized {
+        switch fallback {
         case let value where value.contains("plan"):
             return .plan
         case let value where value.contains("inspect"):

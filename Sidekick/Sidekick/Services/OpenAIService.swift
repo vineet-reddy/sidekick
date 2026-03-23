@@ -128,7 +128,7 @@ private struct AnalysisFilePayload: Decodable {
 private struct PaperBundlePayload: Decodable {
     let title: String
     let markdown: String
-    let latex: String
+    let latex: String?
     let analysisFiles: [AnalysisFilePayload]?
     let figures: [ResearchFigureArtifact]?
     let manifest: [String: JSONValue]?
@@ -336,7 +336,7 @@ final class OpenAIService: ObservableObject {
                 "title": title,
                 "theme": theme,
                 "dataset_ids": [],
-                "dataset_hints": selectedDatasets.map(\.id),
+                "dataset_hints": [],
                 "allowed_domains": [],
                 "notes": notes.map {
                     [
@@ -364,6 +364,7 @@ final class OpenAIService: ObservableObject {
         let snapshot = PaperTaskProgressSnapshot(
             taskID: status.jobID,
             status: status.status,
+            backendStage: status.stage,
             observedAt: .now,
             taskCreatedAt: status.createdAt,
             assistantTurnCreatedAt: status.updatedAt,
@@ -390,7 +391,7 @@ final class OpenAIService: ObservableObject {
             let artifacts = PaperArtifacts(
                 title: bundle.title,
                 markdown: bundle.markdown,
-                latex: bundle.latex,
+                latex: bundle.latex ?? "",
                 figures: figureBytes,
                 provenance: bundle.provenance ?? bundle.analysis?.provenance,
                 plan: bundle.plan,
