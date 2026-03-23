@@ -37,6 +37,7 @@ class OpenAIClient:
         instructions: str,
         input_text: str,
         use_code_interpreter: bool,
+        use_web_search: bool = False,
         timeout_seconds: int,
     ) -> OpenAIResponseResult:
         payload: dict[str, Any] = {
@@ -50,13 +51,18 @@ class OpenAIClient:
                 "effort": self._config.openai_reasoning_effort,
             }
 
+        tools: list[dict[str, Any]] = []
+        if use_web_search:
+            tools.append({"type": "web_search"})
         if use_code_interpreter:
-            payload["tools"] = [
+            tools.append(
                 {
                     "type": "code_interpreter",
                     "container": {"type": "auto"},
                 }
-            ]
+            )
+        if tools:
+            payload["tools"] = tools
 
         created = self._request_json("POST", "/responses", payload)
         response_id = str(created.get("id") or "").strip()

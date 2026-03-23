@@ -414,7 +414,7 @@ Return strict JSON only with this exact shape:
   "risks": ["string"],
   "execution_notes": "string"
 }
-Keep the plan concise, empirical, and honest. Use public data and reproducibility-friendly methods.
+Keep the plan concise, empirical, and honest. Use web search to identify real public datasets and core citations whenever the notes do not already name them explicitly. Prefer public datasets that are directly downloadable and reproducibility-friendly.
 """
         notes = context.request_payload["notes"]
         input_text = json.dumps(
@@ -430,6 +430,7 @@ Keep the plan concise, empirical, and honest. Use public data and reproducibilit
             instructions=instructions,
             input_text=input_text,
             use_code_interpreter=False,
+            use_web_search=True,
             timeout_seconds=min(300, self._config.backend_max_job_runtime_seconds),
         )
         self._database.update_paper_job(
@@ -574,6 +575,7 @@ Return strict JSON only with this exact shape:
   }
 }
 Requirements:
+- Use web search to find real public datasets, cohort descriptions, and supporting literature before you analyze anything.
 - Use Code Interpreter to identify, download, inspect, and analyze real public datasets.
 - Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
 - If real public data cannot be accessed and analyzed, set `verification.decision` to `blocked`, explain exactly why, and do not fabricate results.
@@ -604,6 +606,7 @@ Requirements:
             instructions=instructions,
             input_text=input_text,
             use_code_interpreter=True,
+            use_web_search=True,
             timeout_seconds=self._config.backend_max_job_runtime_seconds,
         )
         self._database.update_paper_job(
@@ -681,6 +684,7 @@ You must either:
 Return strict JSON only with the same bundle schema as before.
 
 Rules:
+- Use web search again if needed to find valid public datasets, literature, or missing citation details.
 - Address every listed gate failure directly.
 - Do not keep draft/demo/synthetic language unless you are explicitly blocking publication.
 - If the first attempt failed because the manuscript was too short, missing sections, missing references, or missing dataset accounting, fix those.
@@ -703,6 +707,7 @@ Rules:
             instructions=instructions,
             input_text=input_text,
             use_code_interpreter=True,
+            use_web_search=True,
             timeout_seconds=self._config.backend_max_job_runtime_seconds,
         )
         self._database.record_paper_job_metrics(
