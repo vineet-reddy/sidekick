@@ -125,6 +125,33 @@ def _count_citation_markers(text: str) -> int:
     return sum(len(re.findall(pattern, text, flags=re.IGNORECASE)) for pattern in patterns)
 
 
+def _find_banned_draft_language(text: str) -> list[str]:
+    hits: list[str] = []
+    phrase_patterns = {
+        "synthetic data": r"\bsynthetic\s+(?:data|dataset|datasets|results?|sample|samples|analysis|bundle)\b",
+        "simulated data": r"\bsimulated\s+(?:data|dataset|datasets|results?|sample|samples|analysis|bundle)\b",
+        "illustrative example": r"\billustrative\s+(?:example|analysis|dataset|results?)\b",
+        "demo mode": r"\bdemo mode\b",
+        "demonstration dataset": r"\bdemonstration dataset\b",
+        "mock data": r"\bmock data\b",
+        "toy example": r"\btoy example\b",
+        "scaffold manuscript": r"\bscaffold(?:ed)?\s+(?:paper|manuscript|bundle)\b",
+        "placeholder data": r"\bplaceholder\s+(?:data|dataset|figure|figures|table|tables|result|results|manuscript|paper|text)\b",
+        "this draft": r"\bthis draft\b",
+        "(draft)": r"\(draft\)",
+        "reproducible analysis bundle (draft)": r"\breproducible analysis bundle \(draft\)\b",
+        "does not constitute empirical evidence": r"\bdoes not constitute empirical evidence\b",
+        "next steps for empirical work": r"\bnext steps for empirical work\b",
+        "no real public": r"\bno real public\b",
+        "not be interpreted as empirical": r"\bnot be interpreted as empirical\b",
+    }
+    lowered = text.lower()
+    for label, pattern in phrase_patterns.items():
+        if re.search(pattern, lowered):
+            hits.append(label)
+    return hits
+
+
 def _required_analysis_files_present(bundle: dict[str, Any]) -> list[str]:
     required = {"analysis.py", "requirements.txt", "makefile"}
     seen = {
@@ -160,19 +187,8 @@ def _find_analysis_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
         ] if part
     ).lower()
 
-    banned_phrases = [
-        "synthetic",
-        "simulated",
-        "illustrative",
-        "demo mode",
-        "mock data",
-        "toy example",
-        "placeholder",
-        "no real public",
-    ]
-    for phrase in banned_phrases:
-        if phrase in combined_text:
-            issues.append(f"Analysis bundle contains banned draft/demo language: '{phrase}'.")
+    for phrase in _find_banned_draft_language(combined_text):
+        issues.append(f"Analysis bundle contains banned draft/demo language: '{phrase}'.")
 
     if not title:
         issues.append("Analysis bundle is missing a title.")
@@ -278,27 +294,8 @@ def _find_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
         ] if part
     ).lower()
 
-    banned_phrases = [
-        "synthetic",
-        "simulated",
-        "illustrative",
-        "demo mode",
-        "demonstration dataset",
-        "mock data",
-        "toy example",
-        "scaffold",
-        "placeholder",
-        "this draft",
-        "(draft)",
-        "reproducible analysis bundle (draft)",
-        "does not constitute empirical evidence",
-        "next steps for empirical work",
-        "no real public",
-        "not be interpreted as empirical",
-    ]
-    for phrase in banned_phrases:
-        if phrase in combined_text:
-            issues.append(f"Bundle contains banned draft/demo language: '{phrase}'.")
+    for phrase in _find_banned_draft_language(combined_text):
+        issues.append(f"Bundle contains banned draft/demo language: '{phrase}'.")
 
     if not title or "draft" in title.lower():
         issues.append("Title is missing or still labeled as a draft.")

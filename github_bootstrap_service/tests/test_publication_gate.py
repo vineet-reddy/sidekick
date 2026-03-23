@@ -4,7 +4,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
-from bootstrap_service.server import _find_bundle_quality_issues
+from bootstrap_service.server import _find_analysis_bundle_quality_issues, _find_bundle_quality_issues
 
 
 def _full_markdown() -> str:
@@ -249,6 +249,15 @@ class PublicationGateTests(unittest.TestCase):
         issues = _find_bundle_quality_issues(bundle)
         self.assertTrue(any("resolver-selected dataset id" in issue for issue in issues))
         self.assertTrue(any("resolver-selected dataset URL" in issue for issue in issues))
+
+    def test_does_not_reject_bare_placeholder_word_without_fake_data_context(self) -> None:
+        bundle = _valid_bundle()
+        bundle["provenance"]["notes"] = "Repository cleanup removed an old placeholder comment before final export."
+        bundle["analysis"]["provenance"]["notes"] = "A placeholder token in earlier local code was removed before analysis."
+        bundle["inspection"]["access_notes"] = "Data were downloaded normally."
+
+        self.assertEqual(_find_analysis_bundle_quality_issues(bundle), [])
+        self.assertEqual(_find_bundle_quality_issues(bundle), [])
 
 
 if __name__ == "__main__":
