@@ -687,37 +687,6 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                 install_session["id"],
                 self.server.config.github_connect_session_ttl_seconds,
             )
-            if self.server.config.github_access_token:
-                try:
-                    user = self.server.github_client.fetch_authenticated_user(self.server.config.github_access_token)
-                    repo = self.server.github_client.ensure_sidekick_repository(
-                        self.server.config.github_access_token,
-                        owner=user.login,
-                    )
-                    self.server.database.upsert_github_connection(
-                        install_session_id=install_session["id"],
-                        github_login=user.login,
-                        repo_owner=user.login,
-                        repo_name=repo.name,
-                        repo_full_name=repo.full_name,
-                        repo_url=repo.html_url or f"https://github.com/{repo.full_name}",
-                        access_token_encrypted=encrypt_text(
-                            self.server.config.github_access_token,
-                            self.server.config.encryption_secret,
-                        ),
-                        visibility=repo.visibility,
-                    )
-                    session = self.server.database.update_github_connect_session(
-                        session["id"],
-                        status="completed",
-                        error_message=None,
-                    ) or session
-                except GitHubClientError as error:
-                    session = self.server.database.update_github_connect_session(
-                        session["id"],
-                        status="failed",
-                        error_message=str(error),
-                    ) or session
             self._send_json(HTTPStatus.CREATED, self._github_connect_session_payload(session))
             return
 

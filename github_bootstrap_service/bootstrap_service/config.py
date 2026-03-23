@@ -38,7 +38,6 @@ class BootstrapServiceConfig:
     github_repo_name: str = "sidekick"
     github_repo_description: str = "Reproducible research artifacts published by Sidekick."
     github_repo_visibility: str = "public"
-    github_access_token: str | None = None
     github_connect_session_ttl_seconds: int = 3600
     backend_database_path: str = ".sidekick-runtime/backend.sqlite3"
     backend_artifact_root: str = ".sidekick-runtime/paper-artifacts"
@@ -105,7 +104,6 @@ class BootstrapServiceConfig:
             ).strip()
             or "Reproducible research artifacts published by Sidekick.",
             github_repo_visibility=(os.getenv("SIDEKICK_GITHUB_REPO_VISIBILITY", "public").strip() or "public").lower(),
-            github_access_token=(os.getenv("SIDEKICK_GITHUB_ACCESS_TOKEN") or "").strip() or None,
             github_connect_session_ttl_seconds=_int_env("SIDEKICK_GITHUB_CONNECT_SESSION_TTL_SECONDS", 3600),
             backend_database_path=os.getenv("SIDEKICK_BACKEND_DATABASE_PATH", ".sidekick-runtime/backend.sqlite3").strip()
             or ".sidekick-runtime/backend.sqlite3",

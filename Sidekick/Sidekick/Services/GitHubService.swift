@@ -277,10 +277,6 @@ final class GitHubService: ObservableObject {
             return URL(string: environmentValue)
         }
 
-#if targetEnvironment(simulator)
-        return URL(string: "http://127.0.0.1:8787")
-#else
-
         let infoValue = (Bundle.main.object(forInfoDictionaryKey: "SidekickGitHubBootstrapBaseURL") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let infoValue,
@@ -290,7 +286,6 @@ final class GitHubService: ObservableObject {
         }
 
         return URL(string: infoValue)
-#endif
     }
 
     private var deviceID: String {
