@@ -62,6 +62,80 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertEqual(citations[0].filename, "table_1.csv")
         self.assertEqual(citations[0].annotated_text, annotated_text)
 
+    def test_extracts_container_ids_from_response_payload(self) -> None:
+        client = OpenAIClient(_config())
+        response = OpenAIResponseResult(
+            response_id="resp_123",
+            output_text="{}",
+            usage=OpenAIUsage(input_tokens=10, output_tokens=12),
+            payload={
+                "output": [
+                    {"type": "code_interpreter_call", "container_id": "cntr_123"},
+                    {
+                        "type": "message",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": "done",
+                                "annotations": [
+                                    {
+                                        "type": "container_file_citation",
+                                        "container_id": "cntr_123",
+                                        "file_id": "cfile_123",
+                                        "filename": "table_1.csv",
+                                    }
+                                ],
+                            }
+                        ],
+                    },
+                ]
+            },
+        )
+
+        self.assertEqual(client.extract_container_ids(response), ["cntr_123"])
+
+    def test_lists_container_files_across_pages(self) -> None:
+        class StubOpenAIClient(OpenAIClient):
+            def __init__(self) -> None:
+                super().__init__(_config())
+                self.paths: list[str] = []
+
+            def _request_json(self, method: str, path: str, body: dict[str, object] | None) -> dict[str, object]:
+                self.paths.append(path)
+                if path == "/containers/cntr_123/files":
+                    return {
+                        "data": [
+                            {
+                                "id": "cfile_1",
+                                "path": "/mnt/data/artifacts/table_1.csv",
+                                "mime_type": "text/csv",
+                            }
+                        ],
+                        "has_more": True,
+                        "last_id": "cfile_1",
+                    }
+                if path == "/containers/cntr_123/files?after=cfile_1":
+                    return {
+                        "data": [
+                            {
+                                "id": "cfile_2",
+                                "path": "/mnt/data/artifacts/figure_1.png",
+                                "mime_type": "image/png",
+                            }
+                        ],
+                        "has_more": False,
+                        "last_id": "cfile_2",
+                    }
+                raise AssertionError(f"Unexpected path: {path}")
+
+        client = StubOpenAIClient()
+        files = client.list_container_files(container_id="cntr_123")
+
+        self.assertEqual(client.paths, ["/containers/cntr_123/files", "/containers/cntr_123/files?after=cfile_1"])
+        self.assertEqual([file.file_id for file in files], ["cfile_1", "cfile_2"])
+        self.assertEqual(files[0].filename, "table_1.csv")
+        self.assertEqual(files[1].mime_type, "image/png")
+
 
 if __name__ == "__main__":
     unittest.main()

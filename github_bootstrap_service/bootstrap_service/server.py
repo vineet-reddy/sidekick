@@ -22,7 +22,7 @@ from .config import BootstrapServiceConfig
 from .crypto import decrypt_text, encrypt_text
 from .database import JobClaim, SidekickDatabase, iso_now, utc_now
 from .github_client import GitHubClient, GitHubClientError
-from .openai_client import OpenAIClient, OpenAIContainerFileCitation
+from .openai_client import OpenAIClient, OpenAIContainerFile
 
 
 def _json_dumps(payload: dict[str, Any]) -> bytes:
@@ -112,6 +112,16 @@ def _artifact_path_value(artifact: dict[str, Any]) -> str:
 
 def _artifact_source_ids(artifact: dict[str, Any]) -> list[str]:
     return _normalize_text_list(artifact.get("source_ids") or artifact.get("sources"))
+
+
+def _path_candidates(value: str) -> set[str]:
+    raw = value.strip()
+    if not raw:
+        return set()
+    sanitized = _sanitize_relative_path(raw, fallback="")
+    basename = Path(sanitized or raw).name
+    candidates = {candidate for candidate in {raw, sanitized, basename} if candidate}
+    return candidates
 
 
 def _find_banned_phrases(text: str) -> list[str]:
@@ -226,6 +236,26 @@ class DownloadedArtifactFile:
     metadata_path: str
     mime_type: str
     sha256: str
+
+
+def _build_validation_error_message(validation: dict[str, Any]) -> str:
+    lines = [str(validation.get("summary") or "Validation blocked the run.").strip() or "Validation blocked the run."]
+
+    dropped_claims = validation.get("dropped_claims") or []
+    if isinstance(dropped_claims, list):
+        for entry in dropped_claims[:3]:
+            if not isinstance(entry, dict):
+                continue
+            claim_id = str(entry.get("claim_id") or "claim").strip() or "claim"
+            reasons = [str(reason).strip() for reason in entry.get("reasons") or [] if str(reason).strip()]
+            if reasons:
+                lines.append(f"{claim_id}: {'; '.join(reasons)}")
+
+    if len(lines) == 1:
+        issues = [str(issue).strip() for issue in validation.get("validation_issues") or [] if str(issue).strip()]
+        lines.extend(issues[:3])
+
+    return "\n".join(lines)
 
 
 def _build_task_provenance(ledger: dict[str, Any]) -> dict[str, Any]:
@@ -367,7 +397,7 @@ class JobProcessor(threading.Thread):
             validation = self._validate_ledger(context.job["id"], ledger)
             if validation.get("status") != "approved":
                 raise JobExecutionError(
-                    str(validation.get("summary") or "Validation blocked the run."),
+                    _build_validation_error_message(validation),
                     stage="verify",
                 )
 
@@ -454,6 +484,7 @@ Return strict JSON only with this exact shape:
 Rules:
 - Save every cited artifact as a real file in the container. Do not inline binary data or giant tables into JSON.
 - Reference each saved file exactly by the filename or path you created so it can be retrieved later.
+- Before returning, ensure every `artifacts[].path` value matches a real saved container file path or basename exactly. Rename files if needed.
 - Claims must be conservative, uncertainty-aware, and narrower than the evidence if needed.
 - If a claim is not clearly supported by a real file artifact plus reproducible source provenance, omit it.
 - Source provenance must include reproducible retrieval information such as an accession id, direct download URL, or concrete API query. Landing pages alone are insufficient.
@@ -493,8 +524,12 @@ Rules:
             _extract_json_object(response.output_text),
             title_fallback=str(context.request_payload.get("title") or "Research paper"),
         )
-        citations = self._openai_client.extract_container_file_citations(response)
-        downloaded_files = self._materialize_workspace_files(context.job["id"], ledger, citations)
+        container_ids = self._openai_client.extract_container_ids(response)
+        downloaded_files = self._materialize_workspace_files(
+            context.job["id"],
+            ledger,
+            container_ids=container_ids,
+        )
         self._apply_downloaded_files_to_ledger(ledger, downloaded_files)
         _write_json_file(self._job_directory(context.job["id"]) / "ledger.json", ledger)
         return ledger
@@ -503,77 +538,78 @@ Rules:
         self,
         job_id: str,
         ledger: dict[str, Any],
-        citations: list[OpenAIContainerFileCitation],
+        *,
+        container_ids: list[str],
     ) -> list[DownloadedArtifactFile]:
         workspace_directory = self._job_directory(job_id)
         downloaded_files: list[DownloadedArtifactFile] = []
         claimed_artifact_ids: set[str] = set()
+        container_files: list[OpenAIContainerFile] = []
+        seen_file_keys: set[tuple[str, str]] = set()
+        for container_id in container_ids:
+            for container_file in self._openai_client.list_container_files(container_id=container_id):
+                key = (container_file.container_id, container_file.file_id)
+                if key in seen_file_keys:
+                    continue
+                seen_file_keys.add(key)
+                container_files.append(container_file)
 
-        for citation in citations:
-            metadata = self._openai_client.get_container_file_metadata(
-                container_id=citation.container_id,
-                file_id=citation.file_id,
+        claimed_file_keys: set[tuple[str, str]] = set()
+        for artifact in ledger.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            if artifact_id and artifact_id in claimed_artifact_ids:
+                continue
+            declared_path = _artifact_path_value(artifact)
+            artifact_candidates = _path_candidates(declared_path)
+            if not artifact_candidates:
+                continue
+
+            matched_file = next(
+                (
+                    container_file
+                    for container_file in container_files
+                    if (container_file.container_id, container_file.file_id) not in claimed_file_keys
+                    and artifact_candidates
+                    & (_path_candidates(container_file.path) | _path_candidates(container_file.filename))
+                ),
+                None,
             )
+            if matched_file is None:
+                continue
+
             raw_bytes = self._openai_client.download_container_file_bytes(
-                container_id=citation.container_id,
-                file_id=citation.file_id,
+                container_id=matched_file.container_id,
+                file_id=matched_file.file_id,
             )
-
-            artifact = self._match_citation_to_artifact(ledger.get("artifacts", []), citation, metadata, claimed_artifact_ids)
-            artifact_id = str(artifact.get("artifact_id") or "").strip() if artifact is not None else None
-            declared_path = _artifact_path_value(artifact or {})
-            original_path = str(metadata.get("path") or "").strip()
-            fallback_name = Path(original_path or citation.filename or citation.file_id).name or f"{citation.file_id}.bin"
+            fallback_name = Path(matched_file.path or matched_file.filename or matched_file.file_id).name or f"{matched_file.file_id}.bin"
             relative_path = _sanitize_relative_path(
-                declared_path if artifact_id else f"artifacts/unmatched/{fallback_name}",
-                fallback=f"artifacts/unmatched/{fallback_name}",
+                declared_path or f"artifacts/{fallback_name}",
+                fallback=f"artifacts/{fallback_name}",
             )
             destination = workspace_directory / relative_path
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(raw_bytes)
 
-            mime_type = str(metadata.get("mime_type") or "").strip() or _guess_mime_type(relative_path)
-            downloaded_file = DownloadedArtifactFile(
-                artifact_id=artifact_id,
-                container_id=citation.container_id,
-                file_id=citation.file_id,
-                filename=Path(relative_path).name,
-                relative_path=relative_path,
-                metadata_path=original_path,
-                mime_type=mime_type,
-                sha256=_sha256_bytes(raw_bytes),
+            mime_type = matched_file.mime_type or _guess_mime_type(relative_path)
+            downloaded_files.append(
+                DownloadedArtifactFile(
+                    artifact_id=artifact_id or None,
+                    container_id=matched_file.container_id,
+                    file_id=matched_file.file_id,
+                    filename=Path(relative_path).name,
+                    relative_path=relative_path,
+                    metadata_path=matched_file.path,
+                    mime_type=mime_type,
+                    sha256=_sha256_bytes(raw_bytes),
+                )
             )
-            downloaded_files.append(downloaded_file)
+            claimed_file_keys.add((matched_file.container_id, matched_file.file_id))
             if artifact_id:
                 claimed_artifact_ids.add(artifact_id)
 
         return downloaded_files
-
-    def _match_citation_to_artifact(
-        self,
-        artifacts: list[dict[str, Any]],
-        citation: OpenAIContainerFileCitation,
-        metadata: dict[str, Any],
-        claimed_artifact_ids: set[str],
-    ) -> dict[str, Any] | None:
-        candidates = {
-            citation.annotated_text.strip().strip("\"'"),
-            citation.filename.strip(),
-            Path(str(metadata.get("path") or citation.filename or "")).name,
-        }
-        candidates = {candidate for candidate in candidates if candidate}
-
-        for artifact in artifacts:
-            artifact_id = str(artifact.get("artifact_id") or "").strip()
-            if not artifact_id or artifact_id in claimed_artifact_ids:
-                continue
-            declared_path = _artifact_path_value(artifact)
-            if not declared_path:
-                continue
-            declared_basename = Path(declared_path).name
-            if declared_path in candidates or declared_basename in candidates:
-                return artifact
-        return None
 
     def _apply_downloaded_files_to_ledger(self, ledger: dict[str, Any], downloaded_files: list[DownloadedArtifactFile]) -> None:
         by_artifact_id = {

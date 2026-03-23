@@ -8,6 +8,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bootstrap_service.config import BootstrapServiceConfig
 from bootstrap_service.database import SidekickDatabase
+from bootstrap_service.openai_client import OpenAIContainerFile
 from bootstrap_service.server import JobProcessor
 
 
@@ -24,14 +25,14 @@ def _config(root: pathlib.Path) -> BootstrapServiceConfig:
     )
 
 
-def _processor(root: pathlib.Path) -> JobProcessor:
+def _processor(root: pathlib.Path, *, openai_client: object | None = None) -> JobProcessor:
     config = _config(root)
     database = SidekickDatabase(config)
     return JobProcessor(
         config=config,
         database=database,
         github_client=object(),  # not used by these tests
-        openai_client=object(),  # not used by these tests
+        openai_client=openai_client or object(),  # not used by these tests
     )
 
 
@@ -156,6 +157,70 @@ class PublicationGateTests(unittest.TestCase):
             self.assertEqual(figures[0]["caption"], "Main figure")
             self.assertEqual(figures[0]["mime_type"], "image/png")
             self.assertEqual(base64.b64decode(figures[0]["base64_data"]), png_bytes)
+
+    def test_workspace_artifacts_can_be_materialized_without_message_annotations(self) -> None:
+        class FakeOpenAIClient:
+            def list_container_files(self, *, container_id: str) -> list[OpenAIContainerFile]:
+                self.container_id = container_id
+                return [
+                    OpenAIContainerFile(
+                        container_id=container_id,
+                        file_id="cfile_1",
+                        filename="table_1.csv",
+                        path="/mnt/data/artifacts/table_1.csv",
+                        mime_type="text/csv",
+                    )
+                ]
+
+            def download_container_file_bytes(self, *, container_id: str, file_id: str) -> bytes:
+                self.downloaded = (container_id, file_id)
+                return b"metric,value\nprevalence,0.18\n"
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            openai_client = FakeOpenAIClient()
+            processor = _processor(root, openai_client=openai_client)
+            job_id = "job-materialized"
+            ledger = {
+                "title": "Materialized ledger",
+                "recommended_format": "brief_report",
+                "sources": [
+                    {
+                        "source_id": "source_1",
+                        "label": "CDC public table",
+                        "download_url": "https://example.org/download/table_1.csv",
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact_1",
+                        "path": "artifacts/table_1.csv",
+                        "kind": "table",
+                        "source_ids": ["source_1"],
+                    }
+                ],
+                "claims": [
+                    {
+                        "claim_id": "claim_1",
+                        "text": "The estimated prevalence is reported in the public table.",
+                        "artifact_ids": ["artifact_1"],
+                        "source_ids": ["source_1"],
+                    }
+                ],
+            }
+
+            downloaded = processor._materialize_workspace_files(
+                job_id,
+                ledger,
+                container_ids=["cntr_123"],
+            )
+            processor._apply_downloaded_files_to_ledger(ledger, downloaded)
+            validation = processor._validate_ledger(job_id, ledger)
+
+            self.assertEqual(getattr(openai_client, "container_id", None), "cntr_123")
+            self.assertEqual(getattr(openai_client, "downloaded", None), ("cntr_123", "cfile_1"))
+            self.assertEqual(validation["status"], "approved")
+            self.assertEqual(validation["approved_claim_ids"], ["claim_1"])
 
 
 if __name__ == "__main__":

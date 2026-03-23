@@ -5,6 +5,7 @@ import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .config import BootstrapServiceConfig
@@ -26,6 +27,15 @@ class OpenAIContainerFileCitation:
     file_id: str
     filename: str
     annotated_text: str
+
+
+@dataclass(frozen=True)
+class OpenAIContainerFile:
+    container_id: str
+    file_id: str
+    filename: str
+    path: str
+    mime_type: str
 
 
 @dataclass(frozen=True)
@@ -149,6 +159,65 @@ class OpenAIClient:
                     )
 
         return citations
+
+    def extract_container_ids(self, response: OpenAIResponseResult) -> list[str]:
+        discovered: list[str] = []
+        seen: set[str] = set()
+
+        def collect(value: Any) -> None:
+            if isinstance(value, dict):
+                container_id = value.get("container_id")
+                if isinstance(container_id, str):
+                    normalized = container_id.strip()
+                    if normalized and normalized not in seen:
+                        seen.add(normalized)
+                        discovered.append(normalized)
+                for nested in value.values():
+                    collect(nested)
+                return
+
+            if isinstance(value, list):
+                for nested in value:
+                    collect(nested)
+
+        collect(response.payload.get("output"))
+        return discovered
+
+    def list_container_files(self, *, container_id: str) -> list[OpenAIContainerFile]:
+        files: list[OpenAIContainerFile] = []
+        next_after: str | None = None
+
+        while True:
+            query = f"?{urlencode({'after': next_after})}" if next_after else ""
+            payload = self._request_json("GET", f"/containers/{container_id}/files{query}", None)
+            entries = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(entries, list):
+                break
+
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                file_id = str(entry.get("id") or "").strip()
+                if not file_id:
+                    continue
+                path = str(entry.get("path") or "").strip()
+                filename = path.rsplit("/", 1)[-1] if path else file_id
+                files.append(
+                    OpenAIContainerFile(
+                        container_id=container_id,
+                        file_id=file_id,
+                        filename=filename,
+                        path=path,
+                        mime_type=str(entry.get("mime_type") or "").strip(),
+                    )
+                )
+
+            has_more = bool(payload.get("has_more")) if isinstance(payload, dict) else False
+            next_after = str(payload.get("last_id") or "").strip() if isinstance(payload, dict) else ""
+            if not has_more or not next_after:
+                break
+
+        return files
 
     def get_container_file_metadata(self, *, container_id: str, file_id: str) -> dict[str, Any]:
         return self._request_json("GET", f"/containers/{container_id}/files/{file_id}", None)
