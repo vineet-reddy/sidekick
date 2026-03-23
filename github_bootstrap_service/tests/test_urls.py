@@ -26,7 +26,7 @@ class GitHubURLTests(unittest.TestCase):
         self.assertIn("client_id=cid", url)
         self.assertIn("state=opaque-state", url)
         self.assertIn("scope=public_repo+read%3Auser", url)
-        self.assertIn("redirect_uri=https%3A%2F%2Fbootstrap.sidekick.example%2Fbrowser%2Fgithub-connect%2Fcallback", url)
+        self.assertIn("redirect_uri=https%3A%2F%2Fbootstrap.sidekick.example%2Fbrowser%2Fgithub-bootstrap%2Fcallback", url)
 
     def test_connect_payload_browser_url_points_directly_to_github(self) -> None:
         config = BootstrapServiceConfig(
@@ -58,7 +58,7 @@ class GitHubURLTests(unittest.TestCase):
         self.assertEqual(parsed.path, "/login/oauth/authorize")
         self.assertEqual(
             parse_qs(parsed.query)["redirect_uri"][0],
-            "https://bootstrap.sidekick.example/browser/github-connect/callback",
+            "https://bootstrap.sidekick.example/browser/github-bootstrap/callback",
         )
         self.assertIn(".", parse_qs(parsed.query)["state"][0])
 
