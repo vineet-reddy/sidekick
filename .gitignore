@@ -12,5 +12,13 @@
 /error.log
 TRUSTED_DATASET_REGISTRY_SPEC.md
 
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+dist/
+build/
+
 # Local runtime tooling state
 /.sidekick-runtime/
