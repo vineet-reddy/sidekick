@@ -1,281 +1,270 @@
 import Combine
 import Foundation
 
-struct GitHubWorkspaceContext: Codable, Equatable {
-    let githubLogin: String
-    let githubAccountID: Int
-    let repositoryID: Int
-    let repositoryName: String
-    let repositoryFullName: String
-    let repositoryHTMLURL: URL?
-    let defaultBranch: String
-    let connectorInstallURL: URL
-    let connectorRepairURL: URL
-    let bootstrapSessionID: String?
-    let installLaunchTime: Date
-    let provisionedAt: Date
+struct SidekickBackendSession: Codable, Equatable {
+    let installSessionID: String
+    let sessionToken: String
+    let createdAt: Date
+    let lastSeenAt: Date
 
     enum CodingKeys: String, CodingKey {
-        case githubLogin = "github_login"
-        case githubAccountID = "github_account_id"
-        case repositoryID = "repository_id"
-        case repositoryName = "repository_name"
-        case repositoryFullName = "repository_full_name"
-        case repositoryHTMLURL = "repository_html_url"
-        case defaultBranch = "default_branch"
-        case connectorInstallURL = "connector_install_url"
-        case connectorRepairURL = "connector_repair_url"
-        case bootstrapSessionID = "bootstrap_session_id"
-        case installLaunchTime = "install_launch_time"
-        case provisionedAt = "provisioned_at"
+        case installSessionID = "install_session_id"
+        case sessionToken = "session_token"
+        case createdAt = "created_at"
+        case lastSeenAt = "last_seen_at"
     }
 }
 
-struct ConnectorScopeAttestation: Codable, Equatable {
-    let chatgptEmail: String
+struct GitHubExportContext: Codable, Equatable {
+    let id: String
     let githubLogin: String
-    let repositoryID: Int
-    let repositoryFullName: String
-    let bootstrapSessionID: String?
-    let installLaunchTime: Date
-    let attestedAt: Date
+    let repoOwner: String
+    let repoName: String
+    let repoFullName: String
+    let repoURL: URL?
+    let visibility: String
+    let createdAt: Date
+    let updatedAt: Date
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case githubLogin = "github_login"
+        case repoOwner = "repo_owner"
+        case repoName = "repo_name"
+        case repoFullName = "repo_full_name"
+        case repoURL = "repo_url"
+        case visibility
+        case createdAt = "created_at"
+        case updatedAt = "updated_at"
+    }
 }
 
-struct GitHubBootstrapSession: Codable, Equatable {
+struct GitHubConnectSession: Codable, Equatable {
     let sessionID: String
     let status: String
-    let chatgptEmail: String?
     let errorMessage: String?
     let createdAt: Date
     let updatedAt: Date
     let expiresAt: Date
-    let startURL: URL
-    let statusURL: URL
-    let workspace: GitHubWorkspaceContext?
+    let browserURL: URL
+    let connection: GitHubExportContext?
 
     enum CodingKeys: String, CodingKey {
         case sessionID = "session_id"
         case status
-        case chatgptEmail = "chatgpt_email"
         case errorMessage = "error_message"
         case createdAt = "created_at"
         case updatedAt = "updated_at"
         case expiresAt = "expires_at"
-        case startURL = "start_url"
-        case statusURL = "status_url"
-        case workspace
+        case browserURL = "browser_url"
+        case connection
+    }
+
+    var isTerminal: Bool {
+        status == "completed" || status == "failed"
+    }
+}
+
+private struct DeviceSessionResponse: Codable {
+    let installSessionID: String
+    let sessionToken: String
+    let createdAt: Date
+    let lastSeenAt: Date
+    let githubConnection: GitHubExportContext?
+
+    enum CodingKeys: String, CodingKey {
+        case installSessionID = "install_session_id"
+        case sessionToken = "session_token"
+        case createdAt = "created_at"
+        case lastSeenAt = "last_seen_at"
+        case githubConnection = "github_connection"
+    }
+
+    var session: SidekickBackendSession {
+        SidekickBackendSession(
+            installSessionID: installSessionID,
+            sessionToken: sessionToken,
+            createdAt: createdAt,
+            lastSeenAt: lastSeenAt
+        )
     }
 }
 
 @MainActor
 final class GitHubService: ObservableObject {
     enum GitHubServiceError: LocalizedError {
-        case bootstrapServiceNotConfigured
-        case bootstrapServiceUnavailable(URL)
+        case backendNotConfigured
         case invalidResponse
-        case missingWorkspaceContext
-        case missingChatGPTEmail
+        case missingDeviceSession
 
         var errorDescription: String? {
             switch self {
-            case .bootstrapServiceNotConfigured:
-                return "Sidekick could not find its GitHub workspace service configuration."
-            case let .bootstrapServiceUnavailable(url):
-                return """
-                Sidekick could not reach its GitHub workspace service at \(url.absoluteString). Try again in a moment.
-                """
+            case .backendNotConfigured:
+                return "Sidekick could not find its backend URL."
             case .invalidResponse:
-                return "The GitHub bootstrap service returned an unexpected response."
-            case .missingWorkspaceContext:
-                return "Sidekick has not provisioned a workspace repository yet."
-            case .missingChatGPTEmail:
-                return "Sign in with ChatGPT before confirming connector scope."
+                return "The Sidekick backend returned an unexpected response."
+            case .missingDeviceSession:
+                return "Sidekick could not create a device session."
             }
         }
     }
 
-    @Published private(set) var workspaceContext: GitHubWorkspaceContext?
-    @Published private(set) var activeBootstrapSession: GitHubBootstrapSession?
-    @Published private(set) var bootstrapErrorMessage: String?
+    @Published private(set) var backendSession: SidekickBackendSession?
+    @Published private(set) var exportContext: GitHubExportContext?
+    @Published private(set) var activeConnectSession: GitHubConnectSession?
+    @Published private(set) var connectionErrorMessage: String?
 
     private let session: URLSession
     private let defaults: UserDefaults
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private let attestationMaximumAge: TimeInterval = 24 * 60 * 60
-    private var signOutObserver: NSObjectProtocol?
+    private let requestTimeout: TimeInterval = 12
 
     init(
-        session: URLSession = .shared,
+        session: URLSession? = nil,
         defaults: UserDefaults = .standard
     ) {
-        self.session = session
+        if let session {
+            self.session = session
+        } else {
+            let configuration = URLSessionConfiguration.default
+            configuration.timeoutIntervalForRequest = requestTimeout
+            configuration.timeoutIntervalForResource = requestTimeout
+            configuration.waitsForConnectivity = false
+            self.session = URLSession(configuration: configuration)
+        }
         self.defaults = defaults
-        decoder.dateDecodingStrategy = .iso8601
         encoder.dateEncodingStrategy = .iso8601
+        decoder.dateDecodingStrategy = .iso8601
 
-        workspaceContext = Self.loadValue(
-            GitHubWorkspaceContext.self,
+        backendSession = Self.loadValue(
+            SidekickBackendSession.self,
             defaults: defaults,
-            key: sidekickGitHubWorkspaceContextDefaultsKey,
+            key: sidekickBackendSessionDefaultsKey,
             decoder: decoder
         )
-        activeBootstrapSession = Self.loadValue(
-            GitHubBootstrapSession.self,
+        exportContext = Self.loadValue(
+            GitHubExportContext.self,
             defaults: defaults,
-            key: sidekickGitHubBootstrapSessionDefaultsKey,
+            key: sidekickGitHubExportContextDefaultsKey,
             decoder: decoder
         )
-
-        signOutObserver = NotificationCenter.default.addObserver(
-            forName: .sidekickDidSignOut,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor [weak self] in
-                self?.clearSessionState()
-            }
-        }
+        activeConnectSession = Self.loadValue(
+            GitHubConnectSession.self,
+            defaults: defaults,
+            key: sidekickGitHubConnectSessionDefaultsKey,
+            decoder: decoder
+        )
     }
 
-    deinit {
-        if let signOutObserver {
-            NotificationCenter.default.removeObserver(signOutObserver)
-        }
+    var isConnected: Bool {
+        exportContext != nil
     }
 
-    func beginWorkspaceBootstrap(chatGPTEmail: String?) async throws -> URL {
-        guard let baseURL = bootstrapServiceBaseURL else {
-            throw GitHubServiceError.bootstrapServiceNotConfigured
+    var repositoryURL: URL? {
+        exportContext?.repoURL
+    }
+
+    var repositoryDisplayName: String {
+        exportContext?.repoFullName ?? "Connect GitHub"
+    }
+
+    func ensureDeviceSession() async throws -> SidekickBackendSession {
+        if let backendSession {
+            return backendSession
         }
 
-        try await verifyBootstrapServiceReachability(baseURL: baseURL)
+        guard let baseURL = backendBaseURL else {
+            throw GitHubServiceError.backendNotConfigured
+        }
 
-        var request = URLRequest(url: baseURL.appendingPathComponent("api/bootstrap/sessions"))
-        request.httpMethod = "POST"
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(
-            withJSONObject: [
-                "chatgpt_email": (chatGPTEmail?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "")
-            ]
+        let payload = [
+            "device_id": deviceID
+        ]
+        let response: DeviceSessionResponse = try await performRequest(
+            url: baseURL.appendingPathComponent("api/device/session"),
+            method: "POST",
+            body: payload,
+            authorized: false
         )
 
-        let data: Data
-        let response: URLResponse
-
-        do {
-            (data, response) = try await session.data(for: request)
-        } catch {
-            throw normalizeBootstrapTransportError(error, baseURL: baseURL)
+        backendSession = response.session
+        exportContext = response.githubConnection
+        persist(response.session, key: sidekickBackendSessionDefaultsKey)
+        if let githubConnection = response.githubConnection {
+            persist(githubConnection, key: sidekickGitHubExportContextDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
         }
-
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200 ..< 300).contains(httpResponse.statusCode) else {
-            throw GitHubServiceError.invalidResponse
-        }
-
-        let bootstrapSession = try decoder.decode(GitHubBootstrapSession.self, from: data)
-        activeBootstrapSession = bootstrapSession
-        persist(bootstrapSession, key: sidekickGitHubBootstrapSessionDefaultsKey)
-        bootstrapErrorMessage = nil
-        return bootstrapSession.startURL
+        return response.session
     }
 
-    func refreshBootstrapSessionIfNeeded() async throws -> GitHubBootstrapSession? {
-        guard let activeBootstrapSession else {
+    func beginGitHubConnection() async throws -> URL {
+        if let activeConnectSession,
+           !activeConnectSession.isTerminal {
+            connectionErrorMessage = nil
+            return activeConnectSession.browserURL
+        }
+
+        _ = try await ensureDeviceSession()
+        guard let baseURL = backendBaseURL else {
+            throw GitHubServiceError.backendNotConfigured
+        }
+
+        let connectSession: GitHubConnectSession = try await performRequest(
+            url: baseURL.appendingPathComponent("api/github/connect/start"),
+            method: "POST",
+            authorized: true
+        )
+        activeConnectSession = connectSession
+        persist(connectSession, key: sidekickGitHubConnectSessionDefaultsKey)
+        connectionErrorMessage = nil
+        return connectSession.browserURL
+    }
+
+    @discardableResult
+    func refreshConnectionSessionIfNeeded() async throws -> GitHubConnectSession? {
+        guard let activeConnectSession,
+              let baseURL = backendBaseURL else {
             return nil
         }
 
-        let (data, response) = try await session.data(from: activeBootstrapSession.statusURL)
-        guard let httpResponse = response as? HTTPURLResponse,
-              (200 ..< 300).contains(httpResponse.statusCode) else {
-            throw GitHubServiceError.invalidResponse
+        let refreshed: GitHubConnectSession = try await performRequest(
+            url: baseURL.appendingPathComponent("api/github/connect/sessions/\(activeConnectSession.sessionID)"),
+            method: "GET",
+            authorized: true
+        )
+        self.activeConnectSession = refreshed
+        persist(refreshed, key: sidekickGitHubConnectSessionDefaultsKey)
+        connectionErrorMessage = refreshed.errorMessage
+
+        if let connection = refreshed.connection {
+            exportContext = connection
+            persist(connection, key: sidekickGitHubExportContextDefaultsKey)
+            NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
         }
 
-        let refreshed = try decoder.decode(GitHubBootstrapSession.self, from: data)
-        self.activeBootstrapSession = refreshed
-        persist(refreshed, key: sidekickGitHubBootstrapSessionDefaultsKey)
-
-        if let workspace = refreshed.workspace {
-            workspaceContext = workspace
-            persist(workspace, key: sidekickGitHubWorkspaceContextDefaultsKey)
+        if refreshed.isTerminal {
+            defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
         }
 
-        bootstrapErrorMessage = refreshed.errorMessage
         return refreshed
     }
 
-    func markConnectorScopeAttested(chatgptEmail: String?) throws {
-        guard let workspaceContext else {
-            throw GitHubServiceError.missingWorkspaceContext
-        }
+    func clearConnectionState() {
+        exportContext = nil
+        activeConnectSession = nil
+        connectionErrorMessage = nil
+        defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
+        defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+        NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
+    }
 
-        let normalizedEmail = (chatgptEmail ?? "")
+    private var backendBaseURL: URL? {
+        let environmentValue = ProcessInfo.processInfo.environment["SIDEKICK_BACKEND_BASE_URL"]?
             .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard !normalizedEmail.isEmpty else {
-            throw GitHubServiceError.missingChatGPTEmail
-        }
-
-        let attestation = ConnectorScopeAttestation(
-            chatgptEmail: normalizedEmail,
-            githubLogin: workspaceContext.githubLogin,
-            repositoryID: workspaceContext.repositoryID,
-            repositoryFullName: workspaceContext.repositoryFullName,
-            bootstrapSessionID: workspaceContext.bootstrapSessionID,
-            installLaunchTime: workspaceContext.installLaunchTime,
-            attestedAt: .now
-        )
-        persist(attestation, key: sidekickConnectorScopeAttestationDefaultsKey)
-        bootstrapErrorMessage = nil
-    }
-
-    func hasRecentConnectorScopeAttestation(
-        for workspaceContext: GitHubWorkspaceContext,
-        chatgptEmail: String?
-    ) -> Bool {
-        let normalizedEmail = (chatgptEmail ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        guard !normalizedEmail.isEmpty,
-              let attestation = loadAttestation() else {
-            return false
-        }
-
-        guard attestation.chatgptEmail == normalizedEmail,
-              attestation.githubLogin == workspaceContext.githubLogin,
-              attestation.repositoryID == workspaceContext.repositoryID,
-              attestation.repositoryFullName == workspaceContext.repositoryFullName,
-              attestation.bootstrapSessionID == workspaceContext.bootstrapSessionID,
-              attestation.installLaunchTime == workspaceContext.installLaunchTime else {
-            return false
-        }
-
-        return Date().timeIntervalSince(attestation.attestedAt) <= attestationMaximumAge
-    }
-
-    func connectorReviewURL() -> URL? {
-        workspaceContext?.connectorRepairURL ?? activeBootstrapSession?.workspace?.connectorRepairURL
-    }
-
-    func recordBootstrapErrorMessage(_ message: String?) {
-        bootstrapErrorMessage = message
-    }
-
-    func clearSessionState() {
-        workspaceContext = nil
-        activeBootstrapSession = nil
-        bootstrapErrorMessage = nil
-        defaults.removeObject(forKey: sidekickGitHubWorkspaceContextDefaultsKey)
-        defaults.removeObject(forKey: sidekickGitHubBootstrapSessionDefaultsKey)
-        defaults.removeObject(forKey: sidekickConnectorScopeAttestationDefaultsKey)
-    }
-
-    private var bootstrapServiceBaseURL: URL? {
-        let rawValue = ProcessInfo.processInfo.environment["SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL"]?
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        if let rawValue, !rawValue.isEmpty {
-            return URL(string: rawValue)
+        if let environmentValue, !environmentValue.isEmpty {
+            return URL(string: environmentValue)
         }
 
         let infoValue = (Bundle.main.object(forInfoDictionaryKey: "SidekickGitHubBootstrapBaseURL") as? String)?
@@ -289,46 +278,73 @@ final class GitHubService: ObservableObject {
         return URL(string: infoValue)
     }
 
-    private func verifyBootstrapServiceReachability(baseURL: URL) async throws {
-        var request = URLRequest(url: baseURL.appendingPathComponent("health"))
-        request.httpMethod = "GET"
-        request.timeoutInterval = 3
+    private var deviceID: String {
+        if let stored = defaults.string(forKey: sidekickBackendDeviceIDDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !stored.isEmpty {
+            return stored
+        }
+
+        let generated = UUID().uuidString
+        defaults.set(generated, forKey: sidekickBackendDeviceIDDefaultsKey)
+        return generated
+    }
+
+    private func performRequest<Response: Decodable>(
+        url: URL,
+        method: String,
+        body: [String: Any]? = nil,
+        authorized: Bool
+    ) async throws -> Response {
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.timeoutInterval = requestTimeout
+        request.cachePolicy = .reloadIgnoringLocalCacheData
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+        if authorized {
+            guard let token = backendSession?.sessionToken else {
+                throw GitHubServiceError.missingDeviceSession
+            }
+            request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        }
+
+        if let body {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+
+        let (data, response) = try await session.data(for: request)
+        guard let httpResponse = response as? HTTPURLResponse,
+              (200 ..< 300).contains(httpResponse.statusCode) else {
+            throw decodeErrorMessage(data: data) ?? GitHubServiceError.invalidResponse
+        }
 
         do {
-            let (_, response) = try await session.data(for: request)
-            guard let httpResponse = response as? HTTPURLResponse,
-                  (200 ..< 300).contains(httpResponse.statusCode) else {
-                throw GitHubServiceError.bootstrapServiceUnavailable(baseURL)
-            }
+            return try decoder.decode(Response.self, from: data)
         } catch {
-            throw normalizeBootstrapTransportError(error, baseURL: baseURL)
+            throw GitHubServiceError.invalidResponse
         }
     }
 
-    private func normalizeBootstrapTransportError(_ error: Error, baseURL: URL) -> Error {
-        if error is GitHubServiceError {
-            return error
+    private func decodeErrorMessage(data: Data) -> Error? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
         }
-
-        if let urlError = error as? URLError {
-            switch urlError.code {
-            case .cannotConnectToHost, .cannotFindHost, .timedOut, .networkConnectionLost, .notConnectedToInternet:
-                return GitHubServiceError.bootstrapServiceUnavailable(baseURL)
-            default:
-                break
-            }
+        if let message = object["message"] as? String {
+            return NSError(
+                domain: "com.vineet.sidekick.github",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: message]
+            )
         }
-
-        return error
-    }
-
-    private func loadAttestation() -> ConnectorScopeAttestation? {
-        Self.loadValue(
-            ConnectorScopeAttestation.self,
-            defaults: defaults,
-            key: sidekickConnectorScopeAttestationDefaultsKey,
-            decoder: decoder
-        )
+        if let error = object["error"] as? String {
+            return NSError(
+                domain: "com.vineet.sidekick.github",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: error]
+            )
+        }
+        return nil
     }
 
     private func persist<T: Encodable>(_ value: T, key: String) {

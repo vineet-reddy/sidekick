@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -27,6 +28,13 @@ class GitHubRepository:
     full_name: str
     html_url: str | None
     default_branch: str
+    visibility: str
+
+
+@dataclass(frozen=True)
+class GitHubCommitResult:
+    sha: str
+    html_url: str | None
 
 
 class GitHubClient:
@@ -98,7 +106,7 @@ class GitHubClient:
         *,
         repo_name: str,
         private: bool,
-        description: str | None = None,
+        description: str,
     ) -> GitHubRepository:
         payload = self._request_json(
             method="POST",
@@ -108,139 +116,145 @@ class GitHubClient:
                 "name": repo_name,
                 "private": private,
                 "auto_init": True,
-                "description": description or "Sidekick Codex workspace",
+                "description": description,
             },
         )
         return self._decode_repository(payload)
 
-    def create_repo_from_template(
-        self,
-        access_token: str,
-        *,
-        template_owner: str,
-        template_repo: str,
-        repo_name: str,
-        private: bool,
-        description: str | None = None,
-    ) -> GitHubRepository:
-        payload = self._request_json(
-            method="POST",
-            url=(
-                f"{self._config.github_api_base_url.rstrip('/')}/repos/"
-                f"{template_owner}/{template_repo}/generate"
-            ),
-            access_token=access_token,
-            body={
-                "name": repo_name,
-                "private": private,
-                "include_all_branches": False,
-                "description": description or "Sidekick Codex workspace",
-            },
-        )
-        return self._decode_repository(payload)
-
-    def ensure_workspace_repository(
+    def ensure_sidekick_repository(
         self,
         access_token: str,
         *,
         owner: str,
     ) -> GitHubRepository:
-        existing = self.find_repository(
-            access_token,
-            owner=owner,
-            repo_name=self._config.github_bootstrap_workspace_repo_name,
-        )
-        if existing is not None:
-            return existing
-
-        if self._config.github_bootstrap_template_owner and self._config.github_bootstrap_template_repo:
-            return self.create_repo_from_template(
+        repo_name = self._config.github_repo_name
+        desired_private = self._config.github_repo_visibility != "public"
+        existing = self.find_repository(access_token, owner=owner, repo_name=repo_name)
+        if existing is None:
+            return self.create_repository(
                 access_token,
-                template_owner=self._config.github_bootstrap_template_owner,
-                template_repo=self._config.github_bootstrap_template_repo,
-                repo_name=self._config.github_bootstrap_workspace_repo_name,
-                private=self._config.github_bootstrap_workspace_repo_private,
+                repo_name=repo_name,
+                private=desired_private,
+                description=self._config.github_repo_description,
             )
 
-        return self.create_repository(
-            access_token,
-            repo_name=self._config.github_bootstrap_workspace_repo_name,
-            private=self._config.github_bootstrap_workspace_repo_private,
-        )
+        if desired_private is False and existing.visibility != "public":
+            payload = self._request_json(
+                method="PATCH",
+                url=f"{self._config.github_api_base_url.rstrip('/')}/repos/{owner}/{repo_name}",
+                access_token=access_token,
+                body={"private": False},
+            )
+            return self._decode_repository(payload)
 
-    def protect_default_branch(
+        return existing
+
+    def commit_text_file(
         self,
         access_token: str,
         *,
         owner: str,
         repo_name: str,
-        branch_name: str,
-    ) -> None:
-        if not self._config.github_bootstrap_protect_default_branch:
-            return
+        path: str,
+        content: str,
+        message: str,
+    ) -> GitHubCommitResult:
+        return self._commit_file(
+            access_token,
+            owner=owner,
+            repo_name=repo_name,
+            path=path,
+            raw_bytes=content.encode("utf-8"),
+            message=message,
+        )
 
-        self._request_json(
+    def commit_binary_file(
+        self,
+        access_token: str,
+        *,
+        owner: str,
+        repo_name: str,
+        path: str,
+        raw_bytes: bytes,
+        message: str,
+    ) -> GitHubCommitResult:
+        return self._commit_file(
+            access_token,
+            owner=owner,
+            repo_name=repo_name,
+            path=path,
+            raw_bytes=raw_bytes,
+            message=message,
+        )
+
+    def _commit_file(
+        self,
+        access_token: str,
+        *,
+        owner: str,
+        repo_name: str,
+        path: str,
+        raw_bytes: bytes,
+        message: str,
+    ) -> GitHubCommitResult:
+        existing_sha = self._existing_content_sha(
+            access_token,
+            owner=owner,
+            repo_name=repo_name,
+            path=path,
+        )
+        body: dict[str, Any] = {
+            "message": message,
+            "content": base64.b64encode(raw_bytes).decode("ascii"),
+        }
+        if existing_sha:
+            body["sha"] = existing_sha
+
+        payload = self._request_json(
             method="PUT",
-            url=(
-                f"{self._config.github_api_base_url.rstrip('/')}/repos/"
-                f"{owner}/{repo_name}/branches/{branch_name}/protection"
-            ),
+            url=f"{self._config.github_api_base_url.rstrip('/')}/repos/{owner}/{repo_name}/contents/{path}",
             access_token=access_token,
-            body={
-                "required_status_checks": None,
-                "enforce_admins": self._config.github_bootstrap_enforce_admins,
-                "required_pull_request_reviews": (
-                    {
-                        "dismiss_stale_reviews": False,
-                        "require_code_owner_reviews": False,
-                        "required_approving_review_count": self._config.github_bootstrap_required_approving_review_count,
-                    }
-                    if self._config.github_bootstrap_require_pull_request_reviews
-                    else None
-                ),
-                "restrictions": None,
-                "required_linear_history": self._config.github_bootstrap_require_linear_history,
-                "allow_force_pushes": self._config.github_bootstrap_allow_force_pushes,
-                "allow_deletions": self._config.github_bootstrap_allow_deletions,
-                "block_creations": False,
-                "required_conversation_resolution": False,
-                "lock_branch": False,
-            },
+            body=body,
         )
+        commit = payload.get("commit")
+        if not isinstance(commit, dict):
+            raise GitHubClientError("GitHub did not return a commit payload.")
+        sha = (commit.get("sha") or "").strip()
+        html_url = (commit.get("html_url") or "").strip() or None
+        if not sha:
+            raise GitHubClientError("GitHub did not return a commit sha.")
+        return GitHubCommitResult(sha=sha, html_url=html_url)
 
-    def build_connector_install_url(
+    def _existing_content_sha(
         self,
+        access_token: str,
         *,
-        github_account_id: int,
-        repository_id: int,
-    ) -> str:
-        query = urlencode(
-            [
-                ("suggested_target_id", str(github_account_id)),
-                ("repository_ids[]", str(repository_id)),
-            ]
-        )
-        return (
-            f"{self._config.github_web_base_url.rstrip('/')}/apps/"
-            f"{self._config.github_bootstrap_connector_slug}/installations/new/permissions?{query}"
-        )
-
-    def build_connector_repair_url(
-        self,
-        *,
-        github_account_id: int,
-        repository_id: int,
-    ) -> str:
-        return self.build_connector_install_url(
-            github_account_id=github_account_id,
-            repository_id=repository_id,
-        )
+        owner: str,
+        repo_name: str,
+        path: str,
+    ) -> str | None:
+        try:
+            payload = self._request_json(
+                method="GET",
+                url=f"{self._config.github_api_base_url.rstrip('/')}/repos/{owner}/{repo_name}/contents/{path}",
+                access_token=access_token,
+            )
+        except GitHubClientError as error:
+            if "HTTP 404" in str(error):
+                return None
+            raise
+        sha = payload.get("sha")
+        return str(sha).strip() if isinstance(sha, str) and sha.strip() else None
 
     def _decode_repository(self, payload: dict[str, Any]) -> GitHubRepository:
         repository_id = payload.get("id")
         name = (payload.get("name") or "").strip()
         full_name = (payload.get("full_name") or "").strip()
         default_branch = (payload.get("default_branch") or "main").strip() or "main"
+        visibility = (payload.get("visibility") or "").strip().lower()
+        private = payload.get("private")
+        if not visibility:
+            visibility = "private" if private else "public"
         if not isinstance(repository_id, int) or not name or not full_name:
             raise GitHubClientError("GitHub returned an incomplete repository payload.")
         return GitHubRepository(
@@ -249,6 +263,7 @@ class GitHubClient:
             full_name=full_name,
             html_url=(payload.get("html_url") or "").strip() or None,
             default_branch=default_branch,
+            visibility=visibility,
         )
 
     def _request_json(
@@ -262,7 +277,7 @@ class GitHubClient:
     ) -> dict[str, Any]:
         request_headers = {
             "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2026-03-10",
+            "X-GitHub-Api-Version": "2022-11-28",
             **(headers or {}),
         }
         if access_token:

@@ -39,16 +39,17 @@ enum ResearchRunStatus: String, Codable {
 
 enum ResearchExecutionBackend: String, Codable {
     case automatic
-    case chatGPTOAuth = "chatgpt_oauth"
-    case openAIAPIKey = "openai_api_key"
+    case sidekickHosted = "sidekick_hosted"
+    case userAPIKey = "user_api_key"
+    case legacyChatGPTOAuth = "chatgpt_oauth"
 
     var title: String {
         switch self {
         case .automatic:
             return "Automatic"
-        case .chatGPTOAuth:
-            return "ChatGPT"
-        case .openAIAPIKey:
+        case .sidekickHosted, .legacyChatGPTOAuth:
+            return "Sidekick hosted"
+        case .userAPIKey:
             return "API key"
         }
     }
@@ -204,10 +205,14 @@ final class ResearchRun {
         get {
             if let raw = executionBackendRaw,
                let backend = ResearchExecutionBackend(rawValue: raw) {
+                if backend == .legacyChatGPTOAuth {
+                    return .sidekickHosted
+                }
+
                 return backend
             }
 
-            return status == .queued ? .automatic : .chatGPTOAuth
+            return status == .queued ? .automatic : .sidekickHosted
         }
         set {
             executionBackendRaw = newValue.rawValue

@@ -5,6 +5,7 @@ import SwiftUI
 struct PaperDetailView: View {
     @Environment(\.dismiss) private var dismiss
     @Environment(\.modelContext) private var modelContext
+    @EnvironmentObject private var github: GitHubService
     @Query(sort: \ResearchRun.updatedAt, order: .reverse) private var runs: [ResearchRun]
     @State private var shareItem: ShareItem?
     @State private var exportError: String?
@@ -48,6 +49,10 @@ struct PaperDetailView: View {
             if case let .ready(url) = documentState {
                 ToolbarItem(placement: .topBarTrailing) {
                     Menu {
+                        if let exportURL = exportURL {
+                            Link("Open on GitHub", destination: exportURL)
+                        }
+
                         Button("Share PDF") {
                             shareItem = ShareItem(url: url)
                         }
@@ -133,6 +138,19 @@ struct PaperDetailView: View {
         case .failed:
             return "The paper stalled"
         }
+    }
+
+    private var exportMetadata: PaperArtifactStore.ExportMetadataSnapshot? {
+        let key = paper.codexTaskID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            return nil
+        }
+
+        return PaperArtifactStore.exportMetadata(for: key)
+    }
+
+    private var exportURL: URL? {
+        exportMetadata?.repoURL
     }
 
     private func progressCard(title: String, message: String) -> some View {

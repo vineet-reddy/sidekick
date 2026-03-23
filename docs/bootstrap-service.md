@@ -1,17 +1,17 @@
-# GitHub Bootstrap Service
+# Sidekick Backend
 
-This is the small control-plane backend that powers Sidekick's secure one-repo setup flow.
+This service now acts as the Sidekick backend. It handles anonymous device sessions, GitHub connection, hosted paper jobs, and GitHub publication.
 
-It does four things:
+It does these things:
 
 1. Start GitHub OAuth for the Sidekick user.
-2. Create or reuse the user's private `sidekick-workspace` repository.
-3. Apply branch protection to the default branch.
-4. Redirect the user to the ChatGPT Codex Connector install page with that repository preselected.
+2. Create or reuse the user's public `sidekick` repository.
+3. Run hosted paper jobs against the OpenAI API.
+4. Publish reproducibility bundles back into the user's repo.
 
 ## Why it exists
 
-The iPhone app should not hold your GitHub OAuth client secret and should not create private GitHub repositories directly. The bootstrap service handles those GitHub API calls on your behalf.
+The iPhone app should not hold your GitHub OAuth client secret or your OpenAI API key. The backend handles those calls on the user's behalf and keeps only small durable metadata.
 
 ## Deploy
 
@@ -21,24 +21,21 @@ Required environment variables:
 
 - `GITHUB_CLIENT_ID`
 - `GITHUB_CLIENT_SECRET`
-- `GITHUB_BOOTSTRAP_REDIRECT_BASE_URL`
-
-Optional:
-
-- `GITHUB_BOOTSTRAP_TEMPLATE_OWNER`
-- `GITHUB_BOOTSTRAP_TEMPLATE_REPO`
+- `SIDEKICK_BACKEND_BASE_URL`
+- `OPENAI_API_KEY`
+- `SIDEKICK_ENCRYPTION_SECRET`
 
 ## GitHub OAuth app settings
 
 Set the GitHub OAuth app callback URL to:
 
 ```text
-https://<your-render-service>.onrender.com/browser/github-bootstrap/callback
+https://<your-render-service>.onrender.com/browser/github-connect/callback
 ```
 
 ## iPhone app configuration
 
-Set the app's bootstrap base URL to the same deployed service:
+Set the app's backend base URL to the same deployed service:
 
 ```text
 SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL = https://<your-render-service>.onrender.com

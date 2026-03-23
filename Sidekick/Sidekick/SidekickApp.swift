@@ -4,7 +4,6 @@ import SwiftUI
 @main
 @MainActor
 struct SidekickApp: App {
-    @StateObject private var authService: AuthService
     @StateObject private var githubService: GitHubService
     @StateObject private var openAIService: OpenAIService
     @StateObject private var notificationService: NotificationService
@@ -21,13 +20,11 @@ struct SidekickApp: App {
             fatalError("SwiftData failed to initialize: \(error.localizedDescription)")
         }
 
-        let auth = AuthService()
         let github = GitHubService()
         let notifications = NotificationService()
-        let openAI = OpenAIService(auth: auth, github: github)
-        let heartbeat = HeartbeatManager(openAI: openAI, notifications: notifications)
+        let openAI = OpenAIService(github: github)
+        let heartbeat = HeartbeatManager(openAI: openAI, github: github, notifications: notifications)
 
-        _authService = StateObject(wrappedValue: auth)
         _githubService = StateObject(wrappedValue: github)
         _notificationService = StateObject(wrappedValue: notifications)
         _openAIService = StateObject(wrappedValue: openAI)
@@ -39,7 +36,6 @@ struct SidekickApp: App {
     var body: some Scene {
         WindowGroup {
             AppShellView()
-                .environmentObject(authService)
                 .environmentObject(githubService)
                 .environmentObject(openAIService)
                 .environmentObject(notificationService)

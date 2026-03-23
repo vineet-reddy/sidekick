@@ -19,6 +19,13 @@ enum PaperArtifactStore {
         let latexURL: URL?
     }
 
+    struct ExportMetadataSnapshot {
+        let repoURL: URL?
+        let commitSHA: String?
+        let repoPath: String?
+        let publishedAt: Date?
+    }
+
     private struct PendingSubmission: Codable {
         let taskID: String
         let title: String
@@ -50,6 +57,20 @@ enum PaperArtifactStore {
         let fingerprint: String
         let renderedAt: Date
         let figureCount: Int
+    }
+
+    private struct StoredExportMetadata: Codable {
+        let repoURL: URL?
+        let commitSHA: String?
+        let repoPath: String?
+        let publishedAt: Date
+
+        enum CodingKeys: String, CodingKey {
+            case repoURL = "repo_url"
+            case commitSHA = "commit_sha"
+            case repoPath = "repo_path"
+            case publishedAt = "published_at"
+        }
     }
 
     static func persistPendingSubmission(
@@ -124,6 +145,35 @@ enum PaperArtifactStore {
 
     static func taskProgress(for taskID: String) -> PaperTaskProgressSnapshot? {
         load(PaperTaskProgressSnapshot.self, from: statusURL(for: taskID))
+    }
+
+    static func persistExportMetadata(
+        taskID: String,
+        repoURL: URL?,
+        commitSHA: String?,
+        repoPath: String?,
+        publishedAt: Date = .now
+    ) throws {
+        let metadata = StoredExportMetadata(
+            repoURL: repoURL,
+            commitSHA: commitSHA,
+            repoPath: repoPath,
+            publishedAt: publishedAt
+        )
+        try write(metadata, to: exportMetadataURL(for: taskID))
+    }
+
+    static func exportMetadata(for taskID: String) -> ExportMetadataSnapshot? {
+        guard let stored = load(StoredExportMetadata.self, from: exportMetadataURL(for: taskID)) else {
+            return nil
+        }
+
+        return ExportMetadataSnapshot(
+            repoURL: stored.repoURL,
+            commitSHA: stored.commitSHA,
+            repoPath: stored.repoPath,
+            publishedAt: stored.publishedAt
+        )
     }
 
     static func persistStageArtifact<T: Encodable>(
@@ -240,6 +290,10 @@ enum PaperArtifactStore {
 
     private static func renderManifestURL(for taskID: String) -> URL {
         directoryURL(for: taskID).appendingPathComponent("rendered.json")
+    }
+
+    private static func exportMetadataURL(for taskID: String) -> URL {
+        directoryURL(for: taskID).appendingPathComponent("export.json")
     }
 
     private static func stageArtifactURL(for runID: String, stage: ResearchRunStage) -> URL {

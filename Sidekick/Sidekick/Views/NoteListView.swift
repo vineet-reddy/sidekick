@@ -4,7 +4,6 @@ import SwiftUI
 struct NoteListView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject private var heartbeat: HeartbeatManager
-    @EnvironmentObject private var openAI: OpenAIService
     @Query(sort: \Note.updatedAt, order: .reverse) private var notes: [Note]
 
     @State private var searchText = ""
@@ -30,28 +29,6 @@ struct NoteListView: View {
 
             ScrollView {
                 LazyVStack(spacing: 12) {
-                    if let setupMessage = openAI.oauthExecutionSetupMessage,
-                       !setupMessage.isEmpty,
-                       !openAI.hasUserAPIKeyOverride {
-                        VStack(alignment: .leading, spacing: 10) {
-                            Text(setupBannerTitle)
-                                .font(.headline)
-
-                            Text(setupMessage)
-                                .font(.subheadline)
-                                .foregroundStyle(.secondary)
-                                .fixedSize(horizontal: false, vertical: true)
-
-                            Button("Open setup guide") {
-                                openAI.requestOAuthExecutionSetupSheet()
-                            }
-                            .buttonStyle(.borderedProminent)
-                            .font(.subheadline)
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .glassCard(padding: 16)
-                    }
-
                     if filteredNotes.isEmpty && newNoteText.isEmpty {
                         Text("Jot something down below to get started.")
                             .font(.subheadline)
@@ -92,7 +69,6 @@ struct NoteListView: View {
                 .padding(.bottom, 120)
             }
 
-            // Always-present input field at bottom
             VStack {
                 Spacer()
                 inlineComposer
@@ -116,8 +92,6 @@ struct NoteListView: View {
             NoteEditorView(note: note)
         }
     }
-
-    // MARK: - Inline Composer
 
     private var inlineComposer: some View {
         HStack(spacing: 12) {
@@ -154,8 +128,6 @@ struct NoteListView: View {
         .accessibilityIdentifier("notes.inlineComposer")
     }
 
-    // MARK: - Note Card
-
     private func noteCard(for note: Note) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -185,8 +157,6 @@ struct NoteListView: View {
         .accessibilityIdentifier("note.card.\(note.id.uuidString)")
     }
 
-    // MARK: - Actions
-
     private func commitNewNote() {
         let trimmed = newNoteText.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -196,8 +166,6 @@ struct NoteListView: View {
         try? modelContext.save()
         newNoteText = ""
         isNewNoteFocused = false
-
-        // Debounced heartbeat trigger after note creation
         scheduleHeartbeat()
     }
 
@@ -210,7 +178,6 @@ struct NoteListView: View {
             prioritizedNoteID = nil
         }
 
-        // Force heartbeat run immediately
         Task {
             await heartbeat.run(modelContext: modelContext, force: true)
         }
@@ -231,24 +198,5 @@ struct NoteListView: View {
 
     private func delete(_ note: Note) {
         try? ContentDeletionService.deleteNote(note, modelContext: modelContext)
-    }
-
-    private var setupBannerTitle: String {
-        switch openAI.oauthExecutionSetup.phase {
-        case .connectGitHub:
-            return "Create Secure Workspace Repo"
-        case .confirmRepositoryScope:
-            return "Confirm Codex Stayed On One Repo"
-        case .waitingForMachine:
-            return "Waiting For Codex Machine"
-        case .autoProvisioning:
-            return "Finishing Codex Workspace Setup"
-        case .waitingForEnvironment:
-            return "Codex Workspace Is Still Finishing Setup"
-        case .manualFinish:
-            return "Finish Codex Environment In ChatGPT"
-        case .ready:
-            return "Codex Workspace Ready"
-        }
     }
 }

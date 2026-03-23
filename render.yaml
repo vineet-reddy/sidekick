@@ -10,9 +10,9 @@ services:
         sync: false
       - key: GITHUB_CLIENT_SECRET
         sync: false
-      - key: GITHUB_BOOTSTRAP_REDIRECT_BASE_URL
+      - key: SIDEKICK_BACKEND_BASE_URL
+        value: https://sidekick-ion1.onrender.com
+      - key: OPENAI_API_KEY
         sync: false
-      - key: GITHUB_BOOTSTRAP_TEMPLATE_OWNER
-        sync: false
-      - key: GITHUB_BOOTSTRAP_TEMPLATE_REPO
+      - key: SIDEKICK_ENCRYPTION_SECRET
         sync: false
