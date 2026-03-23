@@ -56,6 +56,213 @@ def _sha256_texts(texts: list[str]) -> str:
     return digest.hexdigest()
 
 
+def _word_count(text: str) -> int:
+    return len(re.findall(r"\b[\w'-]+\b", text))
+
+
+def _normalize_text_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str) and value.strip():
+        return [value.strip()]
+    return []
+
+
+def _nested(mapping: dict[str, Any], *keys: str) -> Any:
+    current: Any = mapping
+    for key in keys:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def _has_markdown_section(markdown: str, names: list[str]) -> bool:
+    lowered = markdown.lower()
+    for name in names:
+        escaped = re.escape(name.lower())
+        if re.search(rf"(?m)^\s{{0,3}}#+\s+{escaped}\s*$", lowered):
+            return True
+        if re.search(rf"(?m)^\s*{escaped}\s*$", lowered):
+            return True
+    return False
+
+
+def _has_latex_section(latex: str, names: list[str]) -> bool:
+    lowered = latex.lower()
+    for name in names:
+        escaped = re.escape(name.lower())
+        if re.search(rf"\\(?:section|subsection)\*?\{{\s*{escaped}\s*\}}", lowered):
+            return True
+    return False
+
+
+def _count_reference_entries(markdown: str) -> int:
+    match = re.search(
+        r"(?ims)^\s{0,3}#+\s+references\s*$([\s\S]+)$",
+        markdown,
+    )
+    if not match:
+        return 0
+
+    section = match.group(1)
+    return len(
+        re.findall(
+            r"(?m)^\s*(?:[-*+]\s+|\d+\.\s+|\[\d+\]\s+).+",
+            section,
+        )
+    )
+
+
+def _count_citation_markers(text: str) -> int:
+    patterns = [
+        r"\[[0-9,\-\s]+\]",
+        r"\([A-Z][A-Za-z]+(?:\s+et al\.)?,\s*\d{4}\)",
+        r"\\cite[t|p]?\{[^}]+\}",
+        r"doi:\s*10\.\d{4,9}/[-._;()/:A-Z0-9]+",
+    ]
+    return sum(len(re.findall(pattern, text, flags=re.IGNORECASE)) for pattern in patterns)
+
+
+def _required_analysis_files_present(bundle: dict[str, Any]) -> list[str]:
+    required = {"analysis.py", "requirements.txt", "makefile"}
+    seen = {
+        Path(str(entry.get("path") or "").strip()).name.lower()
+        for entry in bundle.get("analysis_files", []) or []
+        if isinstance(entry, dict)
+    }
+    return sorted(required - seen)
+
+
+def _find_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    title = str(bundle.get("title") or "").strip()
+    markdown = str(bundle.get("markdown") or "").strip()
+    latex = str(bundle.get("latex") or "").strip()
+    manifest = bundle.get("manifest") if isinstance(bundle.get("manifest"), dict) else {}
+    inspection = bundle.get("inspection") if isinstance(bundle.get("inspection"), dict) else {}
+    analysis = bundle.get("analysis") if isinstance(bundle.get("analysis"), dict) else {}
+    verification = bundle.get("verification") if isinstance(bundle.get("verification"), dict) else {}
+    provenance = bundle.get("provenance") if isinstance(bundle.get("provenance"), dict) else {}
+    analysis_provenance = analysis.get("provenance") if isinstance(analysis.get("provenance"), dict) else {}
+    dataset_manifest = analysis.get("dataset_manifest") if isinstance(analysis.get("dataset_manifest"), dict) else {}
+    inspection_manifest = (
+        inspection.get("dataset_manifest") if isinstance(inspection.get("dataset_manifest"), dict) else {}
+    )
+
+    combined_text = "\n".join(
+        part for part in [
+            title,
+            markdown,
+            latex,
+            str(analysis.get("narrative_summary") or ""),
+            str(provenance.get("notes") or ""),
+            str(analysis_provenance.get("notes") or ""),
+            " ".join(_normalize_text_list(analysis.get("limitations"))),
+            " ".join(_normalize_text_list(verification.get("model_warnings"))),
+            " ".join(_normalize_text_list(verification.get("sample_warnings"))),
+        ] if part
+    ).lower()
+
+    banned_phrases = [
+        "synthetic",
+        "simulated",
+        "illustrative",
+        "demo mode",
+        "demonstration dataset",
+        "mock data",
+        "toy example",
+        "scaffold",
+        "placeholder",
+        "this draft",
+        "(draft)",
+        "reproducible analysis bundle (draft)",
+        "does not constitute empirical evidence",
+        "next steps for empirical work",
+        "no real public",
+        "not be interpreted as empirical",
+    ]
+    for phrase in banned_phrases:
+        if phrase in combined_text:
+            issues.append(f"Bundle contains banned draft/demo language: '{phrase}'.")
+
+    if not title or "draft" in title.lower():
+        issues.append("Title is missing or still labeled as a draft.")
+
+    if _word_count(markdown) < 2200:
+        issues.append("Markdown manuscript is too short for a full paper.")
+
+    if len(latex) < 6000:
+        issues.append("LaTeX manuscript is too short for a professional paper.")
+
+    required_sections = {
+        "Abstract": ["Abstract"],
+        "Introduction": ["Introduction"],
+        "Methods": ["Methods", "Materials and Methods", "Methodology"],
+        "Results": ["Results"],
+        "Discussion": ["Discussion", "Conclusion", "Conclusions"],
+        "References": ["References", "Bibliography"],
+    }
+    for section_label, candidates in required_sections.items():
+        if not _has_markdown_section(markdown, candidates):
+            issues.append(f"Markdown manuscript is missing a {section_label} section.")
+        if not _has_latex_section(latex, candidates) and not (
+            section_label == "Abstract" and "\\begin{abstract}" in latex.lower()
+        ):
+            issues.append(f"LaTeX manuscript is missing a {section_label} section.")
+
+    missing_files = _required_analysis_files_present(bundle)
+    if missing_files:
+        issues.append(f"Analysis bundle is missing required files: {', '.join(missing_files)}.")
+
+    manifest_sources = _normalize_text_list(manifest.get("dataset_sources"))
+    if not manifest_sources:
+        issues.append("Manifest is missing real dataset sources.")
+
+    primary_dataset_ids = _normalize_text_list(dataset_manifest.get("primary_dataset_ids"))
+    if not primary_dataset_ids:
+        primary_dataset_ids = _normalize_text_list(inspection_manifest.get("primary_dataset_ids"))
+    if not primary_dataset_ids:
+        issues.append("Bundle does not identify any primary dataset ids.")
+
+    used_dataset_ids = _normalize_text_list(provenance.get("used_dataset_ids")) or _normalize_text_list(
+        analysis_provenance.get("used_dataset_ids")
+    )
+    if not used_dataset_ids:
+        issues.append("Provenance is missing used dataset ids.")
+
+    row_count = dataset_manifest.get("row_count")
+    if not isinstance(row_count, int) or row_count <= 0:
+        issues.append("Analysis dataset manifest has no positive row count.")
+
+    findings = analysis.get("findings")
+    if not isinstance(findings, list) or len(findings) < 2:
+        issues.append("Analysis does not contain enough supported findings.")
+
+    figures = bundle.get("figures")
+    if not isinstance(figures, list) or not figures:
+        issues.append("Bundle does not include final figure outputs.")
+
+    if str(verification.get("decision") or "").strip().lower() != "proceed":
+        issues.append("Verification did not approve publication.")
+    if _normalize_text_list(verification.get("required_revisions")):
+        issues.append("Verification still lists required revisions.")
+    if not _normalize_text_list(verification.get("supported_claims")):
+        issues.append("Verification is missing supported claims.")
+
+    reference_count = _count_reference_entries(markdown)
+    if reference_count < 4:
+        issues.append("Paper does not include enough explicit reference entries.")
+
+    if _count_citation_markers(markdown) < 4:
+        issues.append("Paper body is missing sufficient citation markers.")
+
+    if _count_citation_markers(latex) < 4:
+        issues.append("LaTeX manuscript is missing sufficient citation markers.")
+
+    return issues
+
+
 def _read_json_file(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
@@ -153,6 +360,7 @@ class JobProcessor(threading.Thread):
         try:
             plan = self._generate_plan(context)
             bundle = self._generate_bundle(context, plan)
+            self._audit_bundle(context, plan, bundle)
             publication = self._publish_bundle(context, bundle)
             self._persist_artifacts(context.job["id"], bundle, publication)
             self._database.update_paper_job(
@@ -250,8 +458,8 @@ Keep the plan concise, empirical, and honest. Use public data and reproducibilit
             progress_message="Running the empirical analysis on OpenAI-hosted compute.",
         )
         instructions = """
-You are a scientifically conservative research assistant running in Code Interpreter.
-Use real public data, generate real analysis code, and write a reproducible paper bundle.
+You are Sidekick's publication engine running in Code Interpreter.
+Produce a real, publication-quality empirical paper from real public data, or fail closed.
 Return strict JSON only with this exact shape:
 {
   "title": "string",
@@ -366,12 +574,18 @@ Return strict JSON only with this exact shape:
   }
 }
 Requirements:
-- Use Code Interpreter to inspect data, run the analysis, and generate any figures.
-- The paper must be a real empirical paper with citations and enough detail to reproduce the analysis.
-- `analysis_files` must include at minimum `analysis.py`, `requirements.txt`, and `Makefile`.
+- Use Code Interpreter to identify, download, inspect, and analyze real public datasets.
+- Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
+- If real public data cannot be accessed and analyzed, set `verification.decision` to `blocked`, explain exactly why, and do not fabricate results.
+- The manuscript must read like a professional arXiv paper, not a scaffold: include Abstract, Introduction, Methods, Results, Discussion, Limitations, and References.
+- The manuscript must contain inline citations and a non-trivial references section.
+- `analysis_files` must include at minimum `analysis.py`, `requirements.txt`, and `Makefile`, and the code must reproduce the figures and tables from raw/public data.
+- `manifest.dataset_sources`, `inspection.dataset_manifest.primary_dataset_ids`, `analysis.dataset_manifest.primary_dataset_ids`, and `provenance.used_dataset_ids` must all be populated with real dataset identifiers or URLs.
+- `analysis.dataset_manifest.row_count` must reflect real analyzed data and be greater than zero.
+- `verification.decision` may be `proceed` only if the evidence supports publication-quality empirical claims.
 - Keep repository paths out of the paper text; cite sources in the paper body itself.
-- `verification.decision` must be `proceed` only if the evidence in the bundle supports a real paper.
-- Use conservative claims and document limitations.
+- The `draft` field exists only for client compatibility. Duplicate the final paper there. Do not label anything as a draft.
+- Use conservative claims, report limitations honestly, and prefer blocking over overstating.
 """
         notes = context.request_payload["notes"]
         notes_hash = _sha256_texts([note["content"] for note in notes])
@@ -407,7 +621,7 @@ Requirements:
         )
         bundle = _extract_json_object(response.output_text)
         bundle["plan"] = plan
-        bundle.setdefault("draft", {"title": bundle.get("title", ""), "markdown": bundle.get("markdown", "")})
+        bundle["draft"] = {"title": bundle.get("title", ""), "markdown": bundle.get("markdown", "")}
         bundle.setdefault(
             "manifest",
             {
@@ -419,7 +633,67 @@ Requirements:
                 "dataset_sources": [],
             },
         )
+        bundle_quality_issues = _find_bundle_quality_issues(bundle)
+        if bundle_quality_issues:
+            raise ValueError("Bundle failed publication gate: " + " ".join(bundle_quality_issues[:4]))
         return bundle
+
+    def _audit_bundle(self, context: JobContext, plan: dict[str, Any], bundle: dict[str, Any]) -> None:
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="verify",
+            progress_message="Auditing evidence quality and manuscript completeness.",
+        )
+        instructions = """
+You are a hard-nosed publication auditor.
+Review the proposed paper bundle and decide whether it is a real, publication-quality empirical paper.
+Return strict JSON only with this exact shape:
+{
+  "accept": true,
+  "summary": "string",
+  "errors": ["string"],
+  "required_revisions": ["string"]
+}
+Acceptance standard:
+- Reject any bundle that uses synthetic, simulated, illustrative, demo, mock, or placeholder data.
+- Reject any bundle that lacks real dataset identifiers, real row counts, executable reproducibility files, sufficient citations, or a full paper structure.
+- Reject any bundle that reads like a draft, bundle description, scaffold, or placeholder manuscript.
+- Reject any bundle whose verification block should not confidently be `proceed`.
+- Prefer false negatives over false positives.
+"""
+        audit_input = json.dumps(
+            {
+                "plan": plan,
+                "bundle": bundle,
+            },
+            sort_keys=True,
+        )
+        response = self._openai_client.generate_json(
+            instructions=instructions,
+            input_text=audit_input,
+            use_code_interpreter=False,
+            timeout_seconds=min(600, self._config.backend_max_job_runtime_seconds),
+        )
+        self._database.record_paper_job_metrics(
+            job_id=context.job["id"],
+            model=self._config.openai_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+            estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
+        )
+        audit = _extract_json_object(response.output_text)
+        errors = _normalize_text_list(audit.get("errors"))
+        required_revisions = _normalize_text_list(audit.get("required_revisions"))
+        accepted = bool(audit.get("accept"))
+        if not accepted:
+            issues = errors or required_revisions or ["Model audit rejected the paper bundle."]
+            raise ValueError("Bundle failed publication audit: " + " ".join(issues[:4]))
+
+        verification = bundle.get("verification")
+        if isinstance(verification, dict):
+            verification["audit_summary"] = str(audit.get("summary") or "").strip()
+            verification["audit_errors"] = errors
+            verification["audit_required_revisions"] = required_revisions
 
     def _publish_bundle(self, context: JobContext, bundle: dict[str, Any]) -> dict[str, Any]:
         self._database.update_paper_job(

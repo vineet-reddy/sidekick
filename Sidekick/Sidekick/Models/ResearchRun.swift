@@ -517,6 +517,23 @@ nonisolated struct ResearchDatasetManifest: Codable {
         case selectedVariables = "selected_variables"
         case qualityNotes = "quality_notes"
     }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        primaryDatasetIDs = try container.decode([String].self, forKey: .primaryDatasetIDs)
+        dataSources = try container.decode([String].self, forKey: .dataSources)
+        sampleDescription = try container.decode(String.self, forKey: .sampleDescription)
+        rowCount = try container.decodeIfPresent(Int.self, forKey: .rowCount)
+        selectedVariables = try container.decode([String].self, forKey: .selectedVariables)
+
+        if let notes = try? container.decode([String].self, forKey: .qualityNotes) {
+            qualityNotes = notes
+        } else if let note = try? container.decode(String.self, forKey: .qualityNotes) {
+            qualityNotes = [note]
+        } else {
+            qualityNotes = []
+        }
+    }
 }
 
 nonisolated struct ResearchInspectionArtifact: Codable {
@@ -530,6 +547,28 @@ nonisolated struct ResearchInspectionArtifact: Codable {
         case accessNotes = "access_notes"
         case qualityChecks = "quality_checks"
         case analysisChecklist = "analysis_checklist"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        datasetManifest = try container.decode(ResearchDatasetManifest.self, forKey: .datasetManifest)
+        accessNotes = try container.decode(String.self, forKey: .accessNotes)
+
+        if let checks = try? container.decode([String].self, forKey: .qualityChecks) {
+            qualityChecks = checks
+        } else if let check = try? container.decode(String.self, forKey: .qualityChecks) {
+            qualityChecks = [check]
+        } else {
+            qualityChecks = []
+        }
+
+        if let checklist = try? container.decode([String].self, forKey: .analysisChecklist) {
+            analysisChecklist = checklist
+        } else if let checklist = try? container.decode(String.self, forKey: .analysisChecklist) {
+            analysisChecklist = [checklist]
+        } else {
+            analysisChecklist = []
+        }
     }
 }
 
@@ -727,11 +766,13 @@ private enum SidekickImageValidator {
               let image = CGImageSourceCreateImageAtIndex(source, 0, nil),
               image.width > 0,
               image.height > 0,
-              containsVisibleContent(image),
               hasPrintableResolution(image) else {
             return nil
         }
 
+        // Backend-generated figures are already scoped to this paper bundle. Prefer
+        // accepting any decodable print-sized image here rather than rejecting a
+        // valid figure because contrast heuristics misclassify it as blank.
         return canonicalPNGData(for: image) ?? data
     }
 

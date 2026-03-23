@@ -386,11 +386,13 @@ final class OpenAIService: ObservableObject {
             )
             let bundle = envelope.bundle
             let topLevelFigures = bundle.figures ?? bundle.analysis?.figures ?? []
+            let decodedFigures = topLevelFigures.compactMap(\.imageData)
+            let figureBytes = decodedFigures.isEmpty ? (bundle.analysis?.figureData ?? []) : decodedFigures
             let artifacts = PaperArtifacts(
                 title: bundle.title,
                 markdown: bundle.markdown,
                 latex: bundle.latex,
-                figures: topLevelFigures.compactMap(\.imageData),
+                figures: figureBytes,
                 provenance: bundle.provenance ?? bundle.analysis?.provenance,
                 plan: bundle.plan,
                 inspection: bundle.inspection,

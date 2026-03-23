@@ -164,7 +164,10 @@ struct AppShellView: View {
                 Task {
                     await preloadRecentReadyPapers(modelContext: modelContext)
                 }
-                if QAFlags.shouldForceHeartbeatOnLaunch || inFlightPaperCount > 0 || heldRunCount > 0 {
+                if QAFlags.shouldForceHeartbeatOnLaunch
+                    || inFlightPaperCount > 0
+                    || heldRunCount > 0
+                    || recoverableCompletedPaperCount > 0 {
                     await heartbeat.run(modelContext: modelContext, force: true)
                 } else {
                     await heartbeat.runIfNeeded(modelContext: modelContext)
@@ -182,7 +185,9 @@ struct AppShellView: View {
 
                 Task {
                     _ = try? await github.refreshConnectionSessionIfNeeded()
-                    if inFlightPaperCount > 0 || heldRunCount > 0 {
+                    if inFlightPaperCount > 0
+                        || heldRunCount > 0
+                        || recoverableCompletedPaperCount > 0 {
                         await heartbeat.run(modelContext: modelContext, force: true)
                     } else {
                         await heartbeat.runIfNeeded(modelContext: modelContext)
@@ -191,6 +196,9 @@ struct AppShellView: View {
             }
             .task(id: foregroundHeartbeatTaskKey) {
                 await runForegroundHeartbeatLoopIfNeeded(modelContext: modelContext)
+            }
+            .task(id: recoverableHeartbeatTaskKey) {
+                await runRecoveryHeartbeatIfNeeded(modelContext: modelContext)
             }
             .task(id: githubPollTaskKey) {
                 await runGitHubPollLoopIfNeeded(modelContext: modelContext)
@@ -207,12 +215,28 @@ struct AppShellView: View {
         }.count
     }
 
+    private var recoverableCompletedPaperCount: Int {
+        let completedRunIDs = Set(
+            runs
+                .filter { $0.status == .completed }
+                .map(\.runID)
+        )
+
+        return papers.filter {
+            $0.status != .ready && completedRunIDs.contains($0.codexTaskID)
+        }.count
+    }
+
     private var foregroundHeartbeatTaskKey: String {
         "\(scenePhase == .active)-\(inFlightPaperCount)"
     }
 
     private var githubPollTaskKey: String {
         "\(scenePhase == .active)-\(github.activeConnectSession?.sessionID ?? "none")-\(github.activeConnectSession?.status ?? "none")"
+    }
+
+    private var recoverableHeartbeatTaskKey: String {
+        "\(scenePhase == .active)-\(recoverableCompletedPaperCount)"
     }
 
     private func resetQAContentIfNeeded(modelContext: ModelContext) {
@@ -301,6 +325,14 @@ struct AppShellView: View {
 
             await heartbeat.run(modelContext: modelContext, force: true)
         }
+    }
+
+    private func runRecoveryHeartbeatIfNeeded(modelContext: ModelContext) async {
+        guard scenePhase == .active, recoverableCompletedPaperCount > 0 else {
+            return
+        }
+
+        await heartbeat.run(modelContext: modelContext, force: true)
     }
 
     private func runGitHubPollLoopIfNeeded(modelContext: ModelContext) async {

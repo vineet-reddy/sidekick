@@ -42,12 +42,13 @@ class BootstrapServiceConfig:
     backend_database_path: str = ".sidekick-runtime/backend.sqlite3"
     backend_artifact_root: str = ".sidekick-runtime/paper-artifacts"
     backend_kill_switch: bool = False
-    backend_max_daily_spend_usd: float = 25.0
+    backend_max_daily_spend_usd: float = 100.0
     backend_max_jobs_per_install_per_day: int = 8
-    backend_max_job_runtime_seconds: int = 1800
+    backend_max_job_runtime_seconds: int = 3600
     backend_max_concurrent_jobs_per_install: int = 1
     backend_artifact_ttl_seconds: int = 24 * 60 * 60
-    openai_model: str = "gpt-5-mini"
+    openai_model: str = "gpt-5.4"
+    openai_reasoning_effort: str = "xhigh"
     openai_base_url: str = "https://api.openai.com/v1"
     openai_estimated_input_cost_per_million: float = 0.25
     openai_estimated_output_cost_per_million: float = 2.0
@@ -110,12 +111,13 @@ class BootstrapServiceConfig:
             backend_artifact_root=os.getenv("SIDEKICK_BACKEND_ARTIFACT_ROOT", ".sidekick-runtime/paper-artifacts").strip()
             or ".sidekick-runtime/paper-artifacts",
             backend_kill_switch=_bool_env("SIDEKICK_BACKEND_KILL_SWITCH", False),
-            backend_max_daily_spend_usd=_float_env("SIDEKICK_BACKEND_MAX_DAILY_SPEND_USD", 25.0),
+            backend_max_daily_spend_usd=_float_env("SIDEKICK_BACKEND_MAX_DAILY_SPEND_USD", 100.0),
             backend_max_jobs_per_install_per_day=_int_env("SIDEKICK_BACKEND_MAX_JOBS_PER_INSTALL_PER_DAY", 8),
-            backend_max_job_runtime_seconds=_int_env("SIDEKICK_BACKEND_MAX_JOB_RUNTIME_SECONDS", 1800),
+            backend_max_job_runtime_seconds=_int_env("SIDEKICK_BACKEND_MAX_JOB_RUNTIME_SECONDS", 3600),
             backend_max_concurrent_jobs_per_install=_int_env("SIDEKICK_BACKEND_MAX_CONCURRENT_JOBS_PER_INSTALL", 1),
             backend_artifact_ttl_seconds=_int_env("SIDEKICK_BACKEND_ARTIFACT_TTL_SECONDS", 24 * 60 * 60),
-            openai_model=os.getenv("SIDEKICK_OPENAI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini",
+            openai_model=os.getenv("SIDEKICK_OPENAI_MODEL", "gpt-5.4").strip() or "gpt-5.4",
+            openai_reasoning_effort=os.getenv("SIDEKICK_OPENAI_REASONING_EFFORT", "xhigh").strip() or "xhigh",
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1",
             openai_estimated_input_cost_per_million=_float_env(
                 "SIDEKICK_OPENAI_INPUT_COST_PER_MILLION",

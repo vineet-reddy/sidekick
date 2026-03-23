@@ -45,6 +45,9 @@ class OpenAIClient:
             "instructions": instructions,
             "input": input_text,
         }
+        payload["reasoning"] = {
+            "effort": self._config.openai_reasoning_effort,
+        }
 
         if use_code_interpreter:
             payload["tools"] = [

@@ -150,6 +150,33 @@ final class HeartbeatManager: ObservableObject {
                 markResearchRunFailed(run, paper: paper, message: message)
             }
         }
+
+        for paper in papers where paper.status != .ready {
+            guard let run = runsByPaperID[paper.id] else {
+                continue
+            }
+
+            guard run.status == .completed,
+                  !run.runID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+
+            if await repairCompletedPaperFromLocalArtifactsIfPossible(paper, run: run) {
+                continue
+            }
+
+            let result = try await openAI.checkTask(run.runID)
+            switch result {
+            case let .waiting(snapshot):
+                continue
+            case let .completed(snapshot, artifacts):
+                persistTaskProgress(snapshot)
+                apply(snapshot: snapshot, to: run)
+                try await applyCompletedArtifacts(artifacts, to: paper, run: run)
+            case let .failed(snapshot, message):
+                continue
+            }
+        }
     }
 
     private func apply(snapshot: PaperTaskProgressSnapshot, to run: ResearchRun) {
@@ -235,6 +262,7 @@ final class HeartbeatManager: ObservableObject {
         paper.markdown = artifacts.markdown
         paper.figureData = artifacts.figures
         paper.codexTaskID = run.runID
+        paper.figureData = artifacts.figures.isEmpty ? (artifacts.analysis?.figureData ?? []) : artifacts.figures
         paper.status = .ready
 
         await PaperDocumentService.precomputeIfNeeded(for: paper)
@@ -246,6 +274,59 @@ final class HeartbeatManager: ObservableObject {
 
         run.markCompleted(message: "Paper ready.")
         try persistModelChanges(in: run.modelContext)
+    }
+
+    private func repairCompletedPaperFromLocalArtifactsIfPossible(
+        _ paper: Paper,
+        run: ResearchRun
+    ) async -> Bool {
+        let taskID = run.runID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !taskID.isEmpty else {
+            return false
+        }
+
+        let draft = PaperArtifactStore.stageArtifact(
+            ResearchDraftArtifact.self,
+            runID: taskID,
+            stage: .write
+        )
+        let analysis = PaperArtifactStore.stageArtifact(
+            ResearchAnalysisArtifact.self,
+            runID: taskID,
+            stage: .analyze
+        )
+
+        let recoveredTitle = (draft?.title ?? paper.title).trimmingCharacters(in: .whitespacesAndNewlines)
+        let recoveredMarkdown = (draft?.markdown ?? paper.markdown).trimmingCharacters(in: .whitespacesAndNewlines)
+        let recoveredFigures = paper.figureData.isEmpty ? (analysis?.figureData ?? []) : paper.figureData
+
+        guard !recoveredMarkdown.isEmpty else {
+            return false
+        }
+
+        if !recoveredTitle.isEmpty {
+            paper.title = recoveredTitle
+        }
+        paper.markdown = recoveredMarkdown
+        paper.figureData = recoveredFigures
+        paper.codexTaskID = taskID
+        paper.status = .ready
+        run.markRunning(stage: .typeset, message: ResearchRunStage.typeset.title)
+
+        await PaperDocumentService.precomputeIfNeeded(for: paper)
+        guard paper.status == .ready else {
+            persistModelChangesIfPossible(in: run.modelContext, context: "repair completed paper")
+            return false
+        }
+
+        if paper.lastNotifiedAt == nil {
+            notifications.notify(paper: paper)
+            paper.lastNotifiedAt = .now
+        }
+
+        run.markCompleted(message: "Paper ready.")
+        persistModelChangesIfPossible(in: run.modelContext, context: "repair completed paper")
+        return true
     }
 
     private func persistTaskProgress(_ snapshot: PaperTaskProgressSnapshot) {

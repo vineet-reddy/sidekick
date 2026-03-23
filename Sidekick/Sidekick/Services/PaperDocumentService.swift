@@ -78,9 +78,7 @@ enum PaperDocumentService {
            let analysis,
            !analysis.figures.isEmpty,
            paper.status == .ready {
-            print("[PaperDocs] required staged figures are unavailable; downgrading paper task=\(taskID)")
-            updatePaperStatusPreservingTimestamp(.failed, for: paper)
-            throw DocumentError.missingRequiredFigureAsset
+            print("[PaperDocs] staged figures are unavailable; rendering with placeholders task=\(taskID)")
         }
 
         let fingerprint = artifactFingerprint(for: paper)
