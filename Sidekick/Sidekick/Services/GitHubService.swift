@@ -96,6 +96,7 @@ final class GitHubService: ObservableObject {
         case backendNotConfigured
         case invalidResponse
         case missingDeviceSession
+        case invalidSessionToken
 
         var errorDescription: String? {
             switch self {
@@ -105,6 +106,8 @@ final class GitHubService: ObservableObject {
                 return "The Sidekick backend returned an unexpected response."
             case .missingDeviceSession:
                 return "Sidekick could not create a device session."
+            case .invalidSessionToken:
+                return "invalid_session_token"
             }
         }
     }
@@ -174,28 +177,21 @@ final class GitHubService: ObservableObject {
         exportContext?.repoFullName ?? "Connect GitHub"
     }
 
-    func ensureDeviceSession() async throws -> SidekickBackendSession {
+    func ensureDeviceSession(forceRefresh: Bool = false) async throws -> SidekickBackendSession {
         guard let baseURL = backendBaseURL else {
             throw GitHubServiceError.backendNotConfigured
         }
         invalidatePersistedStateIfBackendChanged(baseURL: baseURL)
 
-        if let backendSession, exportContext != nil {
+        if !forceRefresh, let backendSession {
             return backendSession
         }
 
-        let payload = [
-            "device_id": deviceID
-        ]
-        let response: DeviceSessionResponse = try await performRequest(
-            url: baseURL.appendingPathComponent("api/device/session"),
-            method: "POST",
-            body: payload,
-            authorized: false
-        )
+        let response = try await createOrResumeDeviceSession(baseURL: baseURL)
 
         backendSession = response.session
         exportContext = response.githubConnection
+        connectionErrorMessage = nil
         persist(response.session, key: sidekickBackendSessionDefaultsKey)
         if let githubConnection = response.githubConnection {
             persist(githubConnection, key: sidekickGitHubExportContextDefaultsKey)
@@ -203,11 +199,12 @@ final class GitHubService: ObservableObject {
             defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
         }
         defaults.set(baseURL.absoluteString, forKey: sidekickBackendBaseURLDefaultsKey)
+        NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
         return response.session
     }
 
     func beginGitHubConnection() async throws -> URL {
-        _ = try await ensureDeviceSession()
+        _ = try await ensureDeviceSession(forceRefresh: true)
         guard let baseURL = backendBaseURL else {
             throw GitHubServiceError.backendNotConfigured
         }
@@ -215,10 +212,9 @@ final class GitHubService: ObservableObject {
         activeConnectSession = nil
         defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
 
-        let connectSession: GitHubConnectSession = try await performRequest(
+        let connectSession: GitHubConnectSession = try await performAuthorizedRequest(
             url: baseURL.appendingPathComponent("api/github/connect/start"),
-            method: "POST",
-            authorized: true
+            method: "POST"
         )
         activeConnectSession = connectSession
         persist(connectSession, key: sidekickGitHubConnectSessionDefaultsKey)
@@ -241,26 +237,35 @@ final class GitHubService: ObservableObject {
             return nil
         }
 
-        let refreshed: GitHubConnectSession = try await performRequest(
-            url: baseURL.appendingPathComponent("api/github/connect/sessions/\(activeConnectSession.sessionID)"),
-            method: "GET",
-            authorized: true
-        )
-        self.activeConnectSession = refreshed
-        persist(refreshed, key: sidekickGitHubConnectSessionDefaultsKey)
-        connectionErrorMessage = refreshed.errorMessage
+        do {
+            let refreshed: GitHubConnectSession = try await performAuthorizedRequest(
+                url: baseURL.appendingPathComponent("api/github/connect/sessions/\(activeConnectSession.sessionID)"),
+                method: "GET"
+            )
+            self.activeConnectSession = refreshed
+            persist(refreshed, key: sidekickGitHubConnectSessionDefaultsKey)
+            connectionErrorMessage = refreshed.errorMessage
 
-        if let connection = refreshed.connection {
-            exportContext = connection
-            persist(connection, key: sidekickGitHubExportContextDefaultsKey)
-            NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
+            if let connection = refreshed.connection {
+                exportContext = connection
+                persist(connection, key: sidekickGitHubExportContextDefaultsKey)
+                NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
+            }
+
+            if refreshed.isTerminal {
+                defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+            }
+
+            return refreshed
+        } catch {
+            if let nsError = error as NSError?,
+               nsError.localizedDescription == "unknown_session" {
+                self.activeConnectSession = nil
+                defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+                return nil
+            }
+            throw error
         }
-
-        if refreshed.isTerminal {
-            defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
-        }
-
-        return refreshed
     }
 
     func clearConnectionState() {
@@ -270,6 +275,45 @@ final class GitHubService: ObservableObject {
         defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
         defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
         NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
+    }
+
+    private func createOrResumeDeviceSession(baseURL: URL) async throws -> DeviceSessionResponse {
+        let payload = [
+            "device_id": deviceID
+        ]
+        return try await performRequest(
+            url: baseURL.appendingPathComponent("api/device/session"),
+            method: "POST",
+            body: payload,
+            authorized: false
+        )
+    }
+
+    private func performAuthorizedRequest<Response: Decodable>(
+        url: URL,
+        method: String,
+        body: [String: Any]? = nil
+    ) async throws -> Response {
+        _ = try await ensureDeviceSession()
+
+        do {
+            return try await performRequest(
+                url: url,
+                method: method,
+                body: body,
+                authorized: true
+            )
+        } catch GitHubServiceError.invalidSessionToken {
+            _ = try await ensureDeviceSession(forceRefresh: true)
+            return try await performRequest(
+                url: url,
+                method: method,
+                body: body,
+                authorized: true
+            )
+        } catch {
+            throw error
+        }
     }
 
     private var backendBaseURL: URL? {
@@ -326,8 +370,21 @@ final class GitHubService: ObservableObject {
         }
 
         let (data, response) = try await session.data(for: request)
-        guard let httpResponse = response as? HTTPURLResponse,
+        let httpResponse = response as? HTTPURLResponse
+        guard let httpResponse,
               (200 ..< 300).contains(httpResponse.statusCode) else {
+            if httpResponse?.statusCode == 401,
+               let error = decodeErrorMessage(data: data) as NSError?,
+               error.localizedDescription == GitHubServiceError.invalidSessionToken.localizedDescription {
+                backendSession = nil
+                exportContext = nil
+                activeConnectSession = nil
+                defaults.removeObject(forKey: sidekickBackendSessionDefaultsKey)
+                defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
+                defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+                NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
+                throw GitHubServiceError.invalidSessionToken
+            }
             throw decodeErrorMessage(data: data) ?? GitHubServiceError.invalidResponse
         }
 
@@ -350,11 +407,10 @@ final class GitHubService: ObservableObject {
             )
         }
         if let error = object["error"] as? String {
-            return NSError(
-                domain: "com.vineet.sidekick.github",
-                code: 1,
-                userInfo: [NSLocalizedDescriptionKey: error]
-            )
+            if error == GitHubServiceError.invalidSessionToken.localizedDescription {
+                return GitHubServiceError.invalidSessionToken
+            }
+            return NSError(domain: "com.vineet.sidekick.github", code: 1, userInfo: [NSLocalizedDescriptionKey: error])
         }
         return nil
     }

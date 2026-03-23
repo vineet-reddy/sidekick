@@ -157,7 +157,7 @@ struct AppShellView: View {
                 Task {
                     await notifications.requestAuthorization()
                 }
-                _ = try? await github.ensureDeviceSession()
+                _ = try? await github.ensureDeviceSession(forceRefresh: true)
                 heartbeat.scheduleBackgroundRefresh()
                 resetQAContentIfNeeded(modelContext: modelContext)
                 seedQANotesIfNeeded(modelContext: modelContext)
@@ -184,6 +184,7 @@ struct AppShellView: View {
                 }
 
                 Task {
+                    _ = try? await github.ensureDeviceSession(forceRefresh: true)
                     _ = try? await github.refreshConnectionSessionIfNeeded()
                     if inFlightPaperCount > 0
                         || heldRunCount > 0
