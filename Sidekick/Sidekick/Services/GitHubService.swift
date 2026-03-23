@@ -170,12 +170,13 @@ final class GitHubService: ObservableObject {
     }
 
     func ensureDeviceSession() async throws -> SidekickBackendSession {
-        if let backendSession {
-            return backendSession
-        }
-
         guard let baseURL = backendBaseURL else {
             throw GitHubServiceError.backendNotConfigured
+        }
+        invalidatePersistedStateIfBackendChanged(baseURL: baseURL)
+
+        if let backendSession, exportContext != nil {
+            return backendSession
         }
 
         let payload = [
@@ -196,6 +197,7 @@ final class GitHubService: ObservableObject {
         } else {
             defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
         }
+        defaults.set(baseURL.absoluteString, forKey: sidekickBackendBaseURLDefaultsKey)
         return response.session
     }
 
@@ -219,6 +221,14 @@ final class GitHubService: ObservableObject {
         activeConnectSession = connectSession
         persist(connectSession, key: sidekickGitHubConnectSessionDefaultsKey)
         connectionErrorMessage = nil
+        if let connection = connectSession.connection {
+            exportContext = connection
+            persist(connection, key: sidekickGitHubExportContextDefaultsKey)
+            NotificationCenter.default.post(name: .sidekickGitHubConnectionChanged, object: nil)
+        }
+        if connectSession.isTerminal {
+            defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+        }
         return connectSession.browserURL
     }
 
@@ -267,6 +277,10 @@ final class GitHubService: ObservableObject {
             return URL(string: environmentValue)
         }
 
+#if targetEnvironment(simulator)
+        return URL(string: "http://127.0.0.1:8787")
+#else
+
         let infoValue = (Bundle.main.object(forInfoDictionaryKey: "SidekickGitHubBootstrapBaseURL") as? String)?
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard let infoValue,
@@ -276,6 +290,7 @@ final class GitHubService: ObservableObject {
         }
 
         return URL(string: infoValue)
+#endif
     }
 
     private var deviceID: String {
@@ -352,6 +367,39 @@ final class GitHubService: ObservableObject {
             return
         }
         defaults.set(data, forKey: key)
+    }
+
+    private func invalidatePersistedStateIfBackendChanged(baseURL: URL) {
+        let normalized = baseURL.absoluteString
+        let stored = defaults.string(forKey: sidekickBackendBaseURLDefaultsKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let stored, !stored.isEmpty else {
+            if backendSession != nil || exportContext != nil || activeConnectSession != nil {
+                backendSession = nil
+                exportContext = nil
+                activeConnectSession = nil
+                connectionErrorMessage = nil
+                defaults.removeObject(forKey: sidekickBackendSessionDefaultsKey)
+                defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
+                defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+            }
+            defaults.set(normalized, forKey: sidekickBackendBaseURLDefaultsKey)
+            return
+        }
+
+        guard stored != normalized else {
+            return
+        }
+
+        backendSession = nil
+        exportContext = nil
+        activeConnectSession = nil
+        connectionErrorMessage = nil
+        defaults.removeObject(forKey: sidekickBackendSessionDefaultsKey)
+        defaults.removeObject(forKey: sidekickGitHubExportContextDefaultsKey)
+        defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
+        defaults.set(normalized, forKey: sidekickBackendBaseURLDefaultsKey)
     }
 
     private static func loadValue<T: Decodable>(

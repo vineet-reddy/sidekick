@@ -2,6 +2,7 @@ import Foundation
 
 let sidekickBackendSessionDefaultsKey = "com.vineet.sidekick.backend-session"
 let sidekickBackendDeviceIDDefaultsKey = "com.vineet.sidekick.backend-device-id"
+let sidekickBackendBaseURLDefaultsKey = "com.vineet.sidekick.backend-base-url"
 let sidekickGitHubExportContextDefaultsKey = "com.vineet.sidekick.github-export-context"
 let sidekickGitHubConnectSessionDefaultsKey = "com.vineet.sidekick.github-connect-session"
 let sidekickOpenAIEnvironmentRouterDefaultsKey = "com.vineet.sidekick.openai-environment-router"

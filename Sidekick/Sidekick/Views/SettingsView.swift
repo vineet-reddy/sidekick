@@ -118,7 +118,9 @@ struct SettingsView: View {
             do {
                 let url = try await github.beginGitHubConnection()
                 await MainActor.run {
-                    openURL(url)
+                    if !github.isConnected {
+                        openURL(url)
+                    }
                 }
             } catch {
                 await MainActor.run {

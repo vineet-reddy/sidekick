@@ -495,7 +495,9 @@ private struct GitHubRequiredView: View {
                 let url = try await github.beginGitHubConnection()
                 await MainActor.run {
                     isConnecting = false
-                    openURL(url)
+                    if !github.isConnected {
+                        openURL(url)
+                    }
                 }
             } catch {
                 await MainActor.run {
