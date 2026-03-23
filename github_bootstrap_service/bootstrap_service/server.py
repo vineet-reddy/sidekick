@@ -414,14 +414,15 @@ Return strict JSON only with this exact shape:
   "risks": ["string"],
   "execution_notes": "string"
 }
-Keep the plan concise, empirical, and honest. Use web search to identify real public datasets and core citations whenever the notes do not already name them explicitly. Prefer public datasets that are directly downloadable and reproducibility-friendly.
+Keep the plan concise, empirical, and honest. Use web search to identify real public datasets and core citations whenever the notes do not already name them explicitly. Prefer public datasets that are directly downloadable and reproducibility-friendly. Treat `dataset_hints` as optional hints only, never as a hard restriction.
 """
         notes = context.request_payload["notes"]
         input_text = json.dumps(
             {
                 "title": context.request_payload["title"],
                 "theme": context.request_payload["theme"],
-                "dataset_hints": context.request_payload.get("dataset_ids", []),
+                "dataset_hints": context.request_payload.get("dataset_hints", [])
+                or context.request_payload.get("dataset_ids", []),
                 "notes": notes,
             },
             sort_keys=True,
@@ -577,6 +578,7 @@ Return strict JSON only with this exact shape:
 Requirements:
 - Use web search to find real public datasets, cohort descriptions, and supporting literature before you analyze anything.
 - Use Code Interpreter to identify, download, inspect, and analyze real public datasets.
+- Treat any `dataset_hints` input as optional suggestions only. You may ignore them if they are stale, low quality, mismatched to the question, or prevent better open-data grounding.
 - Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
 - If real public data cannot be accessed and analyzed, set `verification.decision` to `blocked`, explain exactly why, and do not fabricate results.
 - The manuscript must read like a professional arXiv paper, not a scaffold: include Abstract, Introduction, Methods, Results, Discussion, Limitations, and References.
@@ -595,7 +597,8 @@ Requirements:
             {
                 "title": context.request_payload["title"],
                 "theme": context.request_payload["theme"],
-                "dataset_hints": context.request_payload.get("dataset_ids", []),
+                "dataset_hints": context.request_payload.get("dataset_hints", [])
+                or context.request_payload.get("dataset_ids", []),
                 "plan": plan,
                 "notes_hash": notes_hash,
                 "notes": notes,

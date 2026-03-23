@@ -298,12 +298,11 @@ final class OpenAIService: ObservableObject {
             limit: 4
         )
         let registryVersion = await trustedDatasets.registryVersion()
-        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
         let connected = github.isConnected
 
         return ResearchRunPreparation(
             selectedDatasetIDs: selectedDatasets.map(\.id),
-            allowedDomains: allowedDomains,
+            allowedDomains: [],
             registryVersion: registryVersion,
             sourceSupportTier: selectedDatasets.isEmpty ? .experimental : .supported,
             schedulingDisposition: connected ? .autoStart : .hold,
@@ -330,15 +329,15 @@ final class OpenAIService: ObservableObject {
             noteTexts: notes.map(\.content),
             limit: 4
         )
-        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
         let response: JobCreateResponse = try await performRequest(
             path: "api/papers",
             method: "POST",
             body: [
                 "title": title,
                 "theme": theme,
-                "dataset_ids": selectedDatasets.map(\.id),
-                "allowed_domains": allowedDomains,
+                "dataset_ids": [],
+                "dataset_hints": selectedDatasets.map(\.id),
+                "allowed_domains": [],
                 "notes": notes.map {
                     [
                         "id": $0.id.uuidString,
@@ -352,7 +351,7 @@ final class OpenAIService: ObservableObject {
         return PaperTaskSubmission(
             taskID: response.jobID,
             selectedDatasetIDs: selectedDatasets.map(\.id),
-            allowedDomains: allowedDomains,
+            allowedDomains: [],
             registryVersion: registryVersion
         )
     }
