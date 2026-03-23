@@ -2,36 +2,49 @@ import os
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bootstrap_service.config import BootstrapServiceConfig
 
 
-class BootstrapServiceConfigTests(unittest.TestCase):
-    def test_from_env_reads_backend_settings(self) -> None:
+class ConfigTests(unittest.TestCase):
+    def test_stage_model_defaults_use_current_split(self) -> None:
         env = {
-            "GITHUB_CLIENT_ID": "cid",
-            "GITHUB_CLIENT_SECRET": "secret",
-            "SIDEKICK_BACKEND_BASE_URL": "https://bootstrap.sidekick.example",
+            "GITHUB_CLIENT_ID": "client-id",
+            "GITHUB_CLIENT_SECRET": "client-secret",
+            "SIDEKICK_BACKEND_BASE_URL": "https://sidekick-ion1.onrender.com",
             "OPENAI_API_KEY": "sk-test",
-            "SIDEKICK_GITHUB_REPO_NAME": "sidekick-research",
-            "SIDEKICK_GITHUB_REPO_VISIBILITY": "public",
-            "SIDEKICK_BACKEND_MAX_DAILY_SPEND_USD": "12.5",
         }
-        original = os.environ.copy()
-        try:
-            os.environ.update(env)
+        with patch.dict(os.environ, env, clear=True):
             config = BootstrapServiceConfig.from_env()
-        finally:
-            os.environ.clear()
-            os.environ.update(original)
 
-        self.assertEqual(config.backend_base_url, "https://bootstrap.sidekick.example")
-        self.assertEqual(config.github_repo_name, "sidekick-research")
-        self.assertEqual(config.github_repo_visibility, "public")
-        self.assertEqual(config.openai_api_key, "sk-test")
-        self.assertEqual(config.backend_max_daily_spend_usd, 12.5)
+        self.assertEqual(config.openai_model, "gpt-5.4")
+        self.assertEqual(config.openai_planner_model, "gpt-5.4-nano")
+        self.assertEqual(config.openai_analysis_model, "gpt-5.4")
+        self.assertEqual(config.openai_writer_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_auditor_model, "gpt-5.4")
+
+    def test_stage_models_can_be_overridden_independently(self) -> None:
+        env = {
+            "GITHUB_CLIENT_ID": "client-id",
+            "GITHUB_CLIENT_SECRET": "client-secret",
+            "SIDEKICK_BACKEND_BASE_URL": "https://sidekick-ion1.onrender.com",
+            "OPENAI_API_KEY": "sk-test",
+            "SIDEKICK_OPENAI_MODEL": "gpt-5.4",
+            "SIDEKICK_OPENAI_PLANNER_MODEL": "gpt-5.4-mini",
+            "SIDEKICK_OPENAI_ANALYSIS_MODEL": "gpt-5.4",
+            "SIDEKICK_OPENAI_WRITER_MODEL": "gpt-5.4-mini",
+            "SIDEKICK_OPENAI_AUDITOR_MODEL": "gpt-5.4-mini",
+        }
+        with patch.dict(os.environ, env, clear=True):
+            config = BootstrapServiceConfig.from_env()
+
+        self.assertEqual(config.openai_planner_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_analysis_model, "gpt-5.4")
+        self.assertEqual(config.openai_writer_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_auditor_model, "gpt-5.4-mini")
 
 
 if __name__ == "__main__":

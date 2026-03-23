@@ -39,16 +39,24 @@ class OpenAIClient:
         use_code_interpreter: bool,
         use_web_search: bool = False,
         timeout_seconds: int,
+        model: str | None = None,
+        reasoning_effort: str | None = None,
     ) -> OpenAIResponseResult:
+        selected_model = (model or self._config.openai_model).strip()
         payload: dict[str, Any] = {
-            "model": self._config.openai_model,
+            "model": selected_model,
             "background": True,
             "instructions": instructions,
             "input": input_text,
         }
-        if self._config.openai_reasoning_effort:
+        selected_reasoning_effort = (
+            self._config.openai_reasoning_effort
+            if reasoning_effort is None
+            else reasoning_effort.strip()
+        )
+        if selected_reasoning_effort:
             payload["reasoning"] = {
-                "effort": self._config.openai_reasoning_effort,
+                "effort": selected_reasoning_effort,
             }
 
         tools: list[dict[str, Any]] = []

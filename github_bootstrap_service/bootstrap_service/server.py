@@ -135,6 +135,118 @@ def _required_analysis_files_present(bundle: dict[str, Any]) -> list[str]:
     return sorted(required - seen)
 
 
+def _find_analysis_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
+    issues: list[str] = []
+    title = str(bundle.get("title") or "").strip()
+    manifest = bundle.get("manifest") if isinstance(bundle.get("manifest"), dict) else {}
+    inspection = bundle.get("inspection") if isinstance(bundle.get("inspection"), dict) else {}
+    analysis = bundle.get("analysis") if isinstance(bundle.get("analysis"), dict) else {}
+    provenance = bundle.get("provenance") if isinstance(bundle.get("provenance"), dict) else {}
+    resolver = bundle.get("resolver") if isinstance(bundle.get("resolver"), dict) else {}
+    analysis_provenance = analysis.get("provenance") if isinstance(analysis.get("provenance"), dict) else {}
+    dataset_manifest = analysis.get("dataset_manifest") if isinstance(analysis.get("dataset_manifest"), dict) else {}
+    inspection_manifest = (
+        inspection.get("dataset_manifest") if isinstance(inspection.get("dataset_manifest"), dict) else {}
+    )
+
+    combined_text = "\n".join(
+        part for part in [
+            title,
+            str(analysis.get("narrative_summary") or ""),
+            str(provenance.get("notes") or ""),
+            str(analysis_provenance.get("notes") or ""),
+            " ".join(_normalize_text_list(analysis.get("limitations"))),
+            str(inspection.get("access_notes") or ""),
+        ] if part
+    ).lower()
+
+    banned_phrases = [
+        "synthetic",
+        "simulated",
+        "illustrative",
+        "demo mode",
+        "mock data",
+        "toy example",
+        "placeholder",
+        "no real public",
+    ]
+    for phrase in banned_phrases:
+        if phrase in combined_text:
+            issues.append(f"Analysis bundle contains banned draft/demo language: '{phrase}'.")
+
+    if not title:
+        issues.append("Analysis bundle is missing a title.")
+
+    missing_files = _required_analysis_files_present(bundle)
+    if missing_files:
+        issues.append(f"Analysis bundle is missing required files: {', '.join(missing_files)}.")
+
+    manifest_sources = _normalize_text_list(manifest.get("dataset_sources"))
+    if not manifest_sources:
+        issues.append("Manifest is missing real dataset sources.")
+
+    primary_dataset_ids = _normalize_text_list(dataset_manifest.get("primary_dataset_ids"))
+    if not primary_dataset_ids:
+        primary_dataset_ids = _normalize_text_list(inspection_manifest.get("primary_dataset_ids"))
+    if not primary_dataset_ids:
+        issues.append("Analysis bundle does not identify any primary dataset ids.")
+
+    used_dataset_ids = _normalize_text_list(provenance.get("used_dataset_ids")) or _normalize_text_list(
+        analysis_provenance.get("used_dataset_ids")
+    )
+    if not used_dataset_ids:
+        issues.append("Analysis bundle provenance is missing used dataset ids.")
+
+    row_count = dataset_manifest.get("row_count")
+    if not isinstance(row_count, int) or row_count <= 0:
+        issues.append("Analysis dataset manifest has no positive row count.")
+
+    findings = analysis.get("findings")
+    if not isinstance(findings, list) or len(findings) < 2:
+        issues.append("Analysis does not contain enough supported findings.")
+
+    tables = analysis.get("tables")
+    if not isinstance(tables, list) or not tables:
+        issues.append("Analysis does not include any structured tables.")
+
+    figures = bundle.get("figures")
+    if not isinstance(figures, list) or not figures:
+        issues.append("Analysis bundle does not include final figure outputs.")
+
+    resolver_mode = str(resolver.get("paper_mode") or "").strip().lower()
+    resolver_status = str(resolver.get("status") or "").strip().lower()
+    resolver_candidate = resolver.get("selected_candidate") if isinstance(resolver.get("selected_candidate"), dict) else {}
+    incompatible_families = {
+        str(family_id).strip()
+        for family_id in resolver.get("incompatible_primary_family_ids") or []
+        if str(family_id).strip()
+    }
+    resolver_family_id = str(resolver_candidate.get("family_id") or "").strip()
+    resolver_dataset_id = str(resolver_candidate.get("dataset_id") or "").strip()
+    resolver_access_url = str(resolver_candidate.get("access_url") or "").strip()
+
+    if resolver_mode == "empirical_dataset":
+        if resolver_status != "resolved":
+            issues.append("Resolver did not clear the run for empirical publication.")
+        if not resolver_candidate:
+            issues.append("Resolver did not select a qualifying primary empirical dataset.")
+        if resolver_family_id and resolver_family_id in incompatible_families:
+            issues.append("Resolver selected a forbidden primary source family for an empirical paper.")
+        if resolver_candidate and not bool(resolver_candidate.get("qualifies_as_primary_data")):
+            issues.append("Resolver-selected candidate does not qualify as primary empirical data.")
+
+        dataset_accounting = set(manifest_sources) | set(primary_dataset_ids) | set(used_dataset_ids)
+        normalized_accounting = " ".join(item.lower() for item in dataset_accounting)
+        has_dataset_id = bool(resolver_dataset_id) and resolver_dataset_id.lower() in normalized_accounting
+        has_access_url = bool(resolver_access_url) and resolver_access_url.lower() in normalized_accounting
+        if resolver_dataset_id and not has_dataset_id and not has_access_url:
+            issues.append("Analysis bundle dataset accounting does not cite the resolver-selected dataset id.")
+        if resolver_access_url and not has_access_url and not has_dataset_id:
+            issues.append("Analysis bundle dataset accounting does not cite the resolver-selected dataset URL.")
+
+    return issues
+
+
 def _find_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
     issues: list[str] = []
     title = str(bundle.get("title") or "").strip()
@@ -401,7 +513,6 @@ class JobProcessor(threading.Thread):
             plan = self._generate_plan(context)
             resolution = self._resolve_source_family(context, plan)
             bundle = self._generate_bundle(context, plan, resolution)
-            self._audit_bundle(context, plan, bundle)
             publication = self._publish_bundle(context, bundle)
             self._persist_artifacts(context.job["id"], bundle, publication)
             self._database.update_paper_job(
@@ -423,6 +534,23 @@ class JobProcessor(threading.Thread):
                 error_message=str(error),
                 completed=True,
             )
+
+    def _record_response_metrics(self, *, job_id: str, model: str, input_tokens: int, output_tokens: int) -> None:
+        self._database.record_paper_job_metrics(
+            job_id=job_id,
+            model=model,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            estimated_cost_usd=self._estimate_cost(input_tokens, output_tokens),
+        )
+
+    def _orchestration_metadata(self) -> dict[str, str]:
+        return {
+            "planner_model": self._config.openai_planner_model,
+            "analysis_model": self._config.openai_analysis_model,
+            "writer_model": self._config.openai_writer_model,
+            "auditor_model": self._config.openai_auditor_model,
+        }
 
     def _generate_plan(self, context: JobContext) -> dict[str, Any]:
         self._database.update_paper_job(
@@ -475,18 +603,18 @@ Keep the plan concise, empirical, and honest. Use web search to identify real pu
             use_code_interpreter=False,
             use_web_search=True,
             timeout_seconds=min(300, self._config.backend_max_job_runtime_seconds),
+            model=self._config.openai_planner_model,
         )
         self._database.update_paper_job(
             context.job["id"],
             openai_response_id=response.response_id,
             progress_message="Plan complete. Inspecting reachable data.",
         )
-        self._database.record_paper_job_metrics(
+        self._record_response_metrics(
             job_id=context.job["id"],
-            model=self._config.openai_model,
+            model=self._config.openai_planner_model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
-            estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
         )
         return _extract_json_object(response.output_text)
 
@@ -520,6 +648,111 @@ Keep the plan concise, empirical, and honest. Use web search to identify real pu
         return resolution
 
     def _generate_bundle(self, context: JobContext, plan: dict[str, Any], resolution: ResolutionBundle) -> dict[str, Any]:
+        notes_hash = _sha256_texts([note["content"] for note in context.request_payload["notes"]])
+        analysis_bundle = self._generate_analysis_bundle(
+            context=context,
+            plan=plan,
+            resolution=resolution,
+            notes_hash=notes_hash,
+        )
+        analysis_issues = _find_analysis_bundle_quality_issues(analysis_bundle)
+        if analysis_issues:
+            analysis_bundle = self._revise_analysis_bundle_after_gate_failure(
+                context=context,
+                plan=plan,
+                resolution=resolution,
+                initial_bundle=analysis_bundle,
+                issues=analysis_issues,
+                notes_hash=notes_hash,
+            )
+            analysis_issues = _find_analysis_bundle_quality_issues(analysis_bundle)
+        if analysis_issues:
+            raise JobExecutionError(
+                "Analysis bundle failed evidence gate: " + " ".join(analysis_issues[:4]),
+                stage="analyze",
+            )
+
+        analysis_audit = self._audit_analysis_bundle(context, plan, resolution, analysis_bundle)
+        if not bool(analysis_audit.get("accept")):
+            audit_issues = (
+                _normalize_text_list(analysis_audit.get("required_revisions"))
+                or _normalize_text_list(analysis_audit.get("model_warnings"))
+                or _normalize_text_list(analysis_audit.get("weak_or_unsupported_claims"))
+                or [str(analysis_audit.get("summary") or "Evidence audit rejected the analysis bundle.")]
+            )
+            analysis_bundle = self._revise_analysis_bundle_after_gate_failure(
+                context=context,
+                plan=plan,
+                resolution=resolution,
+                initial_bundle=analysis_bundle,
+                issues=audit_issues,
+                notes_hash=notes_hash,
+            )
+            analysis_issues = _find_analysis_bundle_quality_issues(analysis_bundle)
+            if analysis_issues:
+                raise JobExecutionError(
+                    "Analysis bundle failed evidence gate: " + " ".join(analysis_issues[:4]),
+                    stage="analyze",
+                )
+            analysis_audit = self._audit_analysis_bundle(context, plan, resolution, analysis_bundle)
+        if not bool(analysis_audit.get("accept")):
+            audit_issues = (
+                _normalize_text_list(analysis_audit.get("required_revisions"))
+                or _normalize_text_list(analysis_audit.get("model_warnings"))
+                or _normalize_text_list(analysis_audit.get("weak_or_unsupported_claims"))
+                or [str(analysis_audit.get("summary") or "Evidence audit rejected the analysis bundle.")]
+            )
+            raise JobExecutionError(
+                "Evidence audit rejected publication: " + " ".join(audit_issues[:4]),
+                stage="verify",
+            )
+
+        manuscript_bundle = self._write_manuscript_bundle(
+            context=context,
+            plan=plan,
+            resolution=resolution,
+            analysis_bundle=analysis_bundle,
+            analysis_audit=analysis_audit,
+            notes_hash=notes_hash,
+        )
+        bundle = self._merge_bundle_parts(
+            analysis_bundle=analysis_bundle,
+            manuscript_bundle=manuscript_bundle,
+            analysis_audit=analysis_audit,
+            plan=plan,
+            notes_hash=notes_hash,
+            resolution=resolution,
+        )
+        bundle_quality_issues = _find_bundle_quality_issues(bundle)
+        if not bundle_quality_issues:
+            return bundle
+
+        revised_bundle = self._revise_manuscript_after_gate_failure(
+            context=context,
+            plan=plan,
+            resolution=resolution,
+            analysis_bundle=analysis_bundle,
+            analysis_audit=analysis_audit,
+            initial_bundle=bundle,
+            issues=bundle_quality_issues,
+            notes_hash=notes_hash,
+        )
+        revised_issues = _find_bundle_quality_issues(revised_bundle)
+        if revised_issues:
+            raise JobExecutionError(
+                "Bundle failed publication gate: " + " ".join(revised_issues[:4]),
+                stage="write",
+            )
+        return revised_bundle
+
+    def _generate_analysis_bundle(
+        self,
+        *,
+        context: JobContext,
+        plan: dict[str, Any],
+        resolution: ResolutionBundle,
+        notes_hash: str,
+    ) -> dict[str, Any]:
         self._database.update_paper_job(
             context.job["id"],
             stage="inspect",
@@ -531,13 +764,11 @@ Keep the plan concise, empirical, and honest. Use web search to identify real pu
             progress_message="Running the analysis on OpenAI-hosted compute.",
         )
         instructions = """
-You are Sidekick's publication engine running in Code Interpreter.
-Produce a real, publication-quality scientific paper from real public data, or fail closed.
+You are Sidekick's analyst running in Code Interpreter.
+Build the empirical evidence bundle only. Do not write the paper manuscript yet.
 Return strict JSON only with this exact shape:
 {
   "title": "string",
-  "markdown": "string",
-  "latex": "string",
   "analysis_files": [
     {
       "path": "analysis.py",
@@ -624,7 +855,247 @@ Return strict JSON only with this exact shape:
       "external_sources": ["string"],
       "notes": "string"
     }
-  },
+  }
+}
+Rules:
+- Match the requested `resolution.paper_mode`. Do not silently change modes.
+- Treat the `resolution` input as authoritative. The selected candidate is the primary source unless the mode explicitly says otherwise.
+- Use Code Interpreter to identify, download, inspect, and analyze the resolver-selected public dataset.
+- Use web search only for dataset documentation and supporting methodological context. Do not substitute a different primary dataset.
+- Treat `dataset_hints` as optional suggestions only. They must not override the resolved source family or selected candidate.
+- Prefer the best available real open dataset even if it is small, niche, or imperfect. State limitations explicitly instead of blocking unless the data is not actually analyzable.
+- Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
+- If real public data cannot be accessed and analyzed, return the best honest partial evidence bundle you can, explain the failure in provenance and inspection notes, and do not fabricate results.
+- `analysis_files` must include at minimum `analysis.py`, `requirements.txt`, and `Makefile`, and the code must reproduce the figures and tables from raw/public data.
+- `manifest.dataset_sources`, `inspection.dataset_manifest.primary_dataset_ids`, `analysis.dataset_manifest.primary_dataset_ids`, and `provenance.used_dataset_ids` must all be populated with real dataset identifiers or URLs and must account for the resolver-selected dataset.
+- `analysis.dataset_manifest.row_count` must reflect real analyzed data and be greater than zero whenever the source could actually be analyzed.
+- Keep repository paths and manuscript prose out of the output.
+"""
+        input_text = json.dumps(
+            {
+                "title": context.request_payload["title"],
+                "theme": context.request_payload["theme"],
+                "dataset_hints": context.request_payload.get("dataset_hints", [])
+                or context.request_payload.get("dataset_ids", []),
+                "resolution": resolution.as_dict(),
+                "plan": plan,
+                "notes_hash": notes_hash,
+                "notes": context.request_payload["notes"],
+            },
+            sort_keys=True,
+        )
+        response = self._openai_client.generate_json(
+            instructions=instructions,
+            input_text=input_text,
+            use_code_interpreter=True,
+            use_web_search=True,
+            timeout_seconds=self._config.backend_max_job_runtime_seconds,
+            model=self._config.openai_analysis_model,
+        )
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="verify",
+            progress_message="Analysis complete. Verifying evidence before manuscript writing.",
+            openai_response_id=response.response_id,
+        )
+        self._record_response_metrics(
+            job_id=context.job["id"],
+            model=self._config.openai_analysis_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+        return self._normalized_analysis_bundle(
+            _extract_json_object(response.output_text),
+            notes_hash=notes_hash,
+            resolution=resolution,
+        )
+
+    def _normalized_analysis_bundle(
+        self,
+        bundle: dict[str, Any],
+        *,
+        notes_hash: str,
+        resolution: ResolutionBundle,
+    ) -> dict[str, Any]:
+        bundle["resolver"] = resolution.as_dict()
+        bundle["orchestration"] = self._orchestration_metadata()
+        bundle.setdefault("analysis_files", [])
+        bundle.setdefault("figures", [])
+        bundle.setdefault("provenance", {})
+        bundle.setdefault("inspection", {})
+        bundle.setdefault("analysis", {})
+        manifest = bundle.setdefault(
+            "manifest",
+            {
+                "entrypoint": "analysis.py",
+                "python_version": "3.11",
+                "run_command": "python analysis.py",
+                "notes_hash": notes_hash,
+                "model": self._config.openai_analysis_model,
+                "dataset_sources": [],
+            },
+        )
+        manifest.setdefault("entrypoint", "analysis.py")
+        manifest.setdefault("python_version", "3.11")
+        manifest.setdefault("run_command", "python analysis.py")
+        manifest.setdefault("notes_hash", notes_hash)
+        manifest.setdefault("model", self._config.openai_analysis_model)
+        manifest.setdefault("dataset_sources", [])
+        return bundle
+
+    def _revise_analysis_bundle_after_gate_failure(
+        self,
+        *,
+        context: JobContext,
+        plan: dict[str, Any],
+        resolution: ResolutionBundle,
+        initial_bundle: dict[str, Any],
+        issues: list[str],
+        notes_hash: str,
+    ) -> dict[str, Any]:
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="analyze",
+            progress_message="Evidence bundle failed checks. Revising the analysis on the resolved dataset.",
+        )
+        instructions = """
+You are Sidekick's analyst revising an evidence bundle after quality-gate failures.
+Return strict JSON only with the same analysis-only bundle schema as before.
+
+Rules:
+- Keep the `resolution` input authoritative. Do not switch to a different primary source unless it already appears in the resolver bundle.
+- Address every listed evidence-gate issue directly.
+- If the selected dataset is small or unusual but real and analyzable, keep it and write the limitations clearly instead of declaring failure.
+- Use web search again only for documentation or supporting methodology tied to the already-resolved source family.
+- Do not add manuscript text, LaTeX, or placeholder prose.
+- Do not use draft/demo/synthetic language.
+- If real public data still cannot be obtained or analyzed, be explicit in provenance and inspection notes rather than fabricating output.
+"""
+        input_text = json.dumps(
+            {
+                "title": context.request_payload["title"],
+                "theme": context.request_payload["theme"],
+                "notes": context.request_payload["notes"],
+                "plan": plan,
+                "resolution": resolution.as_dict(),
+                "notes_hash": notes_hash,
+                "failed_gate_issues": issues,
+                "previous_analysis_bundle": initial_bundle,
+            },
+            sort_keys=True,
+        )
+        response = self._openai_client.generate_json(
+            instructions=instructions,
+            input_text=input_text,
+            use_code_interpreter=True,
+            use_web_search=True,
+            timeout_seconds=self._config.backend_max_job_runtime_seconds,
+            model=self._config.openai_analysis_model,
+        )
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="verify",
+            progress_message="Revised analysis complete. Verifying evidence before manuscript writing.",
+            openai_response_id=response.response_id,
+        )
+        self._record_response_metrics(
+            job_id=context.job["id"],
+            model=self._config.openai_analysis_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+        return self._normalized_analysis_bundle(
+            _extract_json_object(response.output_text),
+            notes_hash=notes_hash,
+            resolution=resolution,
+        )
+
+    def _audit_analysis_bundle(
+        self,
+        context: JobContext,
+        plan: dict[str, Any],
+        resolution: ResolutionBundle,
+        analysis_bundle: dict[str, Any],
+    ) -> dict[str, Any]:
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="verify",
+            progress_message="Verifying evidence quality before manuscript writing.",
+        )
+        instructions = """
+You are Sidekick's evidence auditor.
+Review the analysis bundle only and decide whether it is strong enough to support manuscript writing.
+Return strict JSON only with this exact shape:
+{
+  "accept": true,
+  "summary": "string",
+  "supported_claims": ["string"],
+  "weak_or_unsupported_claims": ["string"],
+  "model_warnings": ["string"],
+  "sample_warnings": ["string"],
+  "required_revisions": ["string"]
+}
+Acceptance standard:
+- Reject any analysis bundle that uses synthetic, simulated, illustrative, demo, mock, or placeholder data.
+- Reject any analysis bundle that lacks real dataset identifiers, positive row counts, executable reproducibility files, concrete findings, or final figure outputs.
+- Reject any evidence bundle that does not support conservative empirical claims from the resolver-selected source family.
+- Prefer false negatives over false positives.
+"""
+        audit_input = json.dumps(
+            {
+                "plan": plan,
+                "resolution": resolution.as_dict(),
+                "analysis_bundle": analysis_bundle,
+            },
+            sort_keys=True,
+        )
+        response = self._openai_client.generate_json(
+            instructions=instructions,
+            input_text=audit_input,
+            use_code_interpreter=False,
+            timeout_seconds=min(600, self._config.backend_max_job_runtime_seconds),
+            model=self._config.openai_auditor_model,
+        )
+        self._record_response_metrics(
+            job_id=context.job["id"],
+            model=self._config.openai_auditor_model,
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
+        audit = _extract_json_object(response.output_text)
+        return {
+            "accept": bool(audit.get("accept")),
+            "summary": str(audit.get("summary") or "").strip(),
+            "supported_claims": _normalize_text_list(audit.get("supported_claims")),
+            "weak_or_unsupported_claims": _normalize_text_list(audit.get("weak_or_unsupported_claims")),
+            "model_warnings": _normalize_text_list(audit.get("model_warnings")),
+            "sample_warnings": _normalize_text_list(audit.get("sample_warnings")),
+            "required_revisions": _normalize_text_list(audit.get("required_revisions")),
+        }
+
+    def _write_manuscript_bundle(
+        self,
+        *,
+        context: JobContext,
+        plan: dict[str, Any],
+        resolution: ResolutionBundle,
+        analysis_bundle: dict[str, Any],
+        analysis_audit: dict[str, Any],
+        notes_hash: str,
+    ) -> dict[str, Any]:
+        self._database.update_paper_job(
+            context.job["id"],
+            stage="write",
+            progress_message="Writing paper from the verified evidence bundle.",
+        )
+        instructions = """
+You are Sidekick's manuscript writer.
+You receive a verified evidence bundle. Write the paper from that bundle only.
+Return strict JSON only with this exact shape:
+{
+  "title": "string",
+  "markdown": "string",
+  "latex": "string",
   "verification": {
     "decision": "proceed or revise_analysis or blocked",
     "summary": "string",
@@ -640,145 +1111,171 @@ Return strict JSON only with this exact shape:
     "model_warnings": ["string"],
     "sample_warnings": ["string"],
     "required_revisions": ["string"]
-  },
-  "draft": {
-    "title": "string",
-    "markdown": "string"
   }
 }
-Requirements:
-- Match the requested `resolution.paper_mode`. For `empirical_dataset`, perform real dataset analysis. For `bibliometric`, analyze real article metadata. For `literature_review`, synthesize real literature with explicit screening/accounting. Do not silently change modes.
-- Treat the `resolution` input as authoritative. The selected candidate is the primary empirical source unless the paper mode explicitly says otherwise.
-- Use web search only for supporting literature, dataset documentation, and methodological context. Do not substitute a different primary dataset unless the resolver explicitly selected it.
-- Use Code Interpreter to identify, download, inspect, and analyze the resolver-selected public dataset.
-- Treat any `dataset_hints` input as optional suggestions only. They must not override the resolved source family or selected candidate.
-- Prefer the best available real open dataset even if it is small, niche, or imperfect. State those limitations explicitly instead of blocking unless the data is not actually analyzable.
-- Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
-- If real public data cannot be accessed and analyzed, set `verification.decision` to `blocked`, explain exactly why, and do not fabricate results.
-- The manuscript must read like a professional arXiv paper, not a scaffold: include Abstract, Introduction, Methods, Results, Discussion, Limitations, and References.
-- The manuscript must contain inline citations and a non-trivial references section.
-- `analysis_files` must include at minimum `analysis.py`, `requirements.txt`, and `Makefile`, and the code must reproduce the figures and tables from raw/public data.
-- `manifest.dataset_sources`, `inspection.dataset_manifest.primary_dataset_ids`, `analysis.dataset_manifest.primary_dataset_ids`, and `provenance.used_dataset_ids` must all be populated with real dataset identifiers or URLs and must account for the resolver-selected dataset.
-- `analysis.dataset_manifest.row_count` must reflect real analyzed data and be greater than zero.
-- `verification.decision` may be `proceed` only if the evidence supports publication-quality empirical claims.
-- Keep repository paths out of the paper text; cite sources in the paper body itself.
-- The `draft` field exists only for client compatibility. Duplicate the final paper there. Do not label anything as a draft.
-- Use conservative claims, report limitations honestly, and prefer blocking over overstating.
+Rules:
+- Use the provided evidence bundle and evidence audit as the empirical basis. Do not redo discovery or invent new data.
+- You may use web search for supporting citations, dataset documentation, and methodological references, but not to replace the primary data source.
+- Write a professional arXiv-style paper with Abstract, Introduction, Methods, Results, Discussion, Limitations, and References.
+- Include inline citations in the paper body and a non-trivial references section.
+- Keep claims conservative and aligned with the evidence audit.
+- If the evidence audit reports blocking weaknesses, surface them honestly in `verification` rather than hiding them.
+- Do not use draft/demo/synthetic language.
 """
-        notes = context.request_payload["notes"]
-        notes_hash = _sha256_texts([note["content"] for note in notes])
         input_text = json.dumps(
             {
                 "title": context.request_payload["title"],
                 "theme": context.request_payload["theme"],
-                "dataset_hints": context.request_payload.get("dataset_hints", [])
-                or context.request_payload.get("dataset_ids", []),
-                "resolution": resolution.as_dict(),
-                "plan": plan,
                 "notes_hash": notes_hash,
-                "notes": notes,
+                "notes": context.request_payload["notes"],
+                "plan": plan,
+                "resolution": resolution.as_dict(),
+                "analysis_bundle": analysis_bundle,
+                "analysis_audit": analysis_audit,
             },
             sort_keys=True,
         )
         response = self._openai_client.generate_json(
             instructions=instructions,
             input_text=input_text,
-            use_code_interpreter=True,
+            use_code_interpreter=False,
             use_web_search=True,
-            timeout_seconds=self._config.backend_max_job_runtime_seconds,
+            timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
+            model=self._config.openai_writer_model,
         )
         self._database.update_paper_job(
             context.job["id"],
-            stage="verify",
-            progress_message="Verifying evidence and drafting the final manuscript.",
+            stage="write",
+            progress_message="Paper draft complete. Running the publication gate.",
             openai_response_id=response.response_id,
         )
-        self._database.record_paper_job_metrics(
+        self._record_response_metrics(
             job_id=context.job["id"],
-            model=self._config.openai_model,
+            model=self._config.openai_writer_model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
-            estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
         )
-        bundle = self._normalized_bundle(
-            _extract_json_object(response.output_text),
-            plan=plan,
-            notes_hash=notes_hash,
-            resolution=resolution,
-        )
-        bundle_quality_issues = _find_bundle_quality_issues(bundle)
-        if not bundle_quality_issues:
-            return bundle
+        manuscript_bundle = _extract_json_object(response.output_text)
+        if not isinstance(manuscript_bundle.get("verification"), dict):
+            manuscript_bundle["verification"] = {}
+        return manuscript_bundle
 
-        revised_bundle = self._revise_bundle_after_gate_failure(
-            context=context,
-            plan=plan,
-            resolution=resolution,
-            initial_bundle=bundle,
-            issues=bundle_quality_issues,
-            notes_hash=notes_hash,
-        )
-        revised_issues = _find_bundle_quality_issues(revised_bundle)
-        if revised_issues:
-            raise ValueError("Bundle failed publication gate: " + " ".join(revised_issues[:4]))
-        return revised_bundle
-
-    def _normalized_bundle(
+    def _merge_bundle_parts(
         self,
-        bundle: dict[str, Any],
         *,
+        analysis_bundle: dict[str, Any],
+        manuscript_bundle: dict[str, Any],
+        analysis_audit: dict[str, Any],
         plan: dict[str, Any],
         notes_hash: str,
         resolution: ResolutionBundle,
     ) -> dict[str, Any]:
+        bundle = dict(analysis_bundle)
+        title = (
+            str(manuscript_bundle.get("title") or "").strip()
+            or str(analysis_bundle.get("title") or "").strip()
+        )
+        bundle["title"] = title
+        bundle["markdown"] = str(manuscript_bundle.get("markdown") or "").strip()
+        bundle["latex"] = str(manuscript_bundle.get("latex") or "").strip()
         bundle["plan"] = plan
         bundle["resolver"] = resolution.as_dict()
-        bundle["draft"] = {"title": bundle.get("title", ""), "markdown": bundle.get("markdown", "")}
-        bundle.setdefault(
+        bundle["orchestration"] = self._orchestration_metadata()
+
+        manifest = bundle.setdefault(
             "manifest",
             {
                 "entrypoint": "analysis.py",
                 "python_version": "3.11",
                 "run_command": "python analysis.py",
                 "notes_hash": notes_hash,
-                "model": self._config.openai_model,
+                "model": self._config.openai_analysis_model,
                 "dataset_sources": [],
             },
         )
+        manifest.setdefault("entrypoint", "analysis.py")
+        manifest.setdefault("python_version", "3.11")
+        manifest.setdefault("run_command", "python analysis.py")
+        manifest["notes_hash"] = notes_hash
+        manifest.setdefault("dataset_sources", [])
+        manifest["model"] = self._config.openai_analysis_model
+
+        verification = manuscript_bundle.get("verification") if isinstance(manuscript_bundle.get("verification"), dict) else {}
+        decision = str(verification.get("decision") or "").strip() or ("proceed" if analysis_audit.get("accept") else "revise_analysis")
+        supported_claims = _normalize_text_list(verification.get("supported_claims")) or _normalize_text_list(
+            analysis_audit.get("supported_claims")
+        )
+        weak_claims = _normalize_text_list(verification.get("weak_or_unsupported_claims")) or _normalize_text_list(
+            analysis_audit.get("weak_or_unsupported_claims")
+        )
+        model_warnings = _normalize_text_list(verification.get("model_warnings")) or _normalize_text_list(
+            analysis_audit.get("model_warnings")
+        )
+        sample_warnings = _normalize_text_list(verification.get("sample_warnings")) or _normalize_text_list(
+            analysis_audit.get("sample_warnings")
+        )
+        required_revisions = _normalize_text_list(verification.get("required_revisions"))
+        audit_required_revisions = [] if analysis_audit.get("accept") else _normalize_text_list(
+            analysis_audit.get("required_revisions")
+        )
+        for revision in audit_required_revisions:
+            if revision not in required_revisions:
+                required_revisions.append(revision)
+
+        figure_sanity_checks = verification.get("figure_sanity_checks")
+        if not isinstance(figure_sanity_checks, list) or not figure_sanity_checks:
+            figure_sanity_checks = [
+                {
+                    "filename": str(figure.get("filename") or ""),
+                    "status": "ok",
+                    "issue": "",
+                }
+                for figure in bundle.get("figures", []) or []
+                if isinstance(figure, dict) and str(figure.get("filename") or "").strip()
+            ]
+
+        bundle["verification"] = {
+            "decision": decision,
+            "summary": str(verification.get("summary") or analysis_audit.get("summary") or "").strip(),
+            "supported_claims": supported_claims,
+            "weak_or_unsupported_claims": weak_claims,
+            "figure_sanity_checks": figure_sanity_checks,
+            "model_warnings": model_warnings,
+            "sample_warnings": sample_warnings,
+            "required_revisions": required_revisions,
+            "audit_summary": str(analysis_audit.get("summary") or "").strip(),
+        }
+        bundle["draft"] = {"title": title, "markdown": bundle["markdown"]}
         return bundle
 
-    def _revise_bundle_after_gate_failure(
+    def _revise_manuscript_after_gate_failure(
         self,
         *,
         context: JobContext,
         plan: dict[str, Any],
         resolution: ResolutionBundle,
+        analysis_bundle: dict[str, Any],
+        analysis_audit: dict[str, Any],
         initial_bundle: dict[str, Any],
         issues: list[str],
         notes_hash: str,
     ) -> dict[str, Any]:
         self._database.update_paper_job(
             context.job["id"],
-            stage="analyze",
-            progress_message="Initial bundle failed publication checks. Revising analysis and manuscript.",
+            stage="write",
+            progress_message="Strengthening the manuscript after publication-gate feedback.",
         )
         instructions = """
-You are revising a scientific paper bundle after a publication gate failure.
-You must either:
-1. produce a corrected, publication-quality empirical bundle from real public data, or
-2. return a blocked bundle that explicitly states why real publication-quality output is not yet possible.
-
-Return strict JSON only with the same bundle schema as before.
+You are revising a scientific manuscript after a publication gate failure.
+You may revise the manuscript and verification block only. Do not change the underlying evidence bundle.
+Return strict JSON only with the same manuscript-only schema as before.
 
 Rules:
-- Keep the `resolution` input authoritative. Do not switch to a different primary empirical source unless it is already present in the resolver bundle.
-- Use web search again if needed to find missing citation details or supporting documentation for the already-resolved source family.
-- Address every listed gate failure directly.
-- If the selected dataset is small or unusual but real and analyzable, keep it and write the limitations clearly instead of declaring failure.
-- Do not keep draft/demo/synthetic language unless you are explicitly blocking publication.
-- If the first attempt failed because the manuscript was too short, missing sections, missing references, or missing dataset accounting, fix those.
-- If real public data still cannot be obtained or analyzed, set `verification.decision` to `blocked` and explain why in `verification.summary`, `verification.required_revisions`, and provenance notes.
-- The `draft` field must mirror the final manuscript and must not be labeled as a draft.
+- Use the provided evidence bundle and evidence audit as authoritative.
+- Address every listed publication-gate issue directly.
+- If the paper is too short or missing sections, references, dataset accounting, or citation markers, fix those.
+- Do not use draft/demo/synthetic language.
+- Do not change figures, tables, code, dataset manifests, or provenance except through the manuscript's discussion and verification summary.
 """
         input_text = json.dumps(
             {
@@ -789,6 +1286,8 @@ Rules:
                 "resolution": resolution.as_dict(),
                 "notes_hash": notes_hash,
                 "failed_gate_issues": issues,
+                "analysis_bundle": analysis_bundle,
+                "analysis_audit": analysis_audit,
                 "previous_bundle": initial_bundle,
             },
             sort_keys=True,
@@ -796,80 +1295,28 @@ Rules:
         response = self._openai_client.generate_json(
             instructions=instructions,
             input_text=input_text,
-            use_code_interpreter=True,
+            use_code_interpreter=False,
             use_web_search=True,
-            timeout_seconds=self._config.backend_max_job_runtime_seconds,
+            timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
+            model=self._config.openai_writer_model,
         )
-        self._database.record_paper_job_metrics(
+        self._record_response_metrics(
             job_id=context.job["id"],
-            model=self._config.openai_model,
+            model=self._config.openai_writer_model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
-            estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
         )
-        return self._normalized_bundle(
-            _extract_json_object(response.output_text),
+        manuscript_bundle = _extract_json_object(response.output_text)
+        if not isinstance(manuscript_bundle.get("verification"), dict):
+            manuscript_bundle["verification"] = {}
+        return self._merge_bundle_parts(
+            analysis_bundle=analysis_bundle,
+            manuscript_bundle=manuscript_bundle,
+            analysis_audit=analysis_audit,
             plan=plan,
             notes_hash=notes_hash,
             resolution=resolution,
         )
-
-    def _audit_bundle(self, context: JobContext, plan: dict[str, Any], bundle: dict[str, Any]) -> None:
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="verify",
-            progress_message="Auditing evidence quality and manuscript completeness.",
-        )
-        instructions = """
-You are a hard-nosed publication auditor.
-Review the proposed paper bundle and decide whether it is a real, publication-quality scientific paper grounded in the resolver-selected source family.
-Return strict JSON only with this exact shape:
-{
-  "accept": true,
-  "summary": "string",
-  "errors": ["string"],
-  "required_revisions": ["string"]
-}
-Acceptance standard:
-- Reject any bundle that uses synthetic, simulated, illustrative, demo, mock, or placeholder data.
-- Reject any bundle that lacks real dataset identifiers, real row counts, executable reproducibility files, sufficient citations, or a full paper structure.
-- Reject any bundle that reads like a draft, bundle description, scaffold, or placeholder manuscript.
-- Reject any bundle whose verification block should not confidently be `proceed`.
-- Prefer false negatives over false positives.
-"""
-        audit_input = json.dumps(
-            {
-                "plan": plan,
-                "bundle": bundle,
-            },
-            sort_keys=True,
-        )
-        response = self._openai_client.generate_json(
-            instructions=instructions,
-            input_text=audit_input,
-            use_code_interpreter=False,
-            timeout_seconds=min(600, self._config.backend_max_job_runtime_seconds),
-        )
-        self._database.record_paper_job_metrics(
-            job_id=context.job["id"],
-            model=self._config.openai_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-            estimated_cost_usd=self._estimate_cost(response.usage.input_tokens, response.usage.output_tokens),
-        )
-        audit = _extract_json_object(response.output_text)
-        errors = _normalize_text_list(audit.get("errors"))
-        required_revisions = _normalize_text_list(audit.get("required_revisions"))
-        accepted = bool(audit.get("accept"))
-        if not accepted:
-            issues = errors or required_revisions or ["Model audit rejected the paper bundle."]
-            raise ValueError("Bundle failed publication audit: " + " ".join(issues[:4]))
-
-        verification = bundle.get("verification")
-        if isinstance(verification, dict):
-            verification["audit_summary"] = str(audit.get("summary") or "").strip()
-            verification["audit_errors"] = errors
-            verification["audit_required_revisions"] = required_revisions
 
     def _publish_bundle(self, context: JobContext, bundle: dict[str, Any]) -> dict[str, Any]:
         self._database.update_paper_job(
