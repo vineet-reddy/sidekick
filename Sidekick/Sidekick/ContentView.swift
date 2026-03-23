@@ -419,11 +419,11 @@ struct ContentView: View {
 }
 
 private struct GitHubRequiredView: View {
-    @Environment(\.openURL) private var openURL
     @EnvironmentObject private var github: GitHubService
 
     @State private var isConnecting = false
     @State private var connectError: String?
+    @State private var connectTarget: GitHubConnectBrowserTarget?
 
     var body: some View {
         ZStack {
@@ -484,6 +484,9 @@ private struct GitHubRequiredView: View {
             .padding(20)
         }
         .accessibilityIdentifier("github.required.view")
+        .sheet(item: $connectTarget) { target in
+            SafariBrowserView(url: target.url)
+        }
     }
 
     private func connectGitHub() {
@@ -496,7 +499,7 @@ private struct GitHubRequiredView: View {
                 await MainActor.run {
                     isConnecting = false
                     if !github.isConnected {
-                        openURL(url)
+                        connectTarget = GitHubConnectBrowserTarget(url: url)
                     }
                 }
             } catch {
@@ -507,6 +510,11 @@ private struct GitHubRequiredView: View {
             }
         }
     }
+}
+
+private struct GitHubConnectBrowserTarget: Identifiable {
+    let id = UUID()
+    let url: URL
 }
 
 struct PulseModifier: ViewModifier {

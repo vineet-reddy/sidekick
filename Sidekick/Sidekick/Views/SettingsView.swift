@@ -1,10 +1,10 @@
 import SwiftUI
 
 struct SettingsView: View {
-    @Environment(\.openURL) private var openURL
     @EnvironmentObject private var github: GitHubService
     @EnvironmentObject private var heartbeat: HeartbeatManager
     @State private var connectError: String?
+    @State private var connectTarget: SettingsBrowserTarget?
 
     var body: some View {
         ZStack {
@@ -110,6 +110,9 @@ struct SettingsView: View {
         .navigationTitle("Settings")
         .navigationBarTitleDisplayMode(.inline)
         .accessibilityIdentifier("settings.view")
+        .sheet(item: $connectTarget) { target in
+            SafariBrowserView(url: target.url)
+        }
     }
 
     private func connectGitHub() {
@@ -119,7 +122,7 @@ struct SettingsView: View {
                 let url = try await github.beginGitHubConnection()
                 await MainActor.run {
                     if !github.isConnected {
-                        openURL(url)
+                        connectTarget = SettingsBrowserTarget(url: url)
                     }
                 }
             } catch {
@@ -129,4 +132,9 @@ struct SettingsView: View {
             }
         }
     }
+}
+
+private struct SettingsBrowserTarget: Identifiable {
+    let id = UUID()
+    let url: URL
 }

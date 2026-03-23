@@ -23,7 +23,7 @@ class GitHubURLTests(unittest.TestCase):
         self.assertIn("client_id=cid", url)
         self.assertIn("state=opaque-state", url)
         self.assertIn("scope=public_repo+read%3Auser", url)
-        self.assertIn("redirect_uri=https%3A%2F%2Fbootstrap.sidekick.example%2Fbrowser%2Fgithub-connect%2Fcallback", url)
+        self.assertIn("redirect_uri=https%3A%2F%2Fbootstrap.sidekick.example%2Fbrowser%2Fgithub-bootstrap%2Fcallback", url)
 
 
 if __name__ == "__main__":

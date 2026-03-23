@@ -649,7 +649,11 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
             self._redirect(self.server.github_client.build_user_authorization_url(session["state"]))
             return
 
-        if parsed.path in {"/oauth/github/callback", "/browser/github-connect/callback"}:
+        if parsed.path in {
+            "/oauth/github/callback",
+            "/browser/github-connect/callback",
+            "/browser/github-bootstrap/callback",
+        }:
             self._handle_github_callback(parsed)
             return
 

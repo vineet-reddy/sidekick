@@ -55,7 +55,8 @@ class BootstrapServiceConfig:
 
     @property
     def callback_url(self) -> str:
-        return f"{self.service_base_url}/browser/github-connect/callback"
+        # Keep the legacy callback path until the GitHub OAuth app is updated.
+        return f"{self.service_base_url}/browser/github-bootstrap/callback"
 
     @property
     def service_base_url(self) -> str:
