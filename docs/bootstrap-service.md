@@ -33,7 +33,7 @@ Optional:
 Set the GitHub OAuth app callback URL to:
 
 ```text
-https://<your-bootstrap-service>/browser/github-bootstrap/callback
+https://<your-render-service>.onrender.com/browser/github-bootstrap/callback
 ```
 
 ## iPhone app configuration
@@ -41,7 +41,7 @@ https://<your-bootstrap-service>/browser/github-bootstrap/callback
 Set the app's bootstrap base URL to the same deployed service:
 
 ```text
-SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL = https://<your-bootstrap-service>
+SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL = https://<your-render-service>.onrender.com
 ```
 
 The app reads this from:
