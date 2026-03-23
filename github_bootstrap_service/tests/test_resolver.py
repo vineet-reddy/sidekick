@@ -123,6 +123,96 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolution.selected_candidate.family_id, "openalex_literature")
         self.assertFalse(resolution.selected_candidate.qualifies_as_primary_data)
 
+    def test_falls_back_to_dataverse_for_niche_empirical_note(self) -> None:
+        resolver = FakeResolver(
+            {
+                "api.dandiarchive.org/api/dandisets/": {"results": []},
+                "openneuro.org/crn/graphql": {"data": {"datasets": {"edges": []}}},
+                "dataverse.harvard.edu/api/search": {
+                    "data": {
+                        "items": [
+                            {
+                                "name": "EM in children with epilepsy all data",
+                                "global_id": "doi:10.7910/DVN/W6P50R",
+                                "url": "https://doi.org/10.7910/DVN/W6P50R",
+                                "description": "Raw data on eye movement abnormalities in children with epilepsy.",
+                                "subjects": ["Medicine, Health and Life Sciences"],
+                                "citation": "Lunn, Judith, 2016.",
+                            }
+                        ]
+                    }
+                },
+                "dataverse.harvard.edu/api/datasets/:persistentId/": {
+                    "data": {
+                        "latestVersion": {
+                            "files": [
+                                {
+                                    "restricted": False,
+                                    "label": "EMinCWEProportionsData-2.tab",
+                                    "dataFile": {
+                                        "id": 2839479,
+                                        "filename": "EMinCWEProportionsData-2.tab",
+                                        "contentType": "text/tab-separated-values",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                },
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="Sex differences in pediatric epilepsy responsive neurostimulation",
+            theme="Pediatric epilepsy neurophysiology",
+            notes=[{"title": "RNS", "content": "Need a small but real pediatric epilepsy dataset if available."}],
+            dataset_hints=[],
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertIsNotNone(resolution.selected_candidate)
+        self.assertEqual(resolution.selected_candidate.family_id, "harvard_dataverse_open_data")
+        self.assertTrue(resolution.selected_candidate.qualifies_as_primary_data)
+        self.assertTrue(resolution.selected_candidate.download_urls)
+
+    def test_rejects_zenodo_pdf_only_hit_as_primary_data(self) -> None:
+        resolver = FakeResolver(
+            {
+                "zenodo.org/api/records": {
+                    "hits": {
+                        "hits": [
+                            {
+                                "id": 3662579,
+                                "doi_url": "https://doi.org/10.5281/zenodo.3662579",
+                                "metadata": {
+                                    "title": "Epilepsy methods paper",
+                                    "description": "Epilepsy lateralization using scalp EEG.",
+                                    "access_right": "open",
+                                },
+                                "files": [
+                                    {
+                                        "key": "paper.pdf",
+                                        "links": {"self": "https://zenodo.org/api/records/3662579/files/paper.pdf/content"},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="Epilepsy signal analysis",
+            theme="Epilepsy neurophysiology",
+            notes=[{"title": "Signals", "content": "Need real open data."}],
+            dataset_hints=[],
+        )
+
+        zenodo_candidates = [candidate for candidate in resolution.candidates if candidate.family_id == "zenodo_open_research"]
+        self.assertTrue(zenodo_candidates)
+        self.assertFalse(zenodo_candidates[0].qualifies_as_primary_data)
+
 
 if __name__ == "__main__":
     unittest.main()

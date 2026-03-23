@@ -652,6 +652,7 @@ Requirements:
 - Use web search only for supporting literature, dataset documentation, and methodological context. Do not substitute a different primary dataset unless the resolver explicitly selected it.
 - Use Code Interpreter to identify, download, inspect, and analyze the resolver-selected public dataset.
 - Treat any `dataset_hints` input as optional suggestions only. They must not override the resolved source family or selected candidate.
+- Prefer the best available real open dataset even if it is small, niche, or imperfect. State those limitations explicitly instead of blocking unless the data is not actually analyzable.
 - Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
 - If real public data cannot be accessed and analyzed, set `verification.decision` to `blocked`, explain exactly why, and do not fabricate results.
 - The manuscript must read like a professional arXiv paper, not a scaffold: include Abstract, Introduction, Methods, Results, Discussion, Limitations, and References.
@@ -773,6 +774,7 @@ Rules:
 - Keep the `resolution` input authoritative. Do not switch to a different primary empirical source unless it is already present in the resolver bundle.
 - Use web search again if needed to find missing citation details or supporting documentation for the already-resolved source family.
 - Address every listed gate failure directly.
+- If the selected dataset is small or unusual but real and analyzable, keep it and write the limitations clearly instead of declaring failure.
 - Do not keep draft/demo/synthetic language unless you are explicitly blocking publication.
 - If the first attempt failed because the manuscript was too short, missing sections, missing references, or missing dataset accounting, fix those.
 - If real public data still cannot be obtained or analyzed, set `verification.decision` to `blocked` and explain why in `verification.summary`, `verification.required_revisions`, and provenance notes.

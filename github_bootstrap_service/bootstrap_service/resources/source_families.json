@@ -9,7 +9,7 @@
     "trusted_domains": ["api.gdc.cancer.gov", "portal.gdc.cancer.gov", "gdc.cancer.gov"],
     "allow_in_automatic_mode": true,
     "search_keywords": ["glioblastoma", "gbm", "tumor", "cancer", "mutation", "survival", "transcriptomic", "genomics"],
-    "minimum_case_count": 20
+    "minimum_case_count": 5
   },
   {
     "id": "cbioportal_cancer_studies",
@@ -21,7 +21,19 @@
     "trusted_domains": ["www.cbioportal.org", "cbioportal.org"],
     "allow_in_automatic_mode": true,
     "search_keywords": ["glioblastoma", "gbm", "tumor", "cancer", "mutation", "survival", "genomics"],
-    "minimum_case_count": 20
+    "minimum_case_count": 5
+  },
+  {
+    "id": "geo_functional_genomics",
+    "label": "NCBI GEO Functional Genomics",
+    "family_type": "domain_repository",
+    "supported_paper_modes": ["empirical_dataset"],
+    "unit_of_analysis": "sample_or_series",
+    "modalities": ["gene_expression", "cancer_genomics", "clinical_cohort", "general_empirical"],
+    "trusted_domains": ["eutils.ncbi.nlm.nih.gov", "ncbi.nlm.nih.gov"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["glioblastoma", "gbm", "gene expression", "transcriptomic", "rna", "single-cell", "clinical"],
+    "minimum_asset_count": 3
   },
   {
     "id": "dandi_neurophysiology",
@@ -33,7 +45,7 @@
     "trusted_domains": ["api.dandiarchive.org", "dandiarchive.org", "docs.dandiarchive.org"],
     "allow_in_automatic_mode": true,
     "search_keywords": ["epilepsy", "ecog", "ieeg", "intracranial", "seizure", "neurostimulation", "rns", "lfp", "spike"],
-    "minimum_asset_count": 5
+    "minimum_asset_count": 1
   },
   {
     "id": "openneuro_neurophysiology",
@@ -45,6 +57,42 @@
     "trusted_domains": ["openneuro.org"],
     "allow_in_automatic_mode": true,
     "search_keywords": ["epilepsy", "ieeg", "eeg", "ecog", "seizure", "neurostimulation", "pediatric"],
+    "minimum_asset_count": 1
+  },
+  {
+    "id": "harvard_dataverse_open_data",
+    "label": "Harvard Dataverse",
+    "family_type": "general_repository",
+    "supported_paper_modes": ["empirical_dataset"],
+    "unit_of_analysis": "dataset_or_row",
+    "modalities": ["general_empirical", "neurophysiology", "clinical_cohort", "gene_expression", "tabular", "imaging"],
+    "trusted_domains": ["dataverse.harvard.edu"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["dataset", "open data", "public data", "epilepsy", "glioblastoma", "genomics", "clinical"],
+    "minimum_asset_count": 1
+  },
+  {
+    "id": "zenodo_open_research",
+    "label": "Zenodo Open Research",
+    "family_type": "general_repository",
+    "supported_paper_modes": ["empirical_dataset", "methods_simulation"],
+    "unit_of_analysis": "dataset_or_file",
+    "modalities": ["general_empirical", "neurophysiology", "gene_expression", "tabular", "imaging", "signal_processing"],
+    "trusted_domains": ["zenodo.org"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["dataset", "open data", "epilepsy", "ieeg", "glioblastoma", "signal", "benchmark"],
+    "minimum_asset_count": 1
+  },
+  {
+    "id": "figshare_open_data",
+    "label": "Figshare Open Data",
+    "family_type": "general_repository",
+    "supported_paper_modes": ["empirical_dataset", "methods_simulation"],
+    "unit_of_analysis": "dataset_or_file",
+    "modalities": ["general_empirical", "neurophysiology", "gene_expression", "tabular", "imaging", "signal_processing"],
+    "trusted_domains": ["api.figshare.com", "figshare.com"],
+    "allow_in_automatic_mode": true,
+    "search_keywords": ["dataset", "open data", "epilepsy", "ieeg", "glioblastoma", "signal", "benchmark"],
     "minimum_asset_count": 1
   },
   {

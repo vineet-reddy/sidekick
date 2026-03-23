@@ -49,6 +49,8 @@ class DatasetCandidate:
     evidence_count: int | None
     qualifies_as_primary_data: bool
     provenance_note: str
+    api_url: str | None = None
+    download_urls: list[str] | None = None
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -66,6 +68,8 @@ class DatasetCandidate:
             "evidence_count": self.evidence_count,
             "qualifies_as_primary_data": self.qualifies_as_primary_data,
             "provenance_note": self.provenance_note,
+            "api_url": self.api_url,
+            "download_urls": self.download_urls or [],
         }
 
 
@@ -146,7 +150,7 @@ class SourceFamilyResolver:
         )
 
         candidates: list[DatasetCandidate] = []
-        for family in ranked_families[:4]:
+        for family in ranked_families[:8]:
             candidates.extend(self._search_family(family, text, dataset_hints))
 
         candidates.sort(key=lambda candidate: candidate.score, reverse=True)
@@ -234,6 +238,10 @@ class SourceFamilyResolver:
             modalities.append("neurophysiology")
             acceptable_units.extend(["recording_session", "subject"])
 
+        if any(token in text for token in ["expression", "transcript", "rna-seq", "rnaseq", "single-cell", "microarray", "gene"]):
+            modalities.append("gene_expression")
+            acceptable_units.extend(["sample", "cell"])
+
         if paper_mode in {"bibliometric", "literature_review"} and any(
             token in text for token in ["citation", "literature", "publication", "paper", "author", "journal", "review"]
         ):
@@ -265,7 +273,13 @@ class SourceFamilyResolver:
 
     def _family_priority_score(self, family: SourceFamilySpec, inferred_modalities: list[str], text: str) -> float:
         score = 0.0
-        score += 10 if family.family_type == "direct_runtime_source" else 0
+        family_type_boost = {
+            "direct_runtime_source": 12,
+            "domain_repository": 8,
+            "general_repository": 5,
+            "discovery_catalog": 1,
+        }
+        score += family_type_boost.get(family.family_type, 0)
         score += sum(8 for modality in inferred_modalities if modality in family.modalities)
         score += sum(3 for keyword in family.search_keywords if keyword in text)
         return score
@@ -280,10 +294,18 @@ class SourceFamilyResolver:
             return self._search_gdc_projects(family, text, dataset_hints)
         if family.id == "cbioportal_cancer_studies":
             return self._search_cbioportal_studies(family, text, dataset_hints)
+        if family.id == "geo_functional_genomics":
+            return self._search_geo(family, text, dataset_hints)
         if family.id == "dandi_neurophysiology":
             return self._search_dandi(family, text, dataset_hints)
         if family.id == "openneuro_neurophysiology":
             return self._search_openneuro(family, text, dataset_hints)
+        if family.id == "harvard_dataverse_open_data":
+            return self._search_harvard_dataverse(family, text, dataset_hints)
+        if family.id == "zenodo_open_research":
+            return self._search_zenodo(family, text, dataset_hints)
+        if family.id == "figshare_open_data":
+            return self._search_figshare(family, text, dataset_hints)
         if family.id == "openalex_literature":
             return self._search_openalex(family, text, dataset_hints)
         return []
@@ -325,6 +347,7 @@ class SourceFamilyResolver:
                     evidence_count=case_count,
                     qualifies_as_primary_data=qualifies,
                     provenance_note="Resolved deterministically from the GDC projects endpoint.",
+                    api_url=f"https://api.gdc.cancer.gov/projects/{project_id}",
                 )
             )
         return results
@@ -366,8 +389,68 @@ class SourceFamilyResolver:
                     evidence_count=sample_count,
                     qualifies_as_primary_data=qualifies,
                     provenance_note="Resolved deterministically from the cBioPortal studies endpoint.",
+                    api_url=f"https://www.cbioportal.org/api/studies/{study_id}",
                 )
             )
+        return results
+
+    def _search_geo(
+        self,
+        family: SourceFamilySpec,
+        text: str,
+        dataset_hints: list[str],
+    ) -> list[DatasetCandidate]:
+        results: list[DatasetCandidate] = []
+        seen_ids: set[str] = set()
+        for query in self._query_variants(text, family.search_keywords, dataset_hints):
+            search_payload = self._request_json(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+                f"?db=gds&retmode=json&retmax=5&term={self._url_encode(query)}"
+            )
+            id_list = ((search_payload or {}).get("esearchresult") or {}).get("idlist") or []
+            if not id_list:
+                continue
+            summary_payload = self._request_json(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                f"?db=gds&retmode=json&id={','.join(id_list)}"
+            )
+            summary_result = (summary_payload or {}).get("result") or {}
+            for uid in summary_result.get("uids") or []:
+                summary = summary_result.get(str(uid)) or {}
+                accession = str(summary.get("accession") or summary.get("gse") or uid).strip()
+                if not accession or accession in seen_ids:
+                    continue
+                seen_ids.add(accession)
+                title = str(summary.get("title") or accession).strip()
+                description = str(summary.get("summary") or "").strip()
+                sample_count = len(summary.get("samples") or [])
+                haystack = " ".join([accession, title, description, str(summary.get("gdstype") or "")]).lower()
+                match_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+                if match_score <= 0:
+                    continue
+                qualifies = sample_count >= (family.minimum_asset_count or 1)
+                results.append(
+                    DatasetCandidate(
+                        family_id=family.id,
+                        family_label=family.label,
+                        dataset_id=accession,
+                        title=title,
+                        summary=f"{str(summary.get('gdstype') or 'GEO series')} | samples: {sample_count}",
+                        access_url=f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}",
+                        primary_domain=family.trusted_domains[0],
+                        trusted_domains=family.trusted_domains,
+                        unit_of_analysis=family.unit_of_analysis,
+                        modalities=family.modalities,
+                        score=match_score + min(sample_count, 100) / 20,
+                        evidence_count=sample_count,
+                        qualifies_as_primary_data=qualifies,
+                        provenance_note="Resolved deterministically from NCBI GEO E-utilities.",
+                        api_url=(
+                            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                            f"?db=gds&retmode=json&id={uid}"
+                        ),
+                    )
+                )
         return results
 
     def _search_dandi(self, family: SourceFamilySpec, text: str, dataset_hints: list[str]) -> list[DatasetCandidate]:
@@ -406,6 +489,7 @@ class SourceFamilyResolver:
                         evidence_count=asset_count,
                         qualifies_as_primary_data=qualifies,
                         provenance_note="Resolved deterministically from the DANDI API.",
+                        api_url=f"https://api.dandiarchive.org/api/dandisets/{identifier}/",
                     )
                 )
         return results
@@ -440,8 +524,189 @@ class SourceFamilyResolver:
                     evidence_count=1,
                     qualifies_as_primary_data=True,
                     provenance_note="Resolved deterministically from the OpenNeuro GraphQL dataset index.",
+                    api_url="https://openneuro.org/crn/graphql",
                 )
             )
+        return results
+
+    def _search_harvard_dataverse(
+        self,
+        family: SourceFamilySpec,
+        text: str,
+        dataset_hints: list[str],
+    ) -> list[DatasetCandidate]:
+        results: list[DatasetCandidate] = []
+        seen_ids: set[str] = set()
+        for query in self._query_variants(text, family.search_keywords, dataset_hints):
+            payload = self._request_json(
+                "https://dataverse.harvard.edu/api/search"
+                f"?q={self._url_encode(query)}&type=dataset&per_page=5"
+            )
+            for item in ((payload or {}).get("data") or {}).get("items") or []:
+                global_id = str(item.get("global_id") or "").strip()
+                if not global_id or global_id in seen_ids:
+                    continue
+                seen_ids.add(global_id)
+                detail_payload = self._request_json(
+                    "https://dataverse.harvard.edu/api/datasets/:persistentId/"
+                    f"?persistentId={self._url_encode(global_id)}"
+                )
+                latest_version = ((detail_payload or {}).get("data") or {}).get("latestVersion") or {}
+                files = latest_version.get("files") or []
+                data_files = [
+                    entry for entry in files
+                    if not bool(entry.get("restricted"))
+                    and self._is_likely_data_file(
+                        str(((entry.get("dataFile") or {}).get("filename")) or entry.get("label") or ""),
+                        str(((entry.get("dataFile") or {}).get("contentType")) or ""),
+                    )
+                ]
+                haystack = " ".join(
+                    [
+                        str(item.get("name") or ""),
+                        str(item.get("description") or ""),
+                        str(item.get("citation") or ""),
+                        " ".join(item.get("subjects") or []),
+                    ]
+                ).lower()
+                match_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+                if match_score <= 0:
+                    continue
+                download_urls = [
+                    f"https://dataverse.harvard.edu/api/access/datafile/{(entry.get('dataFile') or {}).get('id')}"
+                    for entry in data_files
+                    if (entry.get("dataFile") or {}).get("id")
+                ][:5]
+                results.append(
+                    DatasetCandidate(
+                        family_id=family.id,
+                        family_label=family.label,
+                        dataset_id=global_id,
+                        title=str(item.get("name") or global_id).strip(),
+                        summary=f"{str(item.get('description') or '')[:220]} | data files: {len(data_files)}",
+                        access_url=str(item.get("url") or f"https://dataverse.harvard.edu/dataset.xhtml?persistentId={global_id}"),
+                        primary_domain=family.trusted_domains[0],
+                        trusted_domains=family.trusted_domains,
+                        unit_of_analysis=family.unit_of_analysis,
+                        modalities=family.modalities,
+                        score=match_score + min(len(data_files), 50) / 5,
+                        evidence_count=len(data_files),
+                        qualifies_as_primary_data=len(data_files) >= (family.minimum_asset_count or 1),
+                        provenance_note="Resolved deterministically from the Harvard Dataverse search and dataset APIs.",
+                        api_url=(
+                            "https://dataverse.harvard.edu/api/datasets/:persistentId/"
+                            f"?persistentId={self._url_encode(global_id)}"
+                        ),
+                        download_urls=download_urls,
+                    )
+                )
+        return results
+
+    def _search_zenodo(
+        self,
+        family: SourceFamilySpec,
+        text: str,
+        dataset_hints: list[str],
+    ) -> list[DatasetCandidate]:
+        results: list[DatasetCandidate] = []
+        seen_ids: set[str] = set()
+        for query in self._query_variants(text, family.search_keywords, dataset_hints):
+            payload = self._request_json(f"https://zenodo.org/api/records?q={self._url_encode(query)}")
+            for record in ((payload or {}).get("hits") or {}).get("hits") or []:
+                record_id = str(record.get("id") or "").strip()
+                if not record_id or record_id in seen_ids:
+                    continue
+                seen_ids.add(record_id)
+                metadata = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
+                title = str(metadata.get("title") or record_id).strip()
+                description = str(metadata.get("description") or "").strip()
+                access_right = str(metadata.get("access_right") or "").strip().lower()
+                data_files = [
+                    str(((entry.get("links") or {}).get("self")) or "").strip()
+                    for entry in (record.get("files") or [])
+                    if self._is_likely_data_file(str(entry.get("key") or ""), "")
+                ]
+                haystack = " ".join([title, description]).lower()
+                match_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+                if match_score <= 0:
+                    continue
+                results.append(
+                    DatasetCandidate(
+                        family_id=family.id,
+                        family_label=family.label,
+                        dataset_id=f"zenodo:{record_id}",
+                        title=title,
+                        summary=f"Zenodo record {record_id} | data files: {len(data_files)}",
+                        access_url=str(record.get("doi_url") or f"https://zenodo.org/records/{record_id}"),
+                        primary_domain=family.trusted_domains[0],
+                        trusted_domains=family.trusted_domains,
+                        unit_of_analysis=family.unit_of_analysis,
+                        modalities=family.modalities,
+                        score=match_score + min(len(data_files), 20),
+                        evidence_count=len(data_files),
+                        qualifies_as_primary_data=(
+                            access_right == "open" and len(data_files) >= (family.minimum_asset_count or 1)
+                        ),
+                        provenance_note="Resolved deterministically from the Zenodo records API.",
+                        api_url=f"https://zenodo.org/api/records/{record_id}",
+                        download_urls=data_files[:5],
+                    )
+                )
+        return results
+
+    def _search_figshare(
+        self,
+        family: SourceFamilySpec,
+        text: str,
+        dataset_hints: list[str],
+    ) -> list[DatasetCandidate]:
+        results: list[DatasetCandidate] = []
+        seen_ids: set[str] = set()
+        for query in self._query_variants(text, family.search_keywords, dataset_hints):
+            payload = self._request_json(
+                "https://api.figshare.com/v2/articles"
+                f"?search_for={self._url_encode(query)}&page_size=10"
+            )
+            for item in payload or []:
+                article_id = str(item.get("id") or "").strip()
+                if not article_id or article_id in seen_ids:
+                    continue
+                seen_ids.add(article_id)
+                detail_payload = self._request_json(f"https://api.figshare.com/v2/articles/{article_id}")
+                data_files = [
+                    str(entry.get("download_url") or "").strip()
+                    for entry in ((detail_payload or {}).get("files") or [])
+                    if self._is_likely_data_file(str(entry.get("name") or ""), str(entry.get("mimetype") or ""))
+                ]
+                haystack = " ".join(
+                    [str(item.get("title") or ""), str((detail_payload or {}).get("description") or "")]
+                ).lower()
+                match_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+                if match_score <= 0:
+                    continue
+                results.append(
+                    DatasetCandidate(
+                        family_id=family.id,
+                        family_label=family.label,
+                        dataset_id=f"figshare:{article_id}",
+                        title=str(item.get("title") or article_id).strip(),
+                        summary=f"Figshare article {article_id} | data files: {len(data_files)}",
+                        access_url=str((detail_payload or {}).get("figshare_url") or item.get("url_public_html") or ""),
+                        primary_domain=family.trusted_domains[0],
+                        trusted_domains=family.trusted_domains,
+                        unit_of_analysis=family.unit_of_analysis,
+                        modalities=family.modalities,
+                        score=match_score + min(len(data_files), 20),
+                        evidence_count=len(data_files),
+                        qualifies_as_primary_data=(
+                            bool((detail_payload or {}).get("is_public"))
+                            and len(data_files) >= (family.minimum_asset_count or 1)
+                        ),
+                        provenance_note="Resolved deterministically from the Figshare public articles API.",
+                        api_url=f"https://api.figshare.com/v2/articles/{article_id}",
+                        download_urls=data_files[:5],
+                    )
+                )
         return results
 
     def _search_openalex(self, family: SourceFamilySpec, text: str, dataset_hints: list[str]) -> list[DatasetCandidate]:
@@ -478,6 +743,7 @@ class SourceFamilyResolver:
                         evidence_count=1,
                         qualifies_as_primary_data=False,
                         provenance_note="Resolved deterministically from the OpenAlex works API. Valid for reviews/bibliometrics only.",
+                        api_url=work_id,
                     )
                 )
         return results
@@ -497,6 +763,15 @@ class SourceFamilyResolver:
         major_terms = re.findall(r"[a-z0-9]{4,}", text.lower())
         if major_terms:
             seed_queries.append(" ".join(major_terms[:4]))
+        if "epilepsy" in text and any(token in text for token in ["pediatric", "child", "children", "adolescent"]):
+            seed_queries.append("children epilepsy")
+            seed_queries.append("pediatric epilepsy")
+        if "glioblastoma" in text or "gbm" in text:
+            seed_queries.append("glioblastoma gene expression")
+        if any(token in text for token in ["rns", "responsive neurostimulation"]):
+            seed_queries.append("epilepsy neurostimulation")
+        if any(token in text for token in ["sex differences", "gender"]):
+            seed_queries.append("sex gender")
 
         for query in seed_queries:
             normalized = re.sub(r"\s+", " ", str(query).strip().lower())
@@ -504,7 +779,7 @@ class SourceFamilyResolver:
                 continue
             seen.add(normalized)
             queries.append(normalized)
-            if len(queries) >= 4:
+            if len(queries) >= 6:
                 break
         return queries or ["public dataset"]
 
@@ -542,7 +817,16 @@ class SourceFamilyResolver:
         body: dict[str, Any] | None = None,
     ) -> Any:
         data = json.dumps(body).encode("utf-8") if body is not None else None
-        request = Request(url, data=data, method=method, headers={"User-Agent": "Sidekick/1.0", "Content-Type": "application/json"})
+        request = Request(
+            url,
+            data=data,
+            method=method,
+            headers={
+                "User-Agent": "Sidekick/1.0",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            },
+        )
         try:
             with urlopen(request, timeout=20) as response:
                 raw = response.read()
@@ -556,3 +840,18 @@ class SourceFamilyResolver:
 
     def _url_encode(self, text: str) -> str:
         return re.sub(r"\s+", "%20", text.strip())
+
+    def _is_likely_data_file(self, filename: str, content_type: str) -> bool:
+        lowered_name = filename.lower().strip()
+        lowered_type = content_type.lower().strip()
+        data_extensions = (
+            ".csv", ".tsv", ".tab", ".xlsx", ".xls", ".json", ".jsonl", ".xml", ".zip", ".gz", ".tgz", ".tar",
+            ".parquet", ".feather", ".npy", ".npz", ".mat", ".h5", ".hdf5", ".nwb", ".edf", ".bdf", ".set", ".fif",
+            ".nii", ".nii.gz", ".txt", ".rds", ".pkl", ".pickle", ".sqlite", ".db", ".loom", ".fastq", ".fq",
+            ".fasta", ".fa", ".bam", ".sam", ".vcf", ".bed", ".bw", ".bigwig", ".gct",
+        )
+        data_mime_hints = (
+            "application/json", "application/zip", "application/gzip", "application/x-hdf", "application/x-hdf5",
+            "text/csv", "text/tab-separated-values", "application/vnd.ms-excel",
+        )
+        return lowered_name.endswith(data_extensions) or lowered_type.startswith(data_mime_hints)
