@@ -228,6 +228,48 @@ class SidekickDatabase:
             )
         return payload
 
+    def ensure_github_connect_session(
+        self,
+        *,
+        session_id: str,
+        install_session_id: str,
+        state: str,
+        expires_at: str,
+        status: str = "created",
+        error_message: str | None = None,
+    ) -> dict[str, Any]:
+        now = iso_now()
+        with self._lock, self._connection() as connection:
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO github_connect_sessions (
+                    id,
+                    install_session_id,
+                    state,
+                    status,
+                    error_message,
+                    created_at,
+                    updated_at,
+                    expires_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    session_id,
+                    install_session_id,
+                    state,
+                    status,
+                    error_message,
+                    now,
+                    now,
+                    expires_at,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM github_connect_sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            return dict(row) if row is not None else {}
+
     def get_github_connect_session(self, session_id: str) -> dict[str, Any] | None:
         with self._lock, self._connection() as connection:
             row = connection.execute(

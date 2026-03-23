@@ -202,16 +202,13 @@ final class GitHubService: ObservableObject {
     }
 
     func beginGitHubConnection() async throws -> URL {
-        if let activeConnectSession,
-           !activeConnectSession.isTerminal {
-            connectionErrorMessage = nil
-            return activeConnectSession.browserURL
-        }
-
         _ = try await ensureDeviceSession()
         guard let baseURL = backendBaseURL else {
             throw GitHubServiceError.backendNotConfigured
         }
+
+        activeConnectSession = nil
+        defaults.removeObject(forKey: sidekickGitHubConnectSessionDefaultsKey)
 
         let connectSession: GitHubConnectSession = try await performRequest(
             url: baseURL.appendingPathComponent("api/github/connect/start"),

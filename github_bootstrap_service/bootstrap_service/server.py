@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -636,17 +637,33 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
 
         if parsed.path == "/github/connect/start":
             query = parse_qs(parsed.query)
+            signed_state = (query.get("state") or [""])[0].strip()
+            if signed_state:
+                decoded_state = self._decode_signed_connect_state(signed_state)
+                if decoded_state is None:
+                    self._send_text(HTTPStatus.BAD_REQUEST, "Invalid GitHub connect state.")
+                    return
+                session_id = str(decoded_state.get("session_id") or "").strip()
+                if session_id:
+                    self.server.database.update_github_connect_session(
+                        session_id,
+                        status="redirected_to_github",
+                    )
+                self._redirect(self.server.github_client.build_user_authorization_url(signed_state))
+                return
+
             session_id = (query.get("session_id") or [""])[0].strip()
             session = self.server.database.get_github_connect_session(session_id)
             if session is None:
                 self._send_text(HTTPStatus.NOT_FOUND, "Unknown GitHub connect session.")
                 return
 
+            signed_state = self._build_signed_connect_state(session)
             self.server.database.update_github_connect_session(
                 session_id,
                 status="redirected_to_github",
             )
-            self._redirect(self.server.github_client.build_user_authorization_url(session["state"]))
+            self._redirect(self.server.github_client.build_user_authorization_url(signed_state))
             return
 
         if parsed.path in {
@@ -832,10 +849,24 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
         oauth_error = (query.get("error") or [""])[0].strip()
         error_description = (query.get("error_description") or [""])[0].strip()
 
-        session = self.server.database.get_github_connect_session_for_state(state)
-        if session is None:
+        decoded_state = self._decode_signed_connect_state(state)
+        if decoded_state is None:
             self._send_text(HTTPStatus.BAD_REQUEST, "Unknown or expired GitHub OAuth state.")
             return
+        session_id = str(decoded_state.get("session_id") or "").strip()
+        install_session_id = str(decoded_state.get("install_session_id") or "").strip()
+        raw_state = str(decoded_state.get("nonce") or "").strip()
+        expires_at = str(decoded_state.get("expires_at") or "").strip()
+        if not session_id or not install_session_id or not raw_state or not expires_at:
+            self._send_text(HTTPStatus.BAD_REQUEST, "Unknown or expired GitHub OAuth state.")
+            return
+
+        session = self.server.database.ensure_github_connect_session(
+            session_id=session_id,
+            install_session_id=install_session_id,
+            state=raw_state,
+            expires_at=expires_at,
+        )
 
         if oauth_error:
             message = error_description or oauth_error
@@ -962,6 +993,7 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
 
     def _github_connect_session_payload(self, session: dict[str, Any]) -> dict[str, Any]:
         connection = self.server.database.get_github_connection_for_install(session["install_session_id"])
+        signed_state = self._build_signed_connect_state(session)
         return {
             "session_id": session["id"],
             "status": session["status"],
@@ -969,9 +1001,62 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
             "created_at": session["created_at"],
             "updated_at": session["updated_at"],
             "expires_at": session["expires_at"],
-            "browser_url": f"{self.server.config.service_base_url}/github/connect/start?session_id={session['id']}",
+            "browser_url": self.server.github_client.build_user_authorization_url(signed_state),
             "connection": self._github_connection_payload(connection),
         }
+
+    def _build_signed_connect_state(self, session: dict[str, Any]) -> str:
+        payload = {
+            "session_id": session["id"],
+            "install_session_id": session["install_session_id"],
+            "nonce": session["state"],
+            "expires_at": session["expires_at"],
+        }
+        raw_payload = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        signature = hmac.new(
+            self.server.config.encryption_secret.encode("utf-8"),
+            raw_payload,
+            hashlib.sha256,
+        ).digest()
+        encoded_payload = base64.urlsafe_b64encode(raw_payload).decode("ascii").rstrip("=")
+        encoded_signature = base64.urlsafe_b64encode(signature).decode("ascii").rstrip("=")
+        return f"{encoded_payload}.{encoded_signature}"
+
+    def _decode_signed_connect_state(self, token: str) -> dict[str, Any] | None:
+        parts = token.split(".", 1)
+        if len(parts) != 2:
+            return None
+        encoded_payload, encoded_signature = parts
+        try:
+            raw_payload = base64.urlsafe_b64decode(encoded_payload + "=" * (-len(encoded_payload) % 4))
+            signature = base64.urlsafe_b64decode(encoded_signature + "=" * (-len(encoded_signature) % 4))
+        except Exception:
+            return None
+
+        expected_signature = hmac.new(
+            self.server.config.encryption_secret.encode("utf-8"),
+            raw_payload,
+            hashlib.sha256,
+        ).digest()
+        if not hmac.compare_digest(signature, expected_signature):
+            return None
+
+        try:
+            payload = json.loads(raw_payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict):
+            return None
+
+        expires_at = str(payload.get("expires_at") or "").strip()
+        if not expires_at:
+            return None
+        try:
+            if datetime.fromisoformat(expires_at) <= utc_now():
+                return None
+        except ValueError:
+            return None
+        return payload
 
     def _send_json(self, status: HTTPStatus, payload: dict[str, Any]) -> None:
         body = _json_dumps(payload)
