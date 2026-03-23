@@ -446,8 +446,8 @@ class SidekickDatabase:
                     github_connection_id,
                     paper_title,
                     "queued",
-                    "plan",
-                    "Queued for Sidekick-hosted analysis.",
+                    "inspect",
+                    "Queued for the research workspace.",
                     None,
                     None,
                     None,
@@ -547,7 +547,7 @@ class SidekickDatabase:
                     (
                         iso_now(),
                         iso_now(),
-                        "Planning research run.",
+                        "Inspecting public evidence and building the research workspace.",
                         row["id"],
                     ),
                 )

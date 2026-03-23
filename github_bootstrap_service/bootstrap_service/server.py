@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import json
+import mimetypes
 import os
 import re
 import shutil
@@ -21,8 +22,7 @@ from .config import BootstrapServiceConfig
 from .crypto import decrypt_text, encrypt_text
 from .database import JobClaim, SidekickDatabase, iso_now, utc_now
 from .github_client import GitHubClient, GitHubClientError
-from .openai_client import OpenAIClient
-from .resolver import ResolutionBundle, SourceFamilyResolver
+from .openai_client import OpenAIClient, OpenAIContainerFileCitation
 
 
 def _json_dumps(payload: dict[str, Any]) -> bytes:
@@ -50,359 +50,12 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
     raise ValueError("Model output did not contain a JSON object.")
 
 
-def _sha256_texts(texts: list[str]) -> str:
-    digest = hashlib.sha256()
-    for text in texts:
-        digest.update(text.encode("utf-8"))
-    return digest.hexdigest()
-
-
-def _word_count(text: str) -> int:
-    return len(re.findall(r"\b[\w'-]+\b", text))
-
-
 def _normalize_text_list(value: Any) -> list[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
     if isinstance(value, str) and value.strip():
         return [value.strip()]
     return []
-
-
-def _nested(mapping: dict[str, Any], *keys: str) -> Any:
-    current: Any = mapping
-    for key in keys:
-        if not isinstance(current, dict):
-            return None
-        current = current.get(key)
-    return current
-
-
-def _has_markdown_section(markdown: str, names: list[str]) -> bool:
-    lowered = markdown.lower()
-    for name in names:
-        escaped = re.escape(name.lower())
-        if re.search(rf"(?m)^\s{{0,3}}#+\s+{escaped}\s*$", lowered):
-            return True
-        if re.search(rf"(?m)^\s*{escaped}\s*$", lowered):
-            return True
-    return False
-
-
-def _has_latex_section(latex: str, names: list[str]) -> bool:
-    lowered = latex.lower()
-    for name in names:
-        escaped = re.escape(name.lower())
-        if re.search(rf"\\(?:section|subsection)\*?\{{\s*{escaped}\s*\}}", lowered):
-            return True
-    return False
-
-
-def _count_reference_entries(markdown: str) -> int:
-    match = re.search(
-        r"(?ims)^\s{0,3}#+\s+references\s*$([\s\S]+)$",
-        markdown,
-    )
-    if not match:
-        return 0
-
-    section = match.group(1)
-    return len(
-        re.findall(
-            r"(?m)^\s*(?:[-*+]\s+|\d+\.\s+|\[\d+\]\s+).+",
-            section,
-        )
-    )
-
-
-def _count_citation_markers(text: str) -> int:
-    patterns = [
-        r"\[[0-9,\-\s]+\]",
-        r"\([A-Z][A-Za-z]+(?:\s+et al\.)?,\s*\d{4}\)",
-        r"\\cite[t|p]?\{[^}]+\}",
-        r"doi:\s*10\.\d{4,9}/[-._;()/:A-Z0-9]+",
-    ]
-    return sum(len(re.findall(pattern, text, flags=re.IGNORECASE)) for pattern in patterns)
-
-
-def _find_banned_draft_language(text: str) -> list[str]:
-    hits: list[str] = []
-    phrase_patterns = {
-        "synthetic data": r"\bsynthetic\s+(?:data|dataset|datasets|results?|sample|samples|analysis|bundle)\b",
-        "simulated data": r"\bsimulated\s+(?:data|dataset|datasets|results?|sample|samples|analysis|bundle)\b",
-        "illustrative example": r"\billustrative\s+(?:example|analysis|dataset|results?)\b",
-        "demo mode": r"\bdemo mode\b",
-        "demonstration dataset": r"\bdemonstration dataset\b",
-        "mock data": r"\bmock data\b",
-        "toy example": r"\btoy example\b",
-        "scaffold manuscript": r"\bscaffold(?:ed)?\s+(?:paper|manuscript|bundle)\b",
-        "placeholder data": r"\bplaceholder\s+(?:data|dataset|figure|figures|table|tables|result|results|manuscript|paper|text)\b",
-        "this draft": r"\bthis draft\b",
-        "(draft)": r"\(draft\)",
-        "reproducible analysis bundle (draft)": r"\breproducible analysis bundle \(draft\)\b",
-        "does not constitute empirical evidence": r"\bdoes not constitute empirical evidence\b",
-        "next steps for empirical work": r"\bnext steps for empirical work\b",
-        "no real public": r"\bno real public\b",
-        "not be interpreted as empirical": r"\bnot be interpreted as empirical\b",
-    }
-    lowered = text.lower()
-    for label, pattern in phrase_patterns.items():
-        if re.search(pattern, lowered):
-            hits.append(label)
-    return hits
-
-
-def _required_analysis_files_present(bundle: dict[str, Any]) -> list[str]:
-    required = {"analysis.py", "requirements.txt", "makefile"}
-    seen = {
-        Path(str(entry.get("path") or "").strip()).name.lower()
-        for entry in bundle.get("analysis_files", []) or []
-        if isinstance(entry, dict)
-    }
-    return sorted(required - seen)
-
-
-def _find_analysis_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
-    issues: list[str] = []
-    title = str(bundle.get("title") or "").strip()
-    manifest = bundle.get("manifest") if isinstance(bundle.get("manifest"), dict) else {}
-    inspection = bundle.get("inspection") if isinstance(bundle.get("inspection"), dict) else {}
-    analysis = bundle.get("analysis") if isinstance(bundle.get("analysis"), dict) else {}
-    provenance = bundle.get("provenance") if isinstance(bundle.get("provenance"), dict) else {}
-    resolver = bundle.get("resolver") if isinstance(bundle.get("resolver"), dict) else {}
-    analysis_provenance = analysis.get("provenance") if isinstance(analysis.get("provenance"), dict) else {}
-    dataset_manifest = analysis.get("dataset_manifest") if isinstance(analysis.get("dataset_manifest"), dict) else {}
-    inspection_manifest = (
-        inspection.get("dataset_manifest") if isinstance(inspection.get("dataset_manifest"), dict) else {}
-    )
-
-    combined_text = "\n".join(
-        part for part in [
-            title,
-            str(analysis.get("narrative_summary") or ""),
-            str(provenance.get("notes") or ""),
-            str(analysis_provenance.get("notes") or ""),
-            " ".join(_normalize_text_list(analysis.get("limitations"))),
-            str(inspection.get("access_notes") or ""),
-        ] if part
-    ).lower()
-
-    for phrase in _find_banned_draft_language(combined_text):
-        issues.append(f"Analysis bundle contains banned draft/demo language: '{phrase}'.")
-
-    if not title:
-        issues.append("Analysis bundle is missing a title.")
-
-    missing_files = _required_analysis_files_present(bundle)
-    if missing_files:
-        issues.append(f"Analysis bundle is missing required files: {', '.join(missing_files)}.")
-
-    manifest_sources = _normalize_text_list(manifest.get("dataset_sources"))
-    if not manifest_sources:
-        issues.append("Manifest is missing real dataset sources.")
-
-    primary_dataset_ids = _normalize_text_list(dataset_manifest.get("primary_dataset_ids"))
-    if not primary_dataset_ids:
-        primary_dataset_ids = _normalize_text_list(inspection_manifest.get("primary_dataset_ids"))
-    if not primary_dataset_ids:
-        issues.append("Analysis bundle does not identify any primary dataset ids.")
-
-    used_dataset_ids = _normalize_text_list(provenance.get("used_dataset_ids")) or _normalize_text_list(
-        analysis_provenance.get("used_dataset_ids")
-    )
-    if not used_dataset_ids:
-        issues.append("Analysis bundle provenance is missing used dataset ids.")
-
-    row_count = dataset_manifest.get("row_count")
-    if not isinstance(row_count, int) or row_count <= 0:
-        issues.append("Analysis dataset manifest has no positive row count.")
-
-    findings = analysis.get("findings")
-    if not isinstance(findings, list) or len(findings) < 2:
-        issues.append("Analysis does not contain enough supported findings.")
-
-    tables = analysis.get("tables")
-    if not isinstance(tables, list) or not tables:
-        issues.append("Analysis does not include any structured tables.")
-
-    figures = bundle.get("figures")
-    if not isinstance(figures, list) or not figures:
-        issues.append("Analysis bundle does not include final figure outputs.")
-
-    resolver_mode = str(resolver.get("paper_mode") or "").strip().lower()
-    resolver_status = str(resolver.get("status") or "").strip().lower()
-    resolver_candidate = resolver.get("selected_candidate") if isinstance(resolver.get("selected_candidate"), dict) else {}
-    incompatible_families = {
-        str(family_id).strip()
-        for family_id in resolver.get("incompatible_primary_family_ids") or []
-        if str(family_id).strip()
-    }
-    resolver_family_id = str(resolver_candidate.get("family_id") or "").strip()
-    resolver_dataset_id = str(resolver_candidate.get("dataset_id") or "").strip()
-    resolver_access_url = str(resolver_candidate.get("access_url") or "").strip()
-
-    if resolver_mode == "empirical_dataset":
-        if resolver_status != "resolved":
-            issues.append("Resolver did not clear the run for empirical publication.")
-        if not resolver_candidate:
-            issues.append("Resolver did not select a qualifying primary empirical dataset.")
-        if resolver_family_id and resolver_family_id in incompatible_families:
-            issues.append("Resolver selected a forbidden primary source family for an empirical paper.")
-        if resolver_candidate and not bool(resolver_candidate.get("qualifies_as_primary_data")):
-            issues.append("Resolver-selected candidate does not qualify as primary empirical data.")
-
-        dataset_accounting = set(manifest_sources) | set(primary_dataset_ids) | set(used_dataset_ids)
-        normalized_accounting = " ".join(item.lower() for item in dataset_accounting)
-        has_dataset_id = bool(resolver_dataset_id) and resolver_dataset_id.lower() in normalized_accounting
-        has_access_url = bool(resolver_access_url) and resolver_access_url.lower() in normalized_accounting
-        if resolver_dataset_id and not has_dataset_id and not has_access_url:
-            issues.append("Analysis bundle dataset accounting does not cite the resolver-selected dataset id.")
-        if resolver_access_url and not has_access_url and not has_dataset_id:
-            issues.append("Analysis bundle dataset accounting does not cite the resolver-selected dataset URL.")
-
-    return issues
-
-
-def _find_bundle_quality_issues(bundle: dict[str, Any]) -> list[str]:
-    issues: list[str] = []
-    title = str(bundle.get("title") or "").strip()
-    markdown = str(bundle.get("markdown") or "").strip()
-    latex = str(bundle.get("latex") or "").strip()
-    manifest = bundle.get("manifest") if isinstance(bundle.get("manifest"), dict) else {}
-    inspection = bundle.get("inspection") if isinstance(bundle.get("inspection"), dict) else {}
-    analysis = bundle.get("analysis") if isinstance(bundle.get("analysis"), dict) else {}
-    verification = bundle.get("verification") if isinstance(bundle.get("verification"), dict) else {}
-    provenance = bundle.get("provenance") if isinstance(bundle.get("provenance"), dict) else {}
-    resolver = bundle.get("resolver") if isinstance(bundle.get("resolver"), dict) else {}
-    analysis_provenance = analysis.get("provenance") if isinstance(analysis.get("provenance"), dict) else {}
-    dataset_manifest = analysis.get("dataset_manifest") if isinstance(analysis.get("dataset_manifest"), dict) else {}
-    inspection_manifest = (
-        inspection.get("dataset_manifest") if isinstance(inspection.get("dataset_manifest"), dict) else {}
-    )
-
-    combined_text = "\n".join(
-        part for part in [
-            title,
-            markdown,
-            latex,
-            str(analysis.get("narrative_summary") or ""),
-            str(provenance.get("notes") or ""),
-            str(analysis_provenance.get("notes") or ""),
-            " ".join(_normalize_text_list(analysis.get("limitations"))),
-            " ".join(_normalize_text_list(verification.get("model_warnings"))),
-            " ".join(_normalize_text_list(verification.get("sample_warnings"))),
-        ] if part
-    ).lower()
-
-    for phrase in _find_banned_draft_language(combined_text):
-        issues.append(f"Bundle contains banned draft/demo language: '{phrase}'.")
-
-    if not title or "draft" in title.lower():
-        issues.append("Title is missing or still labeled as a draft.")
-
-    if _word_count(markdown) < 2200:
-        issues.append("Markdown manuscript is too short for a full paper.")
-
-    if len(latex) < 6000:
-        issues.append("LaTeX manuscript is too short for a professional paper.")
-
-    required_sections = {
-        "Abstract": ["Abstract"],
-        "Introduction": ["Introduction"],
-        "Methods": ["Methods", "Materials and Methods", "Methodology"],
-        "Results": ["Results"],
-        "Discussion": ["Discussion", "Conclusion", "Conclusions"],
-        "References": ["References", "Bibliography"],
-    }
-    for section_label, candidates in required_sections.items():
-        if not _has_markdown_section(markdown, candidates):
-            issues.append(f"Markdown manuscript is missing a {section_label} section.")
-        if not _has_latex_section(latex, candidates) and not (
-            section_label == "Abstract" and "\\begin{abstract}" in latex.lower()
-        ):
-            issues.append(f"LaTeX manuscript is missing a {section_label} section.")
-
-    missing_files = _required_analysis_files_present(bundle)
-    if missing_files:
-        issues.append(f"Analysis bundle is missing required files: {', '.join(missing_files)}.")
-
-    manifest_sources = _normalize_text_list(manifest.get("dataset_sources"))
-    if not manifest_sources:
-        issues.append("Manifest is missing real dataset sources.")
-
-    primary_dataset_ids = _normalize_text_list(dataset_manifest.get("primary_dataset_ids"))
-    if not primary_dataset_ids:
-        primary_dataset_ids = _normalize_text_list(inspection_manifest.get("primary_dataset_ids"))
-    if not primary_dataset_ids:
-        issues.append("Bundle does not identify any primary dataset ids.")
-
-    used_dataset_ids = _normalize_text_list(provenance.get("used_dataset_ids")) or _normalize_text_list(
-        analysis_provenance.get("used_dataset_ids")
-    )
-    if not used_dataset_ids:
-        issues.append("Provenance is missing used dataset ids.")
-
-    row_count = dataset_manifest.get("row_count")
-    if not isinstance(row_count, int) or row_count <= 0:
-        issues.append("Analysis dataset manifest has no positive row count.")
-
-    findings = analysis.get("findings")
-    if not isinstance(findings, list) or len(findings) < 2:
-        issues.append("Analysis does not contain enough supported findings.")
-
-    figures = bundle.get("figures")
-    if not isinstance(figures, list) or not figures:
-        issues.append("Bundle does not include final figure outputs.")
-
-    if str(verification.get("decision") or "").strip().lower() != "proceed":
-        issues.append("Verification did not approve publication.")
-    if _normalize_text_list(verification.get("required_revisions")):
-        issues.append("Verification still lists required revisions.")
-    if not _normalize_text_list(verification.get("supported_claims")):
-        issues.append("Verification is missing supported claims.")
-
-    reference_count = _count_reference_entries(markdown)
-    if reference_count < 4:
-        issues.append("Paper does not include enough explicit reference entries.")
-
-    if _count_citation_markers(markdown) < 4:
-        issues.append("Paper body is missing sufficient citation markers.")
-
-    if _count_citation_markers(latex) < 4:
-        issues.append("LaTeX manuscript is missing sufficient citation markers.")
-
-    resolver_mode = str(resolver.get("paper_mode") or "").strip().lower()
-    resolver_status = str(resolver.get("status") or "").strip().lower()
-    resolver_candidate = resolver.get("selected_candidate") if isinstance(resolver.get("selected_candidate"), dict) else {}
-    incompatible_families = {
-        str(family_id).strip()
-        for family_id in resolver.get("incompatible_primary_family_ids") or []
-        if str(family_id).strip()
-    }
-    resolver_family_id = str(resolver_candidate.get("family_id") or "").strip()
-    resolver_dataset_id = str(resolver_candidate.get("dataset_id") or "").strip()
-    resolver_access_url = str(resolver_candidate.get("access_url") or "").strip()
-
-    if resolver_mode == "empirical_dataset":
-        if resolver_status != "resolved":
-            issues.append("Resolver did not clear the run for empirical publication.")
-        if not resolver_candidate:
-            issues.append("Resolver did not select a qualifying primary empirical dataset.")
-        if resolver_family_id and resolver_family_id in incompatible_families:
-            issues.append("Resolver selected a forbidden primary source family for an empirical paper.")
-        if resolver_candidate and not bool(resolver_candidate.get("qualifies_as_primary_data")):
-            issues.append("Resolver-selected candidate does not qualify as primary empirical data.")
-
-        dataset_accounting = set(manifest_sources) | set(primary_dataset_ids) | set(used_dataset_ids)
-        normalized_accounting = " ".join(item.lower() for item in dataset_accounting)
-        has_dataset_id = bool(resolver_dataset_id) and resolver_dataset_id.lower() in normalized_accounting
-        has_access_url = bool(resolver_access_url) and resolver_access_url.lower() in normalized_accounting
-        if resolver_dataset_id and not has_dataset_id and not has_access_url:
-            issues.append("Bundle dataset accounting does not cite the resolver-selected dataset id.")
-        if resolver_access_url and not has_access_url and not has_dataset_id:
-            issues.append("Bundle dataset accounting does not cite the resolver-selected dataset URL.")
-
-    return issues
 
 
 def _read_json_file(path: Path) -> dict[str, Any]:
@@ -412,6 +65,217 @@ def _read_json_file(path: Path) -> dict[str, Any]:
 def _write_json_file(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _sha256_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def _sha256_texts(texts: list[str]) -> str:
+    digest = hashlib.sha256()
+    for text in texts:
+        digest.update(text.encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _is_http_url(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith("https://") or lowered.startswith("http://")
+
+
+def _sanitize_relative_path(value: str, *, fallback: str) -> str:
+    candidate = value.strip().replace("\\", "/")
+    candidate = re.sub(r"^\./+", "", candidate)
+    candidate = candidate.lstrip("/")
+    parts = []
+    for part in candidate.split("/"):
+        cleaned = part.strip()
+        if not cleaned or cleaned in {".", ".."}:
+            continue
+        parts.append(cleaned)
+    sanitized = "/".join(parts)
+    return sanitized or fallback
+
+
+def _guess_mime_type(path: str, fallback: str = "application/octet-stream") -> str:
+    guessed, _ = mimetypes.guess_type(path)
+    return guessed or fallback
+
+
+def _artifact_path_value(artifact: dict[str, Any]) -> str:
+    for key in ("path", "file_path", "filename", "relative_path"):
+        value = str(artifact.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _artifact_source_ids(artifact: dict[str, Any]) -> list[str]:
+    return _normalize_text_list(artifact.get("source_ids") or artifact.get("sources"))
+
+
+def _find_banned_phrases(text: str) -> list[str]:
+    lowered = text.lower()
+    patterns = {
+        "synthetic data": r"\bsynthetic\s+(?:data|dataset|results?|analysis)\b",
+        "simulated data": r"\bsimulated\s+(?:data|dataset|results?|analysis)\b",
+        "mock data": r"\bmock\s+(?:data|dataset|results?)\b",
+        "placeholder": r"\bplaceholder\s+(?:data|dataset|results?|figure|table|text)\b",
+        "demo mode": r"\bdemo(?:\s+mode)?\b",
+        "draft language": r"\bthis draft\b|\(draft\)",
+        "proof claim": r"\b(?:prove|proves|proven|definitive(?:ly)?|conclusive(?:ly)?)\b",
+    }
+    return [label for label, pattern in patterns.items() if re.search(pattern, lowered)]
+
+
+def _source_has_reproducible_receipt(source: dict[str, Any]) -> bool:
+    accession_id = str(source.get("accession_id") or "").strip()
+    download_url = str(source.get("download_url") or "").strip()
+    api_query = source.get("api_query")
+    api_endpoint = str(source.get("api_endpoint") or "").strip()
+    return bool(
+        accession_id
+        or _is_http_url(download_url)
+        or api_endpoint
+        or (isinstance(api_query, dict) and bool(api_query))
+        or (isinstance(api_query, str) and api_query.strip())
+    )
+
+
+def _source_external_urls(source: dict[str, Any]) -> list[str]:
+    urls: list[str] = []
+    for key in ("download_url", "landing_page_url", "api_endpoint"):
+        value = str(source.get(key) or "").strip()
+        if _is_http_url(value):
+            urls.append(value)
+    return urls
+
+
+def _domain_from_url(url: str) -> str:
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return ""
+    return parsed.netloc.strip().lower()
+
+
+def _normalize_source(entry: Any, index: int) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        entry = {}
+    return {
+        "source_id": str(entry.get("source_id") or f"source_{index + 1}").strip() or f"source_{index + 1}",
+        "label": str(entry.get("label") or entry.get("title") or f"Source {index + 1}").strip() or f"Source {index + 1}",
+        "landing_page_url": str(entry.get("landing_page_url") or entry.get("url") or "").strip(),
+        "download_url": str(entry.get("download_url") or entry.get("direct_download_url") or "").strip(),
+        "accession_id": str(entry.get("accession_id") or entry.get("dataset_id") or "").strip(),
+        "api_endpoint": str(entry.get("api_endpoint") or "").strip(),
+        "api_query": entry.get("api_query"),
+        "notes": str(entry.get("notes") or entry.get("retrieval_note") or "").strip(),
+    }
+
+
+def _normalize_artifact(entry: Any, index: int) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        entry = {}
+    declared_path = _artifact_path_value(entry)
+    return {
+        "artifact_id": str(entry.get("artifact_id") or f"artifact_{index + 1}").strip() or f"artifact_{index + 1}",
+        "path": declared_path,
+        "kind": str(entry.get("kind") or entry.get("artifact_type") or "artifact").strip() or "artifact",
+        "mime_type": str(entry.get("mime_type") or "").strip(),
+        "description": str(entry.get("description") or entry.get("caption") or "").strip(),
+        "source_ids": _artifact_source_ids(entry),
+    }
+
+
+def _normalize_claim(entry: Any, index: int) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        entry = {}
+    return {
+        "claim_id": str(entry.get("claim_id") or f"claim_{index + 1}").strip() or f"claim_{index + 1}",
+        "text": str(entry.get("text") or entry.get("claim") or "").strip(),
+        "artifact_ids": _normalize_text_list(entry.get("artifact_ids") or entry.get("artifacts")),
+        "source_ids": _normalize_text_list(entry.get("source_ids") or entry.get("sources")),
+        "notes": str(entry.get("notes") or "").strip(),
+    }
+
+
+def _normalize_ledger(raw_ledger: dict[str, Any], *, title_fallback: str) -> dict[str, Any]:
+    sources = [_normalize_source(entry, index) for index, entry in enumerate(raw_ledger.get("sources") or [])]
+    artifacts = [_normalize_artifact(entry, index) for index, entry in enumerate(raw_ledger.get("artifacts") or [])]
+    claims = [_normalize_claim(entry, index) for index, entry in enumerate(raw_ledger.get("claims") or [])]
+    return {
+        "title": str(raw_ledger.get("title") or title_fallback).strip() or title_fallback,
+        "recommended_format": str(raw_ledger.get("recommended_format") or raw_ledger.get("format") or "brief_report").strip()
+        or "brief_report",
+        "summary": str(raw_ledger.get("summary") or "").strip(),
+        "limitations": _normalize_text_list(raw_ledger.get("limitations")),
+        "sources": sources,
+        "artifacts": artifacts,
+        "claims": claims,
+    }
+
+
+@dataclass(frozen=True)
+class DownloadedArtifactFile:
+    artifact_id: str | None
+    container_id: str
+    file_id: str
+    filename: str
+    relative_path: str
+    metadata_path: str
+    mime_type: str
+    sha256: str
+
+
+def _build_task_provenance(ledger: dict[str, Any]) -> dict[str, Any]:
+    used_dataset_ids = sorted(
+        {
+            str(source.get("accession_id") or "").strip()
+            for source in ledger.get("sources", [])
+            if isinstance(source, dict) and str(source.get("accession_id") or "").strip()
+        }
+    )
+    external_sources = []
+    accessed_domains = set()
+    for source in ledger.get("sources", []):
+        if not isinstance(source, dict):
+            continue
+        for url in _source_external_urls(source):
+            external_sources.append(url)
+            domain = _domain_from_url(url)
+            if domain:
+                accessed_domains.add(domain)
+
+    return {
+        "used_dataset_ids": used_dataset_ids,
+        "accessed_domains": sorted(accessed_domains),
+        "left_trusted_set": False,
+        "external_sources": external_sources,
+        "notes": str(ledger.get("summary") or "Validated from the research workspace ledger.").strip()
+        or "Validated from the research workspace ledger.",
+    }
+
+
+def _build_verification_payload(validation: dict[str, Any], figures: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "decision": "proceed" if validation.get("status") == "approved" else "blocked",
+        "summary": str(validation.get("summary") or "").strip(),
+        "supported_claims": [str(claim.get("text") or "").strip() for claim in validation.get("approved_claims", [])],
+        "weak_or_unsupported_claims": [
+            f"{entry.get('claim_id')}: {'; '.join(entry.get('reasons') or [])}".strip(": ")
+            for entry in validation.get("dropped_claims", [])
+            if str(entry.get("claim_id") or "").strip()
+        ],
+        "figure_sanity_checks": [
+            {"filename": str(figure.get("filename") or ""), "status": "ok", "issue": ""}
+            for figure in figures
+            if str(figure.get("filename") or "").strip()
+        ],
+        "model_warnings": [],
+        "sample_warnings": _normalize_text_list(validation.get("validation_issues")),
+        "required_revisions": [] if validation.get("status") == "approved" else _normalize_text_list(validation.get("validation_issues")),
+    }
 
 
 @dataclass(frozen=True)
@@ -442,7 +306,6 @@ class JobProcessor(threading.Thread):
         self._database = database
         self._github_client = github_client
         self._openai_client = openai_client
-        self._resolver = SourceFamilyResolver()
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -463,9 +326,7 @@ class JobProcessor(threading.Thread):
                     time.sleep(5)
                     continue
 
-                claim = self._database.claim_next_queued_job(
-                    self._config.backend_max_concurrent_jobs_per_install
-                )
+                claim = self._database.claim_next_queued_job(self._config.backend_max_concurrent_jobs_per_install)
                 if claim is None:
                     time.sleep(2)
                     continue
@@ -480,18 +341,13 @@ class JobProcessor(threading.Thread):
         if job is None:
             return
 
-        install_session = self._database.get_install_session_by_id(claim.install_session_id)
-        if install_session is None:
-            install_session = {
-                "id": claim.install_session_id,
-            }
-
+        install_session = self._database.get_install_session_by_id(claim.install_session_id) or {"id": claim.install_session_id}
         github_connection = self._database.get_github_connection_for_install(claim.install_session_id)
         if github_connection is None:
             self._database.update_paper_job(
                 claim.job_id,
                 status="failed",
-                stage="plan",
+                stage="inspect",
                 progress_message="GitHub must be connected before Sidekick can generate this paper.",
                 error_message="Missing GitHub connection.",
                 completed=True,
@@ -507,9 +363,15 @@ class JobProcessor(threading.Thread):
         )
 
         try:
-            plan = self._generate_plan(context)
-            resolution = self._resolve_source_family(context, plan)
-            bundle = self._generate_bundle(context, plan, resolution)
+            ledger = self._run_research_workspace(context)
+            validation = self._validate_ledger(context.job["id"], ledger)
+            if validation.get("status") != "approved":
+                raise JobExecutionError(
+                    str(validation.get("summary") or "Validation blocked the run."),
+                    stage="verify",
+                )
+
+            bundle = self._write_bundle(context, ledger, validation)
             publication = self._publish_bundle(context, bundle)
             self._persist_artifacts(context.job["id"], bundle, publication)
             self._database.update_paper_job(
@@ -526,7 +388,7 @@ class JobProcessor(threading.Thread):
             self._database.update_paper_job(
                 context.job["id"],
                 status="failed",
-                stage=str(stage or (self._database.get_paper_job(context.job["id"]) or context.job).get("stage") or "plan"),
+                stage=str(stage or (self._database.get_paper_job(context.job["id"]) or context.job).get("stage") or "inspect"),
                 progress_message=str(error),
                 error_message=str(error),
                 completed=True,
@@ -541,342 +403,67 @@ class JobProcessor(threading.Thread):
             estimated_cost_usd=self._estimate_cost(input_tokens, output_tokens),
         )
 
-    def _orchestration_metadata(self) -> dict[str, str]:
-        return {
-            "planner_model": self._config.openai_planner_model,
-            "analysis_model": self._config.openai_analysis_model,
-            "writer_model": self._config.openai_writer_model,
-            "auditor_model": self._config.openai_auditor_model,
-        }
-
-    def _generate_plan(self, context: JobContext) -> dict[str, Any]:
+    def _run_research_workspace(self, context: JobContext) -> dict[str, Any]:
         self._database.update_paper_job(
             context.job["id"],
             status="running",
-            stage="plan",
-            progress_message="Planning the paper from clustered notes.",
+            stage="inspect",
+            progress_message="Inspecting public evidence and building the research workspace.",
         )
         instructions = """
-You are planning a scientific paper from short research notes.
-Return strict JSON only with this exact shape:
-{
-  "question": "string",
-  "hypotheses": ["string"],
-  "dataset_needs": [
-    {
-      "dataset_id": "string or null",
-      "role": "primary or supporting",
-      "variables": ["string"],
-      "rationale": "string"
-    }
-  ],
-  "candidate_methods": ["string"],
-  "planned_figures": [
-    {
-      "identifier": "figure_1",
-      "title": "string",
-      "purpose": "string"
-    }
-  ],
-  "risks": ["string"],
-  "execution_notes": "string"
-}
-Keep the plan concise, empirical, and honest. Use web search to identify real public datasets and core citations whenever the notes do not already name them explicitly. Prefer public datasets that are directly downloadable and reproducibility-friendly. Treat `dataset_hints` as optional hints only, never as a hard restriction.
-"""
-        notes = context.request_payload["notes"]
-        input_text = json.dumps(
-            {
-                "title": context.request_payload["title"],
-                "theme": context.request_payload["theme"],
-                "dataset_hints": context.request_payload.get("dataset_hints", [])
-                or context.request_payload.get("dataset_ids", []),
-                "notes": notes,
-            },
-            sort_keys=True,
-        )
-        response = self._openai_client.generate_json(
-            instructions=instructions,
-            input_text=input_text,
-            use_code_interpreter=False,
-            use_web_search=True,
-            timeout_seconds=min(300, self._config.backend_max_job_runtime_seconds),
-            model=self._config.openai_planner_model,
-        )
-        self._database.update_paper_job(
-            context.job["id"],
-            openai_response_id=response.response_id,
-            progress_message="Plan complete. Inspecting reachable data.",
-        )
-        self._record_response_metrics(
-            job_id=context.job["id"],
-            model=self._config.openai_planner_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-        return _extract_json_object(response.output_text)
-
-    def _resolve_source_family(self, context: JobContext, plan: dict[str, Any]) -> ResolutionBundle:
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="inspect",
-            progress_message="Resolving trusted open-data sources before analysis.",
-        )
-        resolution = self._resolver.resolve(
-            title=str(context.request_payload.get("title") or ""),
-            theme=str(context.request_payload.get("theme") or ""),
-            notes=context.request_payload.get("notes") or [],
-            dataset_hints=context.request_payload.get("dataset_hints", [])
-            or context.request_payload.get("dataset_ids", []),
-        )
-        if resolution.status != "resolved":
-            raise JobExecutionError(
-                resolution.blocking_reason or resolution.summary or "No qualifying open dataset found.",
-                stage="inspect",
-            )
-
-        summary = resolution.summary
-        if plan.get("dataset_needs"):
-            summary = f"{summary} Plan requested {len(plan.get('dataset_needs') or [])} dataset roles."
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="inspect",
-            progress_message=summary,
-        )
-        return resolution
-
-    def _generate_bundle(self, context: JobContext, plan: dict[str, Any], resolution: ResolutionBundle) -> dict[str, Any]:
-        notes_hash = _sha256_texts([note["content"] for note in context.request_payload["notes"]])
-        analysis_bundle = self._generate_analysis_bundle(
-            context=context,
-            plan=plan,
-            resolution=resolution,
-            notes_hash=notes_hash,
-        )
-        analysis_issues = _find_analysis_bundle_quality_issues(analysis_bundle)
-        if analysis_issues:
-            analysis_bundle = self._revise_analysis_bundle_after_gate_failure(
-                context=context,
-                plan=plan,
-                resolution=resolution,
-                initial_bundle=analysis_bundle,
-                issues=analysis_issues,
-                notes_hash=notes_hash,
-            )
-            analysis_issues = _find_analysis_bundle_quality_issues(analysis_bundle)
-        if analysis_issues:
-            raise JobExecutionError(
-                "Analysis bundle failed evidence gate: " + " ".join(analysis_issues[:4]),
-                stage="analyze",
-            )
-
-        analysis_audit = self._audit_analysis_bundle(context, plan, resolution, analysis_bundle)
-        if not bool(analysis_audit.get("accept")):
-            audit_issues = (
-                _normalize_text_list(analysis_audit.get("required_revisions"))
-                or _normalize_text_list(analysis_audit.get("model_warnings"))
-                or _normalize_text_list(analysis_audit.get("weak_or_unsupported_claims"))
-                or [str(analysis_audit.get("summary") or "Evidence audit rejected the analysis bundle.")]
-            )
-            analysis_bundle = self._revise_analysis_bundle_after_gate_failure(
-                context=context,
-                plan=plan,
-                resolution=resolution,
-                initial_bundle=analysis_bundle,
-                issues=audit_issues,
-                notes_hash=notes_hash,
-            )
-            analysis_issues = _find_analysis_bundle_quality_issues(analysis_bundle)
-            if analysis_issues:
-                raise JobExecutionError(
-                    "Analysis bundle failed evidence gate: " + " ".join(analysis_issues[:4]),
-                    stage="analyze",
-                )
-            analysis_audit = self._audit_analysis_bundle(context, plan, resolution, analysis_bundle)
-        if not bool(analysis_audit.get("accept")):
-            audit_issues = (
-                _normalize_text_list(analysis_audit.get("required_revisions"))
-                or _normalize_text_list(analysis_audit.get("model_warnings"))
-                or _normalize_text_list(analysis_audit.get("weak_or_unsupported_claims"))
-                or [str(analysis_audit.get("summary") or "Evidence audit rejected the analysis bundle.")]
-            )
-            raise JobExecutionError(
-                "Evidence audit rejected publication: " + " ".join(audit_issues[:4]),
-                stage="verify",
-            )
-
-        manuscript_bundle = self._write_manuscript_bundle(
-            context=context,
-            plan=plan,
-            resolution=resolution,
-            analysis_bundle=analysis_bundle,
-            analysis_audit=analysis_audit,
-            notes_hash=notes_hash,
-        )
-        bundle = self._merge_bundle_parts(
-            analysis_bundle=analysis_bundle,
-            manuscript_bundle=manuscript_bundle,
-            analysis_audit=analysis_audit,
-            plan=plan,
-            notes_hash=notes_hash,
-            resolution=resolution,
-        )
-        bundle_quality_issues = _find_bundle_quality_issues(bundle)
-        if not bundle_quality_issues:
-            return bundle
-
-        revised_bundle = self._revise_manuscript_after_gate_failure(
-            context=context,
-            plan=plan,
-            resolution=resolution,
-            analysis_bundle=analysis_bundle,
-            analysis_audit=analysis_audit,
-            initial_bundle=bundle,
-            issues=bundle_quality_issues,
-            notes_hash=notes_hash,
-        )
-        revised_issues = _find_bundle_quality_issues(revised_bundle)
-        if revised_issues:
-            raise JobExecutionError(
-                "Bundle failed publication gate: " + " ".join(revised_issues[:4]),
-                stage="write",
-            )
-        return revised_bundle
-
-    def _generate_analysis_bundle(
-        self,
-        *,
-        context: JobContext,
-        plan: dict[str, Any],
-        resolution: ResolutionBundle,
-        notes_hash: str,
-    ) -> dict[str, Any]:
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="inspect",
-            progress_message="Inspecting resolver-selected public data and preparing the analysis workspace.",
-        )
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="analyze",
-            progress_message="Running the analysis on OpenAI-hosted compute.",
-        )
-        instructions = """
-You are Sidekick's analyst running in Code Interpreter.
-Build the empirical evidence bundle only. Do not write the paper manuscript yet.
+You are Sidekick's research workspace.
+Use web search and the python tool to gather public evidence, analyze it, save real artifact files, and write a conservative ledger.
 Return strict JSON only with this exact shape:
 {
   "title": "string",
-  "analysis_files": [
+  "recommended_format": "string",
+  "summary": "string",
+  "limitations": ["string"],
+  "sources": [
     {
-      "path": "analysis.py",
-      "content": "string"
-    }
-  ],
-  "figures": [
-    {
-      "filename": "figure_1.png",
-      "caption": "string",
-      "mime_type": "image/png",
-      "base64_data": "..."
-    }
-  ],
-  "manifest": {
-    "entrypoint": "analysis.py",
-    "python_version": "3.11",
-    "run_command": "python analysis.py",
-    "notes_hash": "string",
-    "model": "string",
-    "dataset_sources": ["string"]
-  },
-  "provenance": {
-    "used_dataset_ids": ["string"],
-    "accessed_domains": ["string"],
-    "left_trusted_set": false,
-    "external_sources": ["string"],
-    "notes": "string"
-  },
-  "inspection": {
-    "dataset_manifest": {
-      "primary_dataset_ids": ["string"],
-      "data_sources": ["string"],
-      "sample_description": "string",
-      "row_count": 0,
-      "selected_variables": ["string"],
-      "quality_notes": ["string"]
-    },
-    "access_notes": "string",
-    "quality_checks": ["string"],
-    "analysis_checklist": ["string"]
-  },
-  "analysis": {
-    "dataset_manifest": {
-      "primary_dataset_ids": ["string"],
-      "data_sources": ["string"],
-      "sample_description": "string",
-      "row_count": 0,
-      "selected_variables": ["string"],
-      "quality_notes": ["string"]
-    },
-    "narrative_summary": "string",
-    "findings": [
-      {
-        "claim": "string",
-        "estimate": "string",
-        "uncertainty": "string",
-        "evidence": "string",
-        "supports_hypothesis": true
-      }
-    ],
-    "tables": [
-      {
-        "identifier": "table_1",
-        "title": "string",
-        "columns": ["string"],
-        "rows": [["string"]],
-        "notes": "string"
-      }
-    ],
-    "figures": [
-      {
-        "filename": "figure_1.png",
-        "caption": "string",
-        "mime_type": "image/png",
-        "base64_data": "..."
-      }
-    ],
-    "limitations": ["string"],
-    "provenance": {
-      "used_dataset_ids": ["string"],
-      "accessed_domains": ["string"],
-      "left_trusted_set": false,
-      "external_sources": ["string"],
+      "source_id": "source_1",
+      "label": "string",
+      "landing_page_url": "string",
+      "download_url": "string",
+      "accession_id": "string",
+      "api_endpoint": "string",
+      "api_query": "string or object",
       "notes": "string"
     }
-  }
+  ],
+  "artifacts": [
+    {
+      "artifact_id": "artifact_1",
+      "path": "artifacts/table_1.csv",
+      "kind": "table or figure or stats or notebook or log",
+      "mime_type": "text/csv",
+      "description": "string",
+      "source_ids": ["source_1"]
+    }
+  ],
+  "claims": [
+    {
+      "claim_id": "claim_1",
+      "text": "Conservative claim language only.",
+      "artifact_ids": ["artifact_1"],
+      "source_ids": ["source_1"],
+      "notes": "string"
+    }
+  ]
 }
 Rules:
-- Match the requested `resolution.paper_mode`. Do not silently change modes.
-- Treat the `resolution` input as authoritative. The selected candidate is the primary source unless the mode explicitly says otherwise.
-- Use Code Interpreter to identify, download, inspect, and analyze the resolver-selected public dataset.
-- Use web search only for dataset documentation and supporting methodological context. Do not substitute a different primary dataset.
-- Treat `dataset_hints` as optional suggestions only. They must not override the resolved source family or selected candidate.
-- Prefer the best available real open dataset even if it is small, niche, or imperfect. State limitations explicitly instead of blocking unless the data is not actually analyzable.
-- Do not use synthetic, simulated, illustrative, mock, toy, or placeholder data.
-- If real public data cannot be accessed and analyzed, return the best honest partial evidence bundle you can, explain the failure in provenance and inspection notes, and do not fabricate results.
-- `analysis_files` must include at minimum `analysis.py`, `requirements.txt`, and `Makefile`, and the code must reproduce the figures and tables from raw/public data.
-- `manifest.dataset_sources`, `inspection.dataset_manifest.primary_dataset_ids`, `analysis.dataset_manifest.primary_dataset_ids`, and `provenance.used_dataset_ids` must all be populated with real dataset identifiers or URLs and must account for the resolver-selected dataset.
-- `analysis.dataset_manifest.row_count` must reflect real analyzed data and be greater than zero whenever the source could actually be analyzed.
-- Keep repository paths and manuscript prose out of the output.
+- Save every cited artifact as a real file in the container. Do not inline binary data or giant tables into JSON.
+- Reference each saved file exactly by the filename or path you created so it can be retrieved later.
+- Claims must be conservative, uncertainty-aware, and narrower than the evidence if needed.
+- If a claim is not clearly supported by a real file artifact plus reproducible source provenance, omit it.
+- Source provenance must include reproducible retrieval information such as an accession id, direct download URL, or concrete API query. Landing pages alone are insufficient.
+- Prefer fewer honest claims over many weak claims.
+- Do not use synthetic, simulated, placeholder, demo, or draft language.
 """
         input_text = json.dumps(
             {
                 "title": context.request_payload["title"],
                 "theme": context.request_payload["theme"],
-                "dataset_hints": context.request_payload.get("dataset_hints", [])
-                or context.request_payload.get("dataset_ids", []),
-                "resolution": resolution.as_dict(),
-                "plan": plan,
-                "notes_hash": notes_hash,
                 "notes": context.request_payload["notes"],
             },
             sort_keys=True,
@@ -887,248 +474,260 @@ Rules:
             use_code_interpreter=True,
             use_web_search=True,
             timeout_seconds=self._config.backend_max_job_runtime_seconds,
-            model=self._config.openai_analysis_model,
+            model=self._config.openai_workspace_model,
         )
         self._database.update_paper_job(
             context.job["id"],
-            stage="verify",
-            progress_message="Analysis complete. Verifying evidence before manuscript writing.",
+            stage="inspect",
+            progress_message="Research workspace complete. Saving artifact receipts.",
             openai_response_id=response.response_id,
         )
         self._record_response_metrics(
             job_id=context.job["id"],
-            model=self._config.openai_analysis_model,
+            model=self._config.openai_workspace_model,
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
         )
-        return self._normalized_analysis_bundle(
+
+        ledger = _normalize_ledger(
             _extract_json_object(response.output_text),
-            notes_hash=notes_hash,
-            resolution=resolution,
+            title_fallback=str(context.request_payload.get("title") or "Research paper"),
         )
+        citations = self._openai_client.extract_container_file_citations(response)
+        downloaded_files = self._materialize_workspace_files(context.job["id"], ledger, citations)
+        self._apply_downloaded_files_to_ledger(ledger, downloaded_files)
+        _write_json_file(self._job_directory(context.job["id"]) / "ledger.json", ledger)
+        return ledger
 
-    def _normalized_analysis_bundle(
+    def _materialize_workspace_files(
         self,
-        bundle: dict[str, Any],
-        *,
-        notes_hash: str,
-        resolution: ResolutionBundle,
-    ) -> dict[str, Any]:
-        bundle["resolver"] = resolution.as_dict()
-        bundle["orchestration"] = self._orchestration_metadata()
-        bundle.setdefault("analysis_files", [])
-        bundle.setdefault("figures", [])
-        bundle.setdefault("provenance", {})
-        bundle.setdefault("inspection", {})
-        bundle.setdefault("analysis", {})
-        manifest = bundle.setdefault(
-            "manifest",
-            {
-                "entrypoint": "analysis.py",
-                "python_version": "3.11",
-                "run_command": "python analysis.py",
-                "notes_hash": notes_hash,
-                "model": self._config.openai_analysis_model,
-                "dataset_sources": [],
-            },
-        )
-        manifest.setdefault("entrypoint", "analysis.py")
-        manifest.setdefault("python_version", "3.11")
-        manifest.setdefault("run_command", "python analysis.py")
-        manifest.setdefault("notes_hash", notes_hash)
-        manifest.setdefault("model", self._config.openai_analysis_model)
-        manifest.setdefault("dataset_sources", [])
-        return bundle
+        job_id: str,
+        ledger: dict[str, Any],
+        citations: list[OpenAIContainerFileCitation],
+    ) -> list[DownloadedArtifactFile]:
+        workspace_directory = self._job_directory(job_id)
+        downloaded_files: list[DownloadedArtifactFile] = []
+        claimed_artifact_ids: set[str] = set()
 
-    def _revise_analysis_bundle_after_gate_failure(
+        for citation in citations:
+            metadata = self._openai_client.get_container_file_metadata(
+                container_id=citation.container_id,
+                file_id=citation.file_id,
+            )
+            raw_bytes = self._openai_client.download_container_file_bytes(
+                container_id=citation.container_id,
+                file_id=citation.file_id,
+            )
+
+            artifact = self._match_citation_to_artifact(ledger.get("artifacts", []), citation, metadata, claimed_artifact_ids)
+            artifact_id = str(artifact.get("artifact_id") or "").strip() if artifact is not None else None
+            declared_path = _artifact_path_value(artifact or {})
+            original_path = str(metadata.get("path") or "").strip()
+            fallback_name = Path(original_path or citation.filename or citation.file_id).name or f"{citation.file_id}.bin"
+            relative_path = _sanitize_relative_path(
+                declared_path if artifact_id else f"artifacts/unmatched/{fallback_name}",
+                fallback=f"artifacts/unmatched/{fallback_name}",
+            )
+            destination = workspace_directory / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(raw_bytes)
+
+            mime_type = str(metadata.get("mime_type") or "").strip() or _guess_mime_type(relative_path)
+            downloaded_file = DownloadedArtifactFile(
+                artifact_id=artifact_id,
+                container_id=citation.container_id,
+                file_id=citation.file_id,
+                filename=Path(relative_path).name,
+                relative_path=relative_path,
+                metadata_path=original_path,
+                mime_type=mime_type,
+                sha256=_sha256_bytes(raw_bytes),
+            )
+            downloaded_files.append(downloaded_file)
+            if artifact_id:
+                claimed_artifact_ids.add(artifact_id)
+
+        return downloaded_files
+
+    def _match_citation_to_artifact(
         self,
-        *,
-        context: JobContext,
-        plan: dict[str, Any],
-        resolution: ResolutionBundle,
-        initial_bundle: dict[str, Any],
-        issues: list[str],
-        notes_hash: str,
-    ) -> dict[str, Any]:
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="analyze",
-            progress_message="Evidence bundle failed checks. Revising the analysis on the resolved dataset.",
-        )
-        instructions = """
-You are Sidekick's analyst revising an evidence bundle after quality-gate failures.
-Return strict JSON only with the same analysis-only bundle schema as before.
-
-Rules:
-- Keep the `resolution` input authoritative. Do not switch to a different primary source unless it already appears in the resolver bundle.
-- Address every listed evidence-gate issue directly.
-- If the selected dataset is small or unusual but real and analyzable, keep it and write the limitations clearly instead of declaring failure.
-- Use web search again only for documentation or supporting methodology tied to the already-resolved source family.
-- Do not add manuscript text, LaTeX, or placeholder prose.
-- Do not use draft/demo/synthetic language.
-- If real public data still cannot be obtained or analyzed, be explicit in provenance and inspection notes rather than fabricating output.
-"""
-        input_text = json.dumps(
-            {
-                "title": context.request_payload["title"],
-                "theme": context.request_payload["theme"],
-                "notes": context.request_payload["notes"],
-                "plan": plan,
-                "resolution": resolution.as_dict(),
-                "notes_hash": notes_hash,
-                "failed_gate_issues": issues,
-                "previous_analysis_bundle": initial_bundle,
-            },
-            sort_keys=True,
-        )
-        response = self._openai_client.generate_json(
-            instructions=instructions,
-            input_text=input_text,
-            use_code_interpreter=True,
-            use_web_search=True,
-            timeout_seconds=self._config.backend_max_job_runtime_seconds,
-            model=self._config.openai_analysis_model,
-        )
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="verify",
-            progress_message="Revised analysis complete. Verifying evidence before manuscript writing.",
-            openai_response_id=response.response_id,
-        )
-        self._record_response_metrics(
-            job_id=context.job["id"],
-            model=self._config.openai_analysis_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-        return self._normalized_analysis_bundle(
-            _extract_json_object(response.output_text),
-            notes_hash=notes_hash,
-            resolution=resolution,
-        )
-
-    def _audit_analysis_bundle(
-        self,
-        context: JobContext,
-        plan: dict[str, Any],
-        resolution: ResolutionBundle,
-        analysis_bundle: dict[str, Any],
-    ) -> dict[str, Any]:
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="verify",
-            progress_message="Verifying evidence quality before manuscript writing.",
-        )
-        instructions = """
-You are Sidekick's evidence auditor.
-Review the analysis bundle only and decide whether it is strong enough to support manuscript writing.
-Return strict JSON only with this exact shape:
-{
-  "accept": true,
-  "summary": "string",
-  "supported_claims": ["string"],
-  "weak_or_unsupported_claims": ["string"],
-  "model_warnings": ["string"],
-  "sample_warnings": ["string"],
-  "required_revisions": ["string"]
-}
-Acceptance standard:
-- Reject any analysis bundle that uses synthetic, simulated, illustrative, demo, mock, or placeholder data.
-- Reject any analysis bundle that lacks real dataset identifiers, positive row counts, executable reproducibility files, concrete findings, or final figure outputs.
-- Reject any evidence bundle that does not support conservative empirical claims from the resolver-selected source family.
-- Prefer false negatives over false positives.
-"""
-        audit_input = json.dumps(
-            {
-                "plan": plan,
-                "resolution": resolution.as_dict(),
-                "analysis_bundle": analysis_bundle,
-            },
-            sort_keys=True,
-        )
-        response = self._openai_client.generate_json(
-            instructions=instructions,
-            input_text=audit_input,
-            use_code_interpreter=False,
-            timeout_seconds=min(600, self._config.backend_max_job_runtime_seconds),
-            model=self._config.openai_auditor_model,
-        )
-        self._record_response_metrics(
-            job_id=context.job["id"],
-            model=self._config.openai_auditor_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-        audit = _extract_json_object(response.output_text)
-        return {
-            "accept": bool(audit.get("accept")),
-            "summary": str(audit.get("summary") or "").strip(),
-            "supported_claims": _normalize_text_list(audit.get("supported_claims")),
-            "weak_or_unsupported_claims": _normalize_text_list(audit.get("weak_or_unsupported_claims")),
-            "model_warnings": _normalize_text_list(audit.get("model_warnings")),
-            "sample_warnings": _normalize_text_list(audit.get("sample_warnings")),
-            "required_revisions": _normalize_text_list(audit.get("required_revisions")),
+        artifacts: list[dict[str, Any]],
+        citation: OpenAIContainerFileCitation,
+        metadata: dict[str, Any],
+        claimed_artifact_ids: set[str],
+    ) -> dict[str, Any] | None:
+        candidates = {
+            citation.annotated_text.strip().strip("\"'"),
+            citation.filename.strip(),
+            Path(str(metadata.get("path") or citation.filename or "")).name,
         }
+        candidates = {candidate for candidate in candidates if candidate}
 
-    def _write_manuscript_bundle(
-        self,
-        *,
-        context: JobContext,
-        plan: dict[str, Any],
-        resolution: ResolutionBundle,
-        analysis_bundle: dict[str, Any],
-        analysis_audit: dict[str, Any],
-        notes_hash: str,
-    ) -> dict[str, Any]:
+        for artifact in artifacts:
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            if not artifact_id or artifact_id in claimed_artifact_ids:
+                continue
+            declared_path = _artifact_path_value(artifact)
+            if not declared_path:
+                continue
+            declared_basename = Path(declared_path).name
+            if declared_path in candidates or declared_basename in candidates:
+                return artifact
+        return None
+
+    def _apply_downloaded_files_to_ledger(self, ledger: dict[str, Any], downloaded_files: list[DownloadedArtifactFile]) -> None:
+        by_artifact_id = {
+            downloaded_file.artifact_id: downloaded_file
+            for downloaded_file in downloaded_files
+            if downloaded_file.artifact_id
+        }
+        artifact_files: list[dict[str, Any]] = []
+        for artifact in ledger.get("artifacts", []):
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            downloaded_file = by_artifact_id.get(artifact_id)
+            if downloaded_file is None:
+                continue
+            artifact["path"] = downloaded_file.relative_path
+            artifact["mime_type"] = artifact.get("mime_type") or downloaded_file.mime_type
+            artifact["sha256"] = downloaded_file.sha256
+            artifact_files.append(
+                {
+                    "artifact_id": artifact_id,
+                    "path": downloaded_file.relative_path,
+                    "mime_type": artifact.get("mime_type") or downloaded_file.mime_type,
+                    "sha256": downloaded_file.sha256,
+                }
+            )
+        ledger["artifact_files"] = artifact_files
+
+    def _validate_ledger(self, job_id: str, ledger: dict[str, Any]) -> dict[str, Any]:
+        self._database.update_paper_job(
+            job_id,
+            stage="verify",
+            progress_message="Verifying ledger receipts and approved claims.",
+        )
+        job_directory = self._job_directory(job_id)
+        valid_sources: dict[str, dict[str, Any]] = {}
+        source_issues: list[str] = []
+        for source in ledger.get("sources", []):
+            if not isinstance(source, dict):
+                continue
+            source_id = str(source.get("source_id") or "").strip()
+            if not source_id:
+                continue
+            if _source_has_reproducible_receipt(source):
+                valid_sources[source_id] = source
+            else:
+                source_issues.append(f"{source_id} is missing reproducible retrieval info.")
+
+        valid_artifacts: dict[str, dict[str, Any]] = {}
+        artifact_issues: list[str] = []
+        for artifact in ledger.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            artifact_path = _sanitize_relative_path(
+                _artifact_path_value(artifact),
+                fallback=f"artifacts/{artifact_id or 'artifact'}",
+            )
+            path = job_directory / artifact_path
+            if artifact_id and path.exists() and path.is_file():
+                artifact["path"] = artifact_path
+                artifact["mime_type"] = artifact.get("mime_type") or _guess_mime_type(artifact_path)
+                valid_artifacts[artifact_id] = artifact
+            elif artifact_id:
+                artifact_issues.append(f"{artifact_id} does not resolve to a saved file.")
+
+        approved_claims: list[dict[str, Any]] = []
+        dropped_claims: list[dict[str, Any]] = []
+        for claim in ledger.get("claims", []):
+            if not isinstance(claim, dict):
+                continue
+            claim_id = str(claim.get("claim_id") or "").strip()
+            text = str(claim.get("text") or "").strip()
+            artifact_ids = [artifact_id for artifact_id in _normalize_text_list(claim.get("artifact_ids")) if artifact_id in valid_artifacts]
+            source_ids = [source_id for source_id in _normalize_text_list(claim.get("source_ids")) if source_id in valid_sources]
+            if not source_ids:
+                for artifact_id in artifact_ids:
+                    for source_id in _artifact_source_ids(valid_artifacts[artifact_id]):
+                        if source_id in valid_sources and source_id not in source_ids:
+                            source_ids.append(source_id)
+
+            reasons: list[str] = []
+            if not text:
+                reasons.append("claim text is empty")
+            banned_hits = _find_banned_phrases(text)
+            if banned_hits:
+                reasons.append("claim uses banned language: " + ", ".join(banned_hits))
+            if not artifact_ids:
+                reasons.append("claim does not reference a saved artifact")
+            if not source_ids:
+                reasons.append("claim does not resolve to reproducible source provenance")
+
+            if reasons:
+                dropped_claims.append({"claim_id": claim_id or "claim", "reasons": reasons, "text": text})
+                continue
+
+            approved_claims.append(
+                {
+                    "claim_id": claim_id or f"claim_{len(approved_claims) + 1}",
+                    "text": text,
+                    "artifact_ids": artifact_ids,
+                    "source_ids": source_ids,
+                    "notes": str(claim.get("notes") or "").strip(),
+                }
+            )
+
+        validation_issues = source_issues + artifact_issues
+        status = "approved" if approved_claims else "blocked"
+        final_format = str(ledger.get("recommended_format") or "brief_report").strip() or "brief_report"
+        if not approved_claims:
+            final_format = "blocked"
+
+        validation = {
+            "status": status,
+            "final_format": final_format,
+            "approved_claims": approved_claims,
+            "approved_claim_ids": [claim["claim_id"] for claim in approved_claims],
+            "dropped_claims": dropped_claims,
+            "validation_issues": validation_issues,
+            "summary": (
+                f"Approved {len(approved_claims)} claim(s) for writing."
+                if approved_claims
+                else "Blocked because zero claims survived validation."
+            ),
+        }
+        _write_json_file(job_directory / "validation.json", validation)
+        return validation
+
+    def _write_bundle(self, context: JobContext, ledger: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
         self._database.update_paper_job(
             context.job["id"],
             stage="write",
-            progress_message="Writing paper from the verified evidence bundle.",
+            progress_message="Writing markdown from the approved claims.",
         )
         instructions = """
-You are Sidekick's manuscript writer.
-You receive a verified evidence bundle. Write the paper from that bundle only.
+You are Sidekick's paper writer.
+You receive a validated ledger and must write markdown only from the approved claims.
 Return strict JSON only with this exact shape:
 {
   "title": "string",
-  "markdown": "string",
-  "latex": "string",
-  "verification": {
-    "decision": "proceed or revise_analysis or blocked",
-    "summary": "string",
-    "supported_claims": ["string"],
-    "weak_or_unsupported_claims": ["string"],
-    "figure_sanity_checks": [
-      {
-        "filename": "figure_1.png",
-        "status": "ok or warning or missing",
-        "issue": "string"
-      }
-    ],
-    "model_warnings": ["string"],
-    "sample_warnings": ["string"],
-    "required_revisions": ["string"]
-  }
+  "markdown": "string"
 }
 Rules:
-- Use the provided evidence bundle and evidence audit as the empirical basis. Do not redo discovery or invent new data.
-- You may use web search for supporting citations, dataset documentation, and methodological references, but not to replace the primary data source.
-- Write a professional arXiv-style paper with Abstract, Introduction, Methods, Results, Discussion, Limitations, and References.
-- Include inline citations in the paper body and a non-trivial references section.
-- Keep claims conservative and aligned with the evidence audit.
-- If the evidence audit reports blocking weaknesses, surface them honestly in `verification` rather than hiding them.
-- Do not use draft/demo/synthetic language.
+- Use only `validation.approved_claims` as factual claims. Do not add new claims, findings, estimates, or sources.
+- Use `validation.final_format` as authoritative editorial guidance. Do not upgrade the format.
+- Use `ledger.sources` only for references that support approved claims.
+- Include the ledger limitations honestly.
+- Keep language conservative and uncertainty-aware.
+- Do not use draft, demo, placeholder, simulated, synthetic, or definitive-proof language.
 """
         input_text = json.dumps(
             {
                 "title": context.request_payload["title"],
                 "theme": context.request_payload["theme"],
-                "notes_hash": notes_hash,
-                "notes": context.request_payload["notes"],
-                "plan": plan,
-                "resolution": resolution.as_dict(),
-                "analysis_bundle": analysis_bundle,
-                "analysis_audit": analysis_audit,
+                "ledger": ledger,
+                "validation": validation,
             },
             sort_keys=True,
         )
@@ -1136,14 +735,14 @@ Rules:
             instructions=instructions,
             input_text=input_text,
             use_code_interpreter=False,
-            use_web_search=True,
+            use_web_search=False,
             timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
             model=self._config.openai_writer_model,
         )
         self._database.update_paper_job(
             context.job["id"],
             stage="write",
-            progress_message="Paper draft complete. Running the publication gate.",
+            progress_message="Markdown complete. Publishing the validated bundle.",
             openai_response_id=response.response_id,
         )
         self._record_response_metrics(
@@ -1152,179 +751,62 @@ Rules:
             input_tokens=response.usage.input_tokens,
             output_tokens=response.usage.output_tokens,
         )
-        manuscript_bundle = _extract_json_object(response.output_text)
-        if not isinstance(manuscript_bundle.get("verification"), dict):
-            manuscript_bundle["verification"] = {}
-        return manuscript_bundle
 
-    def _merge_bundle_parts(
-        self,
-        *,
-        analysis_bundle: dict[str, Any],
-        manuscript_bundle: dict[str, Any],
-        analysis_audit: dict[str, Any],
-        plan: dict[str, Any],
-        notes_hash: str,
-        resolution: ResolutionBundle,
-    ) -> dict[str, Any]:
-        bundle = dict(analysis_bundle)
-        title = (
-            str(manuscript_bundle.get("title") or "").strip()
-            or str(analysis_bundle.get("title") or "").strip()
-        )
-        bundle["title"] = title
-        bundle["markdown"] = str(manuscript_bundle.get("markdown") or "").strip()
-        bundle["latex"] = str(manuscript_bundle.get("latex") or "").strip()
-        bundle["plan"] = plan
-        bundle["resolver"] = resolution.as_dict()
-        bundle["orchestration"] = self._orchestration_metadata()
+        written = _extract_json_object(response.output_text)
+        title = str(written.get("title") or ledger.get("title") or context.request_payload["title"]).strip() or context.request_payload["title"]
+        markdown = str(written.get("markdown") or "").strip()
+        if not markdown:
+            raise JobExecutionError("Writer did not return markdown.", stage="write")
+        if _find_banned_phrases(markdown):
+            raise JobExecutionError("Writer returned banned language in markdown.", stage="write")
 
-        manifest = bundle.setdefault(
-            "manifest",
-            {
-                "entrypoint": "analysis.py",
-                "python_version": "3.11",
-                "run_command": "python analysis.py",
-                "notes_hash": notes_hash,
-                "model": self._config.openai_analysis_model,
-                "dataset_sources": [],
-            },
-        )
-        manifest.setdefault("entrypoint", "analysis.py")
-        manifest.setdefault("python_version", "3.11")
-        manifest.setdefault("run_command", "python analysis.py")
-        manifest["notes_hash"] = notes_hash
-        manifest.setdefault("dataset_sources", [])
-        manifest["model"] = self._config.openai_analysis_model
-
-        verification = manuscript_bundle.get("verification") if isinstance(manuscript_bundle.get("verification"), dict) else {}
-        decision = str(verification.get("decision") or "").strip() or ("proceed" if analysis_audit.get("accept") else "revise_analysis")
-        supported_claims = _normalize_text_list(verification.get("supported_claims")) or _normalize_text_list(
-            analysis_audit.get("supported_claims")
-        )
-        weak_claims = _normalize_text_list(verification.get("weak_or_unsupported_claims")) or _normalize_text_list(
-            analysis_audit.get("weak_or_unsupported_claims")
-        )
-        model_warnings = _normalize_text_list(verification.get("model_warnings")) or _normalize_text_list(
-            analysis_audit.get("model_warnings")
-        )
-        sample_warnings = _normalize_text_list(verification.get("sample_warnings")) or _normalize_text_list(
-            analysis_audit.get("sample_warnings")
-        )
-        required_revisions = _normalize_text_list(verification.get("required_revisions"))
-        audit_required_revisions = [] if analysis_audit.get("accept") else _normalize_text_list(
-            analysis_audit.get("required_revisions")
-        )
-        for revision in audit_required_revisions:
-            if revision not in required_revisions:
-                required_revisions.append(revision)
-
-        figure_sanity_checks = verification.get("figure_sanity_checks")
-        if not isinstance(figure_sanity_checks, list) or not figure_sanity_checks:
-            figure_sanity_checks = [
-                {
-                    "filename": str(figure.get("filename") or ""),
-                    "status": "ok",
-                    "issue": "",
-                }
-                for figure in bundle.get("figures", []) or []
-                if isinstance(figure, dict) and str(figure.get("filename") or "").strip()
-            ]
-
-        bundle["verification"] = {
-            "decision": decision,
-            "summary": str(verification.get("summary") or analysis_audit.get("summary") or "").strip(),
-            "supported_claims": supported_claims,
-            "weak_or_unsupported_claims": weak_claims,
-            "figure_sanity_checks": figure_sanity_checks,
-            "model_warnings": model_warnings,
-            "sample_warnings": sample_warnings,
-            "required_revisions": required_revisions,
-            "audit_summary": str(analysis_audit.get("summary") or "").strip(),
+        figures = self._bundle_figures_from_ledger(context.job["id"], ledger)
+        verification = _build_verification_payload(validation, figures)
+        provenance = _build_task_provenance(ledger)
+        bundle = {
+            "title": title,
+            "markdown": markdown,
+            "latex": "",
+            "figures": figures,
+            "provenance": provenance,
+            "verification": verification,
+            "draft": {"title": title, "markdown": markdown},
+            "ledger": ledger,
+            "validation": validation,
+            "artifact_files": ledger.get("artifact_files", []),
         }
-        bundle["draft"] = {"title": title, "markdown": bundle["markdown"]}
         return bundle
 
-    def _revise_manuscript_after_gate_failure(
-        self,
-        *,
-        context: JobContext,
-        plan: dict[str, Any],
-        resolution: ResolutionBundle,
-        analysis_bundle: dict[str, Any],
-        analysis_audit: dict[str, Any],
-        initial_bundle: dict[str, Any],
-        issues: list[str],
-        notes_hash: str,
-    ) -> dict[str, Any]:
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="write",
-            progress_message="Strengthening the manuscript after publication-gate feedback.",
-        )
-        instructions = """
-You are revising a scientific manuscript after a publication gate failure.
-You may revise the manuscript and verification block only. Do not change the underlying evidence bundle.
-Return strict JSON only with the same manuscript-only schema as before.
-
-Rules:
-- Use the provided evidence bundle and evidence audit as authoritative.
-- Address every listed publication-gate issue directly.
-- If the paper is too short or missing sections, references, dataset accounting, or citation markers, fix those.
-- Do not use draft/demo/synthetic language.
-- Do not change figures, tables, code, dataset manifests, or provenance except through the manuscript's discussion and verification summary.
-"""
-        input_text = json.dumps(
-            {
-                "title": context.request_payload["title"],
-                "theme": context.request_payload["theme"],
-                "notes": context.request_payload["notes"],
-                "plan": plan,
-                "resolution": resolution.as_dict(),
-                "notes_hash": notes_hash,
-                "failed_gate_issues": issues,
-                "analysis_bundle": analysis_bundle,
-                "analysis_audit": analysis_audit,
-                "previous_bundle": initial_bundle,
-            },
-            sort_keys=True,
-        )
-        response = self._openai_client.generate_json(
-            instructions=instructions,
-            input_text=input_text,
-            use_code_interpreter=False,
-            use_web_search=True,
-            timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
-            model=self._config.openai_writer_model,
-        )
-        self._record_response_metrics(
-            job_id=context.job["id"],
-            model=self._config.openai_writer_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-        manuscript_bundle = _extract_json_object(response.output_text)
-        if not isinstance(manuscript_bundle.get("verification"), dict):
-            manuscript_bundle["verification"] = {}
-        return self._merge_bundle_parts(
-            analysis_bundle=analysis_bundle,
-            manuscript_bundle=manuscript_bundle,
-            analysis_audit=analysis_audit,
-            plan=plan,
-            notes_hash=notes_hash,
-            resolution=resolution,
-        )
+    def _bundle_figures_from_ledger(self, job_id: str, ledger: dict[str, Any]) -> list[dict[str, Any]]:
+        figures: list[dict[str, Any]] = []
+        job_directory = self._job_directory(job_id)
+        for artifact in ledger.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            artifact_path = str(artifact.get("path") or "").strip()
+            mime_type = str(artifact.get("mime_type") or "").strip() or _guess_mime_type(artifact_path)
+            if not artifact_path or not mime_type.startswith("image/"):
+                continue
+            path = job_directory / artifact_path
+            if not path.exists() or not path.is_file():
+                continue
+            figures.append(
+                {
+                    "filename": path.name,
+                    "caption": str(artifact.get("description") or "").strip(),
+                    "mime_type": mime_type,
+                    "base64_data": base64.b64encode(path.read_bytes()).decode("utf-8"),
+                }
+            )
+        return figures
 
     def _publish_bundle(self, context: JobContext, bundle: dict[str, Any]) -> dict[str, Any]:
         self._database.update_paper_job(
             context.job["id"],
             stage="write",
-            progress_message="Publishing LaTeX and reproducibility code to the user GitHub repository.",
+            progress_message="Publishing markdown, ledger, validation, and artifacts to GitHub.",
         )
-        access_token = decrypt_text(
-            context.github_connection["access_token_encrypted"],
-            self._config.encryption_secret,
-        )
+        access_token = decrypt_text(context.github_connection["access_token_encrypted"], self._config.encryption_secret)
         owner = context.github_connection["repo_owner"]
         repo_name = context.github_connection["repo_name"]
         title = str(bundle.get("title") or context.request_payload["title"]).strip() or context.request_payload["title"]
@@ -1333,7 +815,7 @@ Rules:
         directory = f"papers/{date_prefix}-{slug}-{context.job['id'][:6]}"
         commit_message = f"Add paper: {title}"
 
-        root_readme = f"""# Sidekick Research
+        root_readme = """# Sidekick Research
 
 This repository stores reproducible paper bundles published by Sidekick.
 """
@@ -1351,12 +833,10 @@ This repository stores reproducible paper bundles published by Sidekick.
 Generated by Sidekick.
 
 - Paper markdown: `paper.md`
-- Paper LaTeX: `paper.tex`
-- Resolver trace: `resolver.json`
-- Reproducibility entrypoint: `{bundle['manifest'].get('entrypoint', 'analysis.py')}`
-- Run command: `{bundle['manifest'].get('run_command', 'python analysis.py')}`
+- Research workspace ledger: `ledger.json`
+- Validation lockfile: `validation.json`
+- Reproducibility artifacts: `artifacts/`
 """
-        latest_commit_sha = ""
         latest_commit = self._github_client.commit_text_file(
             access_token,
             owner=owner,
@@ -1369,13 +849,8 @@ Generated by Sidekick.
 
         text_files = {
             f"{directory}/paper.md": str(bundle.get("markdown") or ""),
-            f"{directory}/paper.tex": str(bundle.get("latex") or ""),
-            f"{directory}/manifest.json": json.dumps(bundle.get("manifest") or {}, indent=2, sort_keys=True),
-            f"{directory}/plan.json": json.dumps(bundle.get("plan") or {}, indent=2, sort_keys=True),
-            f"{directory}/resolver.json": json.dumps(bundle.get("resolver") or {}, indent=2, sort_keys=True),
-            f"{directory}/inspection.json": json.dumps(bundle.get("inspection") or {}, indent=2, sort_keys=True),
-            f"{directory}/analysis.json": json.dumps(bundle.get("analysis") or {}, indent=2, sort_keys=True),
-            f"{directory}/verification.json": json.dumps(bundle.get("verification") or {}, indent=2, sort_keys=True),
+            f"{directory}/ledger.json": json.dumps(bundle.get("ledger") or {}, indent=2, sort_keys=True),
+            f"{directory}/validation.json": json.dumps(bundle.get("validation") or {}, indent=2, sort_keys=True),
             f"{directory}/provenance.json": json.dumps(bundle.get("provenance") or {}, indent=2, sort_keys=True),
         }
         for file_path, content in text_files.items():
@@ -1388,33 +863,39 @@ Generated by Sidekick.
                 message=commit_message,
             ).sha
 
-        for file_entry in bundle.get("analysis_files", []) or []:
-            path = str(file_entry.get("path") or "").strip()
-            if not path:
+        job_directory = self._job_directory(context.job["id"])
+        for artifact_file in bundle.get("artifact_files", []) or []:
+            if not isinstance(artifact_file, dict):
                 continue
-            content = str(file_entry.get("content") or "")
-            latest_commit_sha = self._github_client.commit_text_file(
-                access_token,
-                owner=owner,
-                repo_name=repo_name,
-                path=f"{directory}/{path}",
-                content=content,
-                message=commit_message,
-            ).sha
-
-        for figure in bundle.get("figures", []) or []:
-            filename = str(figure.get("filename") or "").strip()
-            raw = str(figure.get("base64_data") or "").encode("utf-8")
-            if not filename or not raw:
+            relative_path = _sanitize_relative_path(
+                str(artifact_file.get("path") or "").strip(),
+                fallback="artifacts/file.bin",
+            )
+            local_path = job_directory / relative_path
+            if not local_path.exists() or not local_path.is_file():
                 continue
-            latest_commit_sha = self._github_client.commit_binary_file(
-                access_token,
-                owner=owner,
-                repo_name=repo_name,
-                path=f"{directory}/figures/{filename}",
-                raw_bytes=base64.b64decode(raw),
-                message=commit_message,
-            ).sha
+            repo_path = f"{directory}/{relative_path}"
+            raw_bytes = local_path.read_bytes()
+            try:
+                content = raw_bytes.decode("utf-8")
+            except UnicodeDecodeError:
+                latest_commit_sha = self._github_client.commit_binary_file(
+                    access_token,
+                    owner=owner,
+                    repo_name=repo_name,
+                    path=repo_path,
+                    raw_bytes=raw_bytes,
+                    message=commit_message,
+                ).sha
+            else:
+                latest_commit_sha = self._github_client.commit_text_file(
+                    access_token,
+                    owner=owner,
+                    repo_name=repo_name,
+                    path=repo_path,
+                    content=content,
+                    message=commit_message,
+                ).sha
 
         return {
             "repo_url": context.github_connection["repo_url"],
@@ -1423,14 +904,8 @@ Generated by Sidekick.
             "published_at": iso_now(),
         }
 
-    def _persist_artifacts(
-        self,
-        job_id: str,
-        bundle: dict[str, Any],
-        publication: dict[str, Any],
-    ) -> None:
-        job_directory = self._config.artifact_root / job_id
-        _write_json_file(job_directory / "bundle.json", {"bundle": bundle, "publication": publication})
+    def _persist_artifacts(self, job_id: str, bundle: dict[str, Any], publication: dict[str, Any]) -> None:
+        _write_json_file(self._job_directory(job_id) / "bundle.json", {"bundle": bundle, "publication": publication})
 
     def _cleanup_expired_artifacts(self) -> None:
         root = self._config.artifact_root
@@ -1447,6 +922,11 @@ Generated by Sidekick.
                 shutil.rmtree(child, ignore_errors=True)
             else:
                 child.unlink(missing_ok=True)
+
+    def _job_directory(self, job_id: str) -> Path:
+        directory = self._config.artifact_root / job_id
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
 
     def _estimate_cost(self, input_tokens: int, output_tokens: int) -> float:
         return (
@@ -1511,11 +991,11 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
             if job is None or job["install_session_id"] != install_session["id"]:
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "unknown_job"})
                 return
-            job_directory = self.server.config.artifact_root / job_id / "bundle.json"
-            if not job_directory.exists():
+            artifact_file = self.server.config.artifact_root / job_id / "bundle.json"
+            if not artifact_file.exists():
                 self._send_json(HTTPStatus.NOT_FOUND, {"error": "artifacts_unavailable"})
                 return
-            payload = _read_json_file(job_directory)
+            payload = _read_json_file(artifact_file)
             self._send_json(HTTPStatus.OK, payload)
             return
 
@@ -1541,10 +1021,7 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                     return
                 session_id = str(decoded_state.get("session_id") or "").strip()
                 if session_id:
-                    self.server.database.update_github_connect_session(
-                        session_id,
-                        status="redirected_to_github",
-                    )
+                    self.server.database.update_github_connect_session(session_id, status="redirected_to_github")
                 self._redirect(self.server.github_client.build_user_authorization_url(signed_state))
                 return
 
@@ -1555,10 +1032,7 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                 return
 
             signed_state = self._build_signed_connect_state(session)
-            self.server.database.update_github_connect_session(
-                session_id,
-                status="redirected_to_github",
-            )
+            self.server.database.update_github_connect_session(session_id, status="redirected_to_github")
             self._redirect(self.server.github_client.build_user_authorization_url(signed_state))
             return
 
@@ -1616,8 +1090,7 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
             if not isinstance(notes, list) or not notes:
                 self._send_json(HTTPStatus.BAD_REQUEST, {"error": "missing_notes"})
                 return
-            clusters = self._assess_notes(notes)
-            self._send_json(HTTPStatus.OK, {"clusters": clusters})
+            self._send_json(HTTPStatus.OK, {"clusters": self._assess_notes(notes)})
             return
 
         if parsed.path == "/api/papers":
@@ -1632,17 +1105,17 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
             if connection is None:
                 self._send_json(
                     HTTPStatus.CONFLICT,
-                    {"error": "github_required", "message": "GitHub must be connected before Sidekick can generate a paper."},
+                    {
+                        "error": "github_required",
+                        "message": "GitHub must be connected before Sidekick can generate a paper.",
+                    },
                 )
                 return
 
             since = (utc_now() - timedelta(days=1)).isoformat()
             recent_jobs = self.server.database.count_recent_jobs_for_install(install_session["id"], since)
             if recent_jobs >= self.server.config.backend_max_jobs_per_install_per_day:
-                self._send_json(
-                    HTTPStatus.TOO_MANY_REQUESTS,
-                    {"error": "install_daily_limit_reached"},
-                )
+                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "install_daily_limit_reached"})
                 return
 
             payload = self._read_json_body()
@@ -1658,7 +1131,7 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                 "theme": theme,
                 "notes": notes,
                 "dataset_ids": payload.get("dataset_ids") or [],
-                "dataset_hints": payload.get("dataset_hints") or [],
+                "dataset_hints": [],
                 "allowed_domains": payload.get("allowed_domains") or [],
             }
             job = self.server.database.create_paper_job(
@@ -1766,11 +1239,7 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
 
         if oauth_error:
             message = error_description or oauth_error
-            self.server.database.update_github_connect_session(
-                session["id"],
-                status="failed",
-                error_message=message,
-            )
+            self.server.database.update_github_connect_session(session["id"], status="failed", error_message=message)
             self._send_text(HTTPStatus.BAD_REQUEST, message)
             return
 
@@ -1786,10 +1255,7 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
         try:
             access_token = self.server.github_client.exchange_code_for_user_token(code)
             user = self.server.github_client.fetch_authenticated_user(access_token)
-            repo = self.server.github_client.ensure_sidekick_repository(
-                access_token,
-                owner=user.login,
-            )
+            repo = self.server.github_client.ensure_sidekick_repository(access_token, owner=user.login)
             self.server.database.upsert_github_connection(
                 install_session_id=session["install_session_id"],
                 github_login=user.login,
@@ -1797,24 +1263,13 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                 repo_name=repo.name,
                 repo_full_name=repo.full_name,
                 repo_url=repo.html_url or f"https://github.com/{repo.full_name}",
-                access_token_encrypted=encrypt_text(
-                    access_token,
-                    self.server.config.encryption_secret,
-                ),
+                access_token_encrypted=encrypt_text(access_token, self.server.config.encryption_secret),
                 visibility=repo.visibility,
             )
-            self.server.database.update_github_connect_session(
-                session["id"],
-                status="completed",
-                error_message=None,
-            )
+            self.server.database.update_github_connect_session(session["id"], status="completed", error_message=None)
             self._send_text(HTTPStatus.OK, "GitHub connected. You can return to Sidekick.")
         except GitHubClientError as error:
-            self.server.database.update_github_connect_session(
-                session["id"],
-                status="failed",
-                error_message=str(error),
-            )
+            self.server.database.update_github_connect_session(session["id"], status="failed", error_message=str(error))
             self._send_text(HTTPStatus.BAD_GATEWAY, str(error))
 
     def _require_install_session(self) -> dict[str, Any] | None:

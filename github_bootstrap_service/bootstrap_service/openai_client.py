@@ -21,10 +21,19 @@ class OpenAIUsage:
 
 
 @dataclass(frozen=True)
+class OpenAIContainerFileCitation:
+    container_id: str
+    file_id: str
+    filename: str
+    annotated_text: str
+
+
+@dataclass(frozen=True)
 class OpenAIResponseResult:
     response_id: str
     output_text: str
     usage: OpenAIUsage
+    payload: dict[str, Any]
 
 
 class OpenAIClient:
@@ -55,9 +64,7 @@ class OpenAIClient:
             else reasoning_effort.strip()
         )
         if selected_reasoning_effort:
-            payload["reasoning"] = {
-                "effort": selected_reasoning_effort,
-            }
+            payload["reasoning"] = {"effort": selected_reasoning_effort}
 
         tools: list[dict[str, Any]] = []
         if use_web_search:
@@ -86,6 +93,7 @@ class OpenAIClient:
                     response_id=response_id,
                     output_text=self._output_text(latest),
                     usage=self._usage(latest),
+                    payload=latest,
                 )
             if status in {"failed", "cancelled", "incomplete", "expired"}:
                 error_message = self._error_message(latest)
@@ -96,13 +104,78 @@ class OpenAIClient:
 
         raise OpenAIClientError("OpenAI response exceeded the configured timeout.")
 
+    def extract_container_file_citations(self, response: OpenAIResponseResult) -> list[OpenAIContainerFileCitation]:
+        citations: list[OpenAIContainerFileCitation] = []
+        seen: set[tuple[str, str, str, str]] = set()
+
+        for item in response.payload.get("output", []) or []:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("type") or "").strip() != "message":
+                continue
+
+            for content in item.get("content", []) or []:
+                if not isinstance(content, dict):
+                    continue
+                if str(content.get("type") or "").strip() != "output_text":
+                    continue
+
+                text = str(content.get("text") or "")
+                for annotation in content.get("annotations", []) or []:
+                    if not isinstance(annotation, dict):
+                        continue
+                    if str(annotation.get("type") or "").strip() != "container_file_citation":
+                        continue
+
+                    container_id = str(annotation.get("container_id") or "").strip()
+                    file_id = str(annotation.get("file_id") or "").strip()
+                    filename = str(annotation.get("filename") or "").strip()
+                    start_index = annotation.get("start_index")
+                    end_index = annotation.get("end_index")
+                    annotated_text = ""
+                    if isinstance(start_index, int) and isinstance(end_index, int) and 0 <= start_index <= end_index <= len(text):
+                        annotated_text = text[start_index:end_index]
+                    key = (container_id, file_id, filename, annotated_text)
+                    if not container_id or not file_id or key in seen:
+                        continue
+                    seen.add(key)
+                    citations.append(
+                        OpenAIContainerFileCitation(
+                            container_id=container_id,
+                            file_id=file_id,
+                            filename=filename,
+                            annotated_text=annotated_text,
+                        )
+                    )
+
+        return citations
+
+    def get_container_file_metadata(self, *, container_id: str, file_id: str) -> dict[str, Any]:
+        return self._request_json("GET", f"/containers/{container_id}/files/{file_id}", None)
+
+    def download_container_file_bytes(self, *, container_id: str, file_id: str) -> bytes:
+        return self._request_bytes("GET", f"/containers/{container_id}/files/{file_id}/content")
+
     def _request_json(self, method: str, path: str, body: dict[str, Any] | None) -> dict[str, Any]:
+        payload = self._request(method, path, body, expect_json=True)
+        if not isinstance(payload, dict):
+            raise OpenAIClientError("OpenAI returned an unexpected JSON payload.")
+        return payload
+
+    def _request_bytes(self, method: str, path: str) -> bytes:
+        payload = self._request(method, path, None, expect_json=False)
+        if not isinstance(payload, bytes):
+            raise OpenAIClientError("OpenAI returned an unexpected binary payload.")
+        return payload
+
+    def _request(self, method: str, path: str, body: dict[str, Any] | None, *, expect_json: bool) -> dict[str, Any] | bytes:
         url = f"{self._config.openai_base_url.rstrip('/')}{path}"
-        headers = {
-            "Authorization": f"Bearer {self._config.openai_api_key}",
-            "Content-Type": "application/json",
-        }
-        data = json.dumps(body).encode("utf-8") if body is not None else None
+        headers = {"Authorization": f"Bearer {self._config.openai_api_key}"}
+        data: bytes | None = None
+        if body is not None:
+            headers["Content-Type"] = "application/json"
+            data = json.dumps(body).encode("utf-8")
+
         request = Request(url=url, data=data, headers=headers, method=method)
 
         try:
@@ -114,6 +187,8 @@ class OpenAIClient:
         except URLError as error:
             raise OpenAIClientError(f"OpenAI request failed: {error.reason}") from error
 
+        if not expect_json:
+            return payload
         if not payload:
             return {}
 
@@ -121,10 +196,6 @@ class OpenAIClient:
             decoded = json.loads(payload.decode("utf-8"))
         except json.JSONDecodeError as error:
             raise OpenAIClientError("OpenAI returned invalid JSON.") from error
-
-        if not isinstance(decoded, dict):
-            raise OpenAIClientError("OpenAI returned an unexpected JSON payload.")
-
         return decoded
 
     def _output_text(self, payload: dict[str, Any]) -> str:
