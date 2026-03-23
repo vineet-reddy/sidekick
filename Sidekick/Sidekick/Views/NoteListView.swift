@@ -236,15 +236,19 @@ struct NoteListView: View {
     private var setupBannerTitle: String {
         switch openAI.oauthExecutionSetup.phase {
         case .connectGitHub:
-            return "Connect GitHub To Finish ChatGPT Queue"
+            return "Create Secure Workspace Repo"
+        case .confirmRepositoryScope:
+            return "Confirm Codex Stayed On One Repo"
         case .waitingForMachine:
-            return "Waiting For ChatGPT Runtime"
+            return "Waiting For Codex Machine"
         case .autoProvisioning:
-            return "Sidekick Is Finishing ChatGPT Queue Setup"
+            return "Finishing Codex Workspace Setup"
         case .waitingForEnvironment:
-            return "ChatGPT Queue Is Still Finishing Setup"
+            return "Codex Workspace Is Still Finishing Setup"
+        case .manualFinish:
+            return "Finish Codex Environment In ChatGPT"
         case .ready:
-            return "ChatGPT Queue Ready"
+            return "Codex Workspace Ready"
         }
     }
 }

@@ -37,7 +37,7 @@ struct SettingsView: View {
 
                     if !openAI.hasUserAPIKeyOverride {
                         VStack(alignment: .leading, spacing: 14) {
-                            Text("ChatGPT Queue")
+                            Text("Codex Workspace")
                                 .font(.headline)
 
                             StatusPill(
@@ -47,7 +47,7 @@ struct SettingsView: View {
 
                             Text(
                                 openAI.oauthExecutionSetupMessage
-                                    ?? "Your ChatGPT OAuth path has at least one usable Codex cloud environment."
+                                    ?? "Your ChatGPT OAuth path has at least one usable repository-bound Codex environment."
                             )
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
@@ -69,14 +69,14 @@ struct SettingsView: View {
 
                         Text(
                             openAI.hasUserAPIKeyOverride
-                                ? "API key mode takes priority over the ChatGPT queue and can run multiple remote papers at once."
-                                : "Optional override. If you add your own OpenAI API key, Sidekick will prefer it over the single-file ChatGPT queue."
+                                ? "API key mode takes priority over the repository-bound Codex workspace flow and can run multiple remote papers at once."
+                                : "Optional override. If you add your own OpenAI API key, Sidekick will prefer it over the repository-bound ChatGPT Codex workspace flow."
                         )
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
 
                         StatusPill(
-                            title: openAI.hasUserAPIKeyOverride ? "API key active" : "Using ChatGPT queue",
+                            title: openAI.hasUserAPIKeyOverride ? "API key active" : "Using Codex workspace",
                             tint: openAI.hasUserAPIKeyOverride ? .green : SidekickTheme.accent
                         )
 
@@ -174,7 +174,7 @@ struct SettingsView: View {
             try openAI.clearUserAPIKey()
             apiKeyDraft = ""
             apiKeyStatusIsError = false
-            apiKeyStatusMessage = "Removed from Keychain. Sidekick will return to the ChatGPT queue."
+            apiKeyStatusMessage = "Removed from Keychain. Sidekick will return to the repository-bound Codex workspace flow."
         } catch {
             apiKeyStatusIsError = true
             apiKeyStatusMessage = error.localizedDescription
@@ -188,11 +188,15 @@ struct SettingsView: View {
 
         switch openAI.oauthExecutionSetup.phase {
         case .connectGitHub:
-            return "GitHub required"
+            return "Workspace setup required"
+        case .confirmRepositoryScope:
+            return "Scope confirmation required"
         case .waitingForMachine, .waitingForEnvironment:
             return "Finishing setup"
         case .autoProvisioning:
             return "Auto-provisioning"
+        case .manualFinish:
+            return "Finish in ChatGPT"
         case .ready:
             return "Ready"
         }

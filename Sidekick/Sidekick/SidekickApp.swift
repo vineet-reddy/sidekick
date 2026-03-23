@@ -5,6 +5,7 @@ import SwiftUI
 @MainActor
 struct SidekickApp: App {
     @StateObject private var authService: AuthService
+    @StateObject private var githubService: GitHubService
     @StateObject private var openAIService: OpenAIService
     @StateObject private var notificationService: NotificationService
     @StateObject private var heartbeatManager: HeartbeatManager
@@ -21,11 +22,13 @@ struct SidekickApp: App {
         }
 
         let auth = AuthService()
+        let github = GitHubService()
         let notifications = NotificationService()
-        let openAI = OpenAIService(auth: auth)
+        let openAI = OpenAIService(auth: auth, github: github)
         let heartbeat = HeartbeatManager(openAI: openAI, notifications: notifications)
 
         _authService = StateObject(wrappedValue: auth)
+        _githubService = StateObject(wrappedValue: github)
         _notificationService = StateObject(wrappedValue: notifications)
         _openAIService = StateObject(wrappedValue: openAI)
         _heartbeatManager = StateObject(wrappedValue: heartbeat)
@@ -37,6 +40,7 @@ struct SidekickApp: App {
         WindowGroup {
             AppShellView()
                 .environmentObject(authService)
+                .environmentObject(githubService)
                 .environmentObject(openAIService)
                 .environmentObject(notificationService)
                 .environmentObject(heartbeatManager)

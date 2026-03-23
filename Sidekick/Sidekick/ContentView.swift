@@ -145,11 +145,13 @@ struct AppShellView: View {
     @Query(sort: \Paper.updatedAt, order: .reverse) private var papers: [Paper]
     @Query(sort: \ResearchRun.updatedAt, order: .reverse) private var runs: [ResearchRun]
 
+    @EnvironmentObject private var auth: AuthService
+    @EnvironmentObject private var github: GitHubService
     @EnvironmentObject private var heartbeat: HeartbeatManager
     @EnvironmentObject private var notifications: NotificationService
     @EnvironmentObject private var openAI: OpenAIService
     @State private var hasDismissedOAuthSetupSheet = false
-    @State private var isShowingOAuthSetupBrowser = false
+    @State private var oauthSetupBrowserTarget: BrowserTarget?
 
     private let foregroundHeartbeatInterval: Duration = .seconds(30)
 
@@ -201,6 +203,9 @@ struct AppShellView: View {
                 }
             }
             .onChange(of: openAI.oauthExecutionSetupSheetRequestID) { _, _ in
+                guard oauthSetupBrowserTarget == nil else {
+                    return
+                }
                 hasDismissedOAuthSetupSheet = false
             }
             .task(id: foregroundHeartbeatTaskKey) {
@@ -212,24 +217,19 @@ struct AppShellView: View {
             .sheet(isPresented: oauthSetupSheetBinding) {
                 OAuthCloudSetupView(
                     snapshot: openAI.oauthExecutionSetup,
-                    openCodexSetup: {
-                        isShowingOAuthSetupBrowser = true
+                    performPrimaryAction: {
+                        handleOAuthSetupPrimaryAction()
                     },
-                    retrySetupCheck: {
-                        Task {
-                            _ = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
-                            if openAI.oauthExecutionSetupMessage == nil, heldRunCount > 0 {
-                                await heartbeat.run(modelContext: modelContext, force: true)
-                            }
-                        }
+                    performSecondaryAction: {
+                        handleOAuthSetupSecondaryAction()
                     },
                     dismiss: {
                         hasDismissedOAuthSetupSheet = true
                     }
                 )
             }
-            .sheet(isPresented: $isShowingOAuthSetupBrowser) {
-                SafariBrowserView(url: URL(string: "https://chatgpt.com/codex/settings/environments")!)
+            .sheet(item: $oauthSetupBrowserTarget) { target in
+                SafariBrowserView(url: target.url)
             }
     }
 
@@ -260,13 +260,14 @@ struct AppShellView: View {
     private var oauthSetupMonitorTaskKey: String {
         let phase = openAI.oauthExecutionSetup.phase.rawValue
         let hasMessage = openAI.oauthExecutionSetupMessage != nil
-        return "\(scenePhase == .active)-\(isShowingOAuthSetupBrowser)-\(hasMessage)-\(phase)"
+        return "\(scenePhase == .active)-\(oauthSetupBrowserTarget != nil)-\(hasMessage)-\(phase)"
     }
 
     private var oauthSetupSheetBinding: Binding<Bool> {
         Binding(
             get: {
                 guard !openAI.hasUserAPIKeyOverride,
+                      oauthSetupBrowserTarget == nil,
                       !openAI.oauthExecutionSetup.isReady,
                       let message = openAI.oauthExecutionSetupMessage,
                       !message.isEmpty else {
@@ -422,19 +423,35 @@ struct AppShellView: View {
     private func runOAuthSetupMonitorLoopIfNeeded(modelContext: ModelContext) async {
         guard scenePhase == .active,
               !openAI.hasUserAPIKeyOverride,
-              openAI.oauthExecutionSetupMessage != nil || isShowingOAuthSetupBrowser else {
+              openAI.oauthExecutionSetupMessage != nil || oauthSetupBrowserTarget != nil else {
             return
         }
 
         while !Task.isCancelled,
               scenePhase == .active,
               !openAI.hasUserAPIKeyOverride,
-              openAI.oauthExecutionSetupMessage != nil || isShowingOAuthSetupBrowser {
+              openAI.oauthExecutionSetupMessage != nil || oauthSetupBrowserTarget != nil {
+            let phase = openAI.oauthExecutionSetup.phase
+            let shouldAutoPoll: Bool
+
+            switch phase {
+            case .connectGitHub, .confirmRepositoryScope, .manualFinish:
+                shouldAutoPoll = oauthSetupBrowserTarget != nil
+            case .waitingForMachine, .autoProvisioning, .waitingForEnvironment:
+                shouldAutoPoll = true
+            case .ready:
+                return
+            }
+
+            guard shouldAutoPoll else {
+                break
+            }
+
             let setupMessage = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
 
             if setupMessage == nil {
                 hasDismissedOAuthSetupSheet = false
-                isShowingOAuthSetupBrowser = false
+                oauthSetupBrowserTarget = nil
 
                 if heldRunCount > 0 {
                     await heartbeat.run(modelContext: modelContext, force: true)
@@ -444,10 +461,10 @@ struct AppShellView: View {
 
             let interval: Duration
             switch openAI.oauthExecutionSetup.phase {
-            case .connectGitHub:
-                interval = isShowingOAuthSetupBrowser ? .seconds(4) : .seconds(15)
+            case .connectGitHub, .confirmRepositoryScope, .manualFinish:
+                interval = oauthSetupBrowserTarget != nil ? .seconds(4) : .seconds(15)
             case .waitingForMachine, .waitingForEnvironment:
-                interval = isShowingOAuthSetupBrowser ? .seconds(4) : .seconds(10)
+                interval = oauthSetupBrowserTarget != nil ? .seconds(4) : .seconds(10)
             case .autoProvisioning:
                 interval = .seconds(4)
             case .ready:
@@ -502,12 +519,68 @@ struct AppShellView: View {
             try? fileManager.removeItem(at: localDatasetsDirectory)
         }
     }
+
+    private func handleOAuthSetupPrimaryAction() {
+        switch openAI.oauthExecutionSetup.phase {
+        case .connectGitHub:
+            Task {
+                do {
+                    let url = try await github.beginWorkspaceBootstrap(chatGPTEmail: auth.userEmail)
+                    await MainActor.run {
+                        oauthSetupBrowserTarget = BrowserTarget(url: url)
+                    }
+                } catch {
+                    await MainActor.run {
+                        github.recordBootstrapErrorMessage(error.localizedDescription)
+                    }
+                }
+            }
+        case .confirmRepositoryScope:
+            do {
+                try github.markConnectorScopeAttested(chatgptEmail: auth.userEmail)
+                Task {
+                    _ = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
+                    if openAI.oauthExecutionSetupMessage == nil, heldRunCount > 0 {
+                        await heartbeat.run(modelContext: modelContext, force: true)
+                    }
+                }
+            } catch {
+                github.recordBootstrapErrorMessage(error.localizedDescription)
+            }
+        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment, .manualFinish, .ready:
+            oauthSetupBrowserTarget = BrowserTarget(
+                url: URL(string: "https://chatgpt.com/codex/settings/environments")!
+            )
+        }
+    }
+
+    private func handleOAuthSetupSecondaryAction() {
+        switch openAI.oauthExecutionSetup.phase {
+        case .confirmRepositoryScope:
+            if let reviewURL = github.connectorReviewURL() {
+                oauthSetupBrowserTarget = BrowserTarget(url: reviewURL)
+            }
+        case .connectGitHub, .waitingForMachine, .autoProvisioning, .waitingForEnvironment, .manualFinish, .ready:
+            Task {
+                _ = await openAI.refreshOAuthExecutionSetupStateIfNeeded()
+                if openAI.oauthExecutionSetupMessage == nil, heldRunCount > 0 {
+                    await heartbeat.run(modelContext: modelContext, force: true)
+                }
+            }
+        }
+    }
+}
+
+private struct BrowserTarget: Identifiable {
+    let id = UUID()
+    let url: URL
 }
 
 private struct OAuthCloudSetupView: View {
+    @EnvironmentObject private var github: GitHubService
     let snapshot: OAuthExecutionSetupSnapshot
-    let openCodexSetup: () -> Void
-    let retrySetupCheck: () -> Void
+    let performPrimaryAction: () -> Void
+    let performSecondaryAction: () -> Void
     let dismiss: () -> Void
 
     var body: some View {
@@ -518,9 +591,9 @@ private struct OAuthCloudSetupView: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 18) {
                         SectionHeader(
-                            eyebrow: "ChatGPT Queue",
-                            title: "Finish setup once, in-app",
-                            subtitle: "Open the official Codex setup page in ChatGPT. Sidekick keeps checking the backend and will resume held papers automatically."
+                            eyebrow: "Codex Workspace",
+                            title: "Finish setup once",
+                            subtitle: "Sidekick creates one secure workspace repo, opens the ChatGPT Codex Connector already scoped to that repo, and then finishes the repository-bound environment."
                         )
 
                         VStack(alignment: .leading, spacing: 14) {
@@ -537,6 +610,14 @@ private struct OAuthCloudSetupView: View {
                                             .foregroundStyle(.secondary)
                                             .fixedSize(horizontal: false, vertical: true)
                                     }
+
+                                    if let bootstrapErrorMessage = github.bootstrapErrorMessage,
+                                       !bootstrapErrorMessage.isEmpty {
+                                        Text(bootstrapErrorMessage)
+                                            .font(.footnote)
+                                            .foregroundStyle(.red)
+                                            .fixedSize(horizontal: false, vertical: true)
+                                    }
                                 }
                             }
                         }
@@ -547,21 +628,21 @@ private struct OAuthCloudSetupView: View {
                                 .font(.headline)
 
                             OAuthSetupStepRow(
-                                title: "Connect GitHub to Codex",
-                                detail: "This is the only step that still has to happen in ChatGPT itself.",
+                                title: "Create secure workspace repo",
+                                detail: workspaceStepDetail,
                                 state: githubStepState
                             )
 
                             OAuthSetupStepRow(
-                                title: "Sidekick provisions a runtime",
-                                detail: runtimeStepDetail,
-                                state: runtimeStepState
+                                title: "Install Codex on one repo",
+                                detail: connectorStepDetail,
+                                state: connectorStepState
                             )
 
                             OAuthSetupStepRow(
-                                title: "Held papers resume",
-                                detail: "As soon as the runtime is ready, Sidekick starts the queue again on its own.",
-                                state: resumeStepState
+                                title: "Finish Codex environment",
+                                detail: runtimeStepDetail,
+                                state: runtimeStepState
                             )
                         }
                         .glassCard(padding: 22)
@@ -570,7 +651,7 @@ private struct OAuthCloudSetupView: View {
                             Text("Alternative")
                                 .font(.headline)
 
-                            Text("If you do not want to set up ChatGPT Codex cloud, add your own OpenAI API key in Settings and Sidekick will use that path instead.")
+                            Text("If you do not want to use the repository-bound ChatGPT Codex flow, add your own OpenAI API key in Settings and Sidekick will use that path instead.")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
@@ -580,17 +661,17 @@ private struct OAuthCloudSetupView: View {
                     .padding(.bottom, 140)
                 }
             }
-            .navigationTitle("ChatGPT Queue")
+            .navigationTitle("Codex Workspace")
             .navigationBarTitleDisplayMode(.inline)
             .safeAreaInset(edge: .bottom) {
                 VStack(spacing: 12) {
                     Button(primaryActionTitle) {
-                        openCodexSetup()
+                        performPrimaryAction()
                     }
                     .buttonStyle(.borderedProminent)
 
-                    Button("Check again now") {
-                        retrySetupCheck()
+                    Button(secondaryActionTitle) {
+                        performSecondaryAction()
                     }
                     .buttonStyle(.bordered)
 
@@ -612,66 +693,120 @@ private struct OAuthCloudSetupView: View {
     private var primaryActionTitle: String {
         switch snapshot.phase {
         case .connectGitHub:
-            return "Continue in ChatGPT"
-        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment:
-            return "Open Codex Setup"
+            return "Create Workspace In GitHub"
+        case .confirmRepositoryScope:
+            return "I Confirmed It"
+        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment, .manualFinish:
+            return "Open Codex Environments"
         case .ready:
-            return "Open Codex Setup"
+            return "Open Codex Environments"
+        }
+    }
+
+    private var secondaryActionTitle: String {
+        switch snapshot.phase {
+        case .confirmRepositoryScope:
+            return "Review GitHub Access Again"
+        case .connectGitHub, .waitingForMachine, .autoProvisioning, .waitingForEnvironment, .manualFinish, .ready:
+            return "Check Again Now"
         }
     }
 
     private var setupHeadline: String {
         switch snapshot.phase {
         case .connectGitHub:
-            return "Connect GitHub once"
+            return "Create the secure workspace repo"
+        case .confirmRepositoryScope:
+            return "Confirm the connector stayed on one repo"
         case .waitingForMachine:
-            return "Waiting for Codex runtime"
+            return "Waiting for a Codex machine"
         case .autoProvisioning:
             return "Sidekick is finishing setup"
         case .waitingForEnvironment:
-            return "Waiting for the runtime to appear"
+            return "Waiting for the environment to appear"
+        case .manualFinish:
+            return "Finish the environment in ChatGPT"
         case .ready:
-            return "ChatGPT Queue is ready"
+            return "Codex workspace is ready"
         }
     }
 
     private var githubStepState: OAuthSetupStepState {
-        snapshot.requiresGitHubConnection ? .current : .complete
+        switch snapshot.phase {
+        case .connectGitHub:
+            return .current
+        case .confirmRepositoryScope, .waitingForMachine, .autoProvisioning, .waitingForEnvironment, .manualFinish, .ready:
+            return .complete
+        }
+    }
+
+    private var connectorStepState: OAuthSetupStepState {
+        switch snapshot.phase {
+        case .connectGitHub:
+            return .pending
+        case .confirmRepositoryScope:
+            return .current
+        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment, .manualFinish, .ready:
+            return .complete
+        }
     }
 
     private var runtimeStepState: OAuthSetupStepState {
         switch snapshot.phase {
-        case .connectGitHub:
+        case .connectGitHub, .confirmRepositoryScope:
             return .pending
         case .waitingForMachine, .autoProvisioning, .waitingForEnvironment:
             return .current
+        case .manualFinish:
+            return .actionRequired
         case .ready:
             return .complete
         }
     }
 
-    private var resumeStepState: OAuthSetupStepState {
-        snapshot.phase == .ready ? .complete : .pending
+    private var workspaceStepDetail: String {
+        if let repo = snapshot.workspaceRepositoryFullName, !repo.isEmpty {
+            return "Sidekick created or reused \(repo) as the only permanent Codex workspace repo for this ChatGPT account."
+        }
+        return "Sidekick will create or reuse one private workspace repo and keep all papers, experiments, and artifacts inside it."
+    }
+
+    private var connectorStepDetail: String {
+        switch snapshot.phase {
+        case .connectGitHub:
+            return "GitHub opens with only the Sidekick workspace repo preselected for the ChatGPT Codex Connector."
+        case .confirmRepositoryScope:
+            return "Confirm that GitHub stayed on Only selected repositories and that the Sidekick workspace repo was the only selected repo."
+        case .waitingForMachine, .autoProvisioning, .waitingForEnvironment, .manualFinish, .ready:
+            if let repo = snapshot.workspaceRepositoryFullName, !repo.isEmpty {
+                return "The connector is installed for \(repo) and Sidekick is using that repo-bound setup."
+            }
+            return "The connector install completed and Sidekick is using the repo-bound setup."
+        }
     }
 
     private var runtimeStepDetail: String {
         switch snapshot.phase {
         case .connectGitHub:
-            return "After GitHub is linked, Sidekick will try to create a Sidekick Runtime automatically."
+            return "Once the connector is installed on one repo, Sidekick will provision the repository-bound environment automatically."
+        case .confirmRepositoryScope:
+            return "After you confirm the scope, Sidekick will finish the repository-bound environment automatically."
         case .waitingForMachine:
-            return "GitHub is linked. Sidekick is waiting for Codex to expose a machine template."
+            return "GitHub is linked. Sidekick is waiting for Codex to expose a usable machine template."
         case .autoProvisioning:
             if let machineLabel = snapshot.machineLabel, !machineLabel.isEmpty {
-                return "Sidekick is creating the runtime on \(machineLabel) and checking for readiness."
+                return "Sidekick is creating the repository-bound environment on \(machineLabel) and checking for readiness."
             }
-            return "Sidekick is creating the runtime and checking for readiness."
+            return "Sidekick is creating the repository-bound environment and checking for readiness."
         case .waitingForEnvironment:
-            return "Codex setup is still settling. Sidekick keeps checking and will pick up the environment automatically."
+            return "Codex is still finishing the workspace environment. Sidekick keeps checking and will pick it up automatically."
+        case .manualFinish:
+            return "Automatic provisioning stalled. Open Codex Environments to finish or verify the repository-bound environment, then come back and check again."
         case .ready:
             if let environmentLabel = snapshot.environmentLabel, !environmentLabel.isEmpty {
                 return "Ready on \(environmentLabel)."
             }
-            return "A usable Codex runtime is ready."
+            return "A usable repository-bound Codex environment is ready."
         }
     }
 
@@ -684,11 +819,23 @@ private struct OAuthCloudSetupView: View {
                 .foregroundStyle(SidekickTheme.accent)
                 .frame(width: 34, height: 34)
                 .background(SidekickTheme.accent.opacity(0.12), in: Circle())
+        case .confirmRepositoryScope:
+            Image(systemName: "checkmark.shield")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.orange)
+                .frame(width: 34, height: 34)
+                .background(Color.orange.opacity(0.14), in: Circle())
         case .waitingForMachine, .autoProvisioning, .waitingForEnvironment:
             ProgressView()
                 .controlSize(.regular)
                 .frame(width: 34, height: 34)
                 .background(SidekickTheme.accent.opacity(0.12), in: Circle())
+        case .manualFinish:
+            Image(systemName: "exclamationmark.circle.fill")
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.orange)
+                .frame(width: 34, height: 34)
+                .background(Color.orange.opacity(0.14), in: Circle())
         case .ready:
             Image(systemName: "checkmark")
                 .font(.headline.weight(.bold))
@@ -702,6 +849,7 @@ private struct OAuthCloudSetupView: View {
 private enum OAuthSetupStepState {
     case pending
     case current
+    case actionRequired
     case complete
 }
 
@@ -739,6 +887,11 @@ private struct OAuthSetupStepRow: View {
         case .current:
             ProgressView()
                 .controlSize(.mini)
+                .frame(width: 18, height: 18)
+                .padding(.top, 2)
+        case .actionRequired:
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.orange)
                 .frame(width: 18, height: 18)
                 .padding(.top, 2)
         case .complete:

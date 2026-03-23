@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: sidekick-github-bootstrap
+    runtime: docker
+    plan: starter
+    dockerfilePath: ./github_bootstrap_service/Dockerfile
+    healthCheckPath: /health
+    envVars:
+      - key: GITHUB_CLIENT_ID
+        sync: false
+      - key: GITHUB_CLIENT_SECRET
+        sync: false
+      - key: GITHUB_BOOTSTRAP_REDIRECT_BASE_URL
+        sync: false
+      - key: GITHUB_BOOTSTRAP_TEMPLATE_OWNER
+        sync: false
+      - key: GITHUB_BOOTSTRAP_TEMPLATE_REPO
+        sync: false

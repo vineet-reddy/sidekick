@@ -1,0 +1,2 @@
+// Copy to BootstrapService.xcconfig and set the deployed bootstrap URL.
+SIDEKICK_GITHUB_BOOTSTRAP_BASE_URL = https://your-bootstrap-service.example.com

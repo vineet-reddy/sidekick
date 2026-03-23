@@ -27,25 +27,33 @@ struct OAuthExecutionSetupSnapshot: Equatable {
     enum Phase: String {
         case ready
         case connectGitHub
+        case confirmRepositoryScope
         case waitingForMachine
         case autoProvisioning
         case waitingForEnvironment
+        case manualFinish
     }
 
     let phase: Phase
     let message: String?
     let environmentLabel: String?
     let machineLabel: String?
+    let workspaceRepositoryFullName: String?
 
     static let ready = OAuthExecutionSetupSnapshot(
         phase: .ready,
         message: nil,
         environmentLabel: nil,
-        machineLabel: nil
+        machineLabel: nil,
+        workspaceRepositoryFullName: nil
     )
 
     var requiresGitHubConnection: Bool {
         phase == .connectGitHub
+    }
+
+    var requiresScopeAttestation: Bool {
+        phase == .confirmRepositoryScope
     }
 
     var isReady: Bool {
@@ -83,6 +91,7 @@ final class OpenAIService: ObservableObject {
     @Published private(set) var oauthExecutionSetupSheetRequestID = 0
 
     private let auth: AuthService
+    private let github: GitHubService
     private let session: URLSession
     private let defaults: UserDefaults
     private let backendBaseURL = URL(string: "https://chatgpt.com/backend-api")!
@@ -99,18 +108,24 @@ final class OpenAIService: ObservableObject {
     private let qaForceNoSignalRemoteTasksEnvironmentVariable = "SIDEKICK_QA_FORCE_NO_SIGNAL_REMOTE_TASKS"
     private let qaForceNoSignalRemoteTaskAgeSecondsEnvironmentVariable = "SIDEKICK_QA_FORCE_NO_SIGNAL_TASK_AGE_SECONDS"
     private let qaProbeCodexEnvironmentEndpointsEnvironmentVariable = "SIDEKICK_QA_PROBE_CODEX_ENV_ENDPOINTS"
+    private let qaForceOAuthSetupPhaseEnvironmentVariable = "SIDEKICK_QA_FORCE_OAUTH_SETUP_PHASE"
+    private let qaForceOAuthSetupMessageEnvironmentVariable = "SIDEKICK_QA_FORCE_OAUTH_SETUP_MESSAGE"
+    private let qaForceOAuthWorkspaceRepoEnvironmentVariable = "SIDEKICK_QA_FORCE_OAUTH_WORKSPACE_REPO"
     private let apiKeyFailureMessageDefaultsKey = "com.vineet.sidekick.openai-api.failure-message"
     private let apiKeyFailureFingerprintDefaultsKey = "com.vineet.sidekick.openai-api.failure-fingerprint"
     private let oauthSetupBootstrap = OAuthExecutionSetupBootstrapCoordinator()
-    private let sidekickRuntimeEnvironmentLabel = "Sidekick Runtime"
+    private let sidekickOfflineEnvironmentLabel = "Sidekick Offline"
+    private let sidekickResearchEnvironmentLabel = "Sidekick Research"
 
     init(
         auth: AuthService,
+        github: GitHubService,
         session: URLSession = .shared,
         trustedDatasets: TrustedDatasetRegistry? = nil,
         defaults: UserDefaults = .standard
     ) {
         self.auth = auth
+        self.github = github
         self.session = session
         self.defaults = defaults
         let registry = trustedDatasets ?? TrustedDatasetRegistry(session: session)
@@ -183,6 +198,20 @@ final class OpenAIService: ObservableObject {
             return nil
         }
 
+        if let forcedSnapshot = qaForcedOAuthExecutionSetupSnapshot() {
+            await oauthSetupBootstrap.reset()
+            await publishOAuthExecutionSetupState(forcedSnapshot)
+            return forcedSnapshot.message
+        }
+
+        do {
+            _ = try await github.refreshBootstrapSessionIfNeeded()
+        } catch {
+            log("github bootstrap session refresh failed: \(error.localizedDescription)")
+        }
+
+        let workspaceContext = github.workspaceContext
+
         do {
             let environments = try await fetchEnvironments()
             await oauthSetupBootstrap.reset()
@@ -192,33 +221,64 @@ final class OpenAIService: ObservableObject {
                     phase: .ready,
                     message: nil,
                     environmentLabel: preferredEnvironment?.label,
-                    machineLabel: nil
+                    machineLabel: nil,
+                    workspaceRepositoryFullName: workspaceContext?.repositoryFullName
                 )
             )
             return nil
         } catch {
-            let requiresGitHubConnection = await oauthExecutionRequiresGitHubConnection()
-            guard let message = oauthExecutionSetupBlockerMessage(
-                for: error,
-                requiresGitHubConnection: requiresGitHubConnection
-            ) else {
-                await publishOAuthExecutionSetupState(.ready)
-                return nil
+            let installationExists = await oauthExecutionGitHubInstallationExists()
+            if installationExists {
+                github.recordBootstrapErrorMessage(nil)
             }
+            let repositoryScopeDiagnostics = await fetchConnectedGitHubRepositoriesDiagnostics(
+                workspaceContext: workspaceContext
+            )
 
             let snapshot: OAuthExecutionSetupSnapshot
 
-            if requiresGitHubConnection {
+            if !installationExists {
                 await oauthSetupBootstrap.reset()
                 snapshot = OAuthExecutionSetupSnapshot(
                     phase: .connectGitHub,
-                    message: message,
+                    message: connectorBootstrapMessage(for: workspaceContext),
                     environmentLabel: nil,
-                    machineLabel: nil
+                    machineLabel: nil,
+                    workspaceRepositoryFullName: workspaceContext?.repositoryFullName
+                )
+            } else if let workspaceContext,
+                      !github.hasRecentConnectorScopeAttestation(
+                          for: workspaceContext,
+                          chatgptEmail: auth.userEmail
+                      ) {
+                await oauthSetupBootstrap.reset()
+                snapshot = OAuthExecutionSetupSnapshot(
+                    phase: .confirmRepositoryScope,
+                    message: connectorAttestationMessage(for: workspaceContext),
+                    environmentLabel: nil,
+                    machineLabel: nil,
+                    workspaceRepositoryFullName: workspaceContext.repositoryFullName
+                )
+            } else if case let .mismatch(detail) = repositoryScopeDiagnostics {
+                await oauthSetupBootstrap.reset()
+                snapshot = OAuthExecutionSetupSnapshot(
+                    phase: .confirmRepositoryScope,
+                    message: detail,
+                    environmentLabel: nil,
+                    machineLabel: nil,
+                    workspaceRepositoryFullName: workspaceContext?.repositoryFullName
                 )
             } else {
+                let message = oauthExecutionSetupBlockerMessage(
+                    for: error,
+                    requiresGitHubConnection: false
+                ) ?? """
+                GitHub is connected. Sidekick is finishing a repository-bound Codex environment for your secure workspace repo.
+                """
+
                 snapshot = await resolvePostGitHubOAuthExecutionSetupState(
-                    fallbackMessage: message
+                    fallbackMessage: message,
+                    workspaceContext: workspaceContext
                 )
             }
 
@@ -263,13 +323,29 @@ final class OpenAIService: ObservableObject {
         }
 
         if requiresGitHubConnection {
+            return connectorBootstrapMessage(for: github.workspaceContext)
+        }
+
+        return """
+        GitHub is connected, but this ChatGPT workspace does not have a usable repository-bound Codex environment yet. Keep this screen open while Sidekick finishes the environment for your Sidekick workspace repo. If Codex still does not expose it, open ChatGPT Codex Environments or add your own OpenAI API key in Settings.
+        """
+    }
+
+    private func connectorBootstrapMessage(for workspaceContext: GitHubWorkspaceContext?) -> String {
+        if let workspaceContext {
             return """
-            This ChatGPT account has not connected GitHub to Codex yet. Open ChatGPT Codex Environments, connect GitHub once, and keep this screen open. Sidekick will finish the Codex runtime setup automatically and resume held papers as soon as the cloud environment is ready.
+            Sidekick already provisioned \(workspaceContext.repositoryFullName). Open GitHub from Sidekick, keep the ChatGPT Codex Connector on Only selected repositories, and leave \(workspaceContext.repositoryFullName) as the only selected repo.
             """
         }
 
         return """
-        GitHub is connected, but this ChatGPT workspace does not have a usable Codex cloud environment yet. Keep this screen open while Sidekick tries to finish setup automatically. If Codex still does not expose a usable runtime, open ChatGPT Codex Environments or add your own OpenAI API key in Settings.
+        Sidekick needs to create your secure GitHub workspace repo first, then open the ChatGPT Codex Connector already scoped to that repo. Continue in GitHub from Sidekick and leave the connector on Only selected repositories.
+        """
+    }
+
+    private func connectorAttestationMessage(for workspaceContext: GitHubWorkspaceContext) -> String {
+        """
+        Sidekick opened GitHub with only \(workspaceContext.repositoryFullName) preselected. Confirm that you left the ChatGPT Codex Connector on Only selected repositories and that \(workspaceContext.repositoryFullName) was the only selected repo.
         """
     }
 
@@ -307,7 +383,7 @@ final class OpenAIService: ObservableObject {
                 "POST",
                 [
                     "machine_id": "default",
-                    "label": "Sidekick Runtime",
+                    "label": "Sidekick Offline",
                     "repos": []
                 ]
             ),
@@ -316,8 +392,8 @@ final class OpenAIService: ObservableObject {
                 ["wham", "environments"],
                 "POST",
                 [
-                    "new_environment": [
-                        "label": "Sidekick Runtime",
+                        "new_environment": [
+                        "label": "Sidekick Offline",
                         "branch": "main"
                     ]
                 ]
@@ -2020,8 +2096,12 @@ final class OpenAIService: ObservableObject {
         prompt: String,
         preference: CloudTaskEnvironmentPreference = .repositoryBound
     ) async throws -> String {
+        let effectivePreference = effectiveTaskPreference(for: preference)
         let environments = try await candidateEnvironments(for: preference)
-        let branch = taskBranch(for: preference)
+        guard !environments.isEmpty else {
+            throw ServiceError.taskFailed("No usable repository-bound Codex environments are available for this ChatGPT workspace.")
+        }
+        let branch = taskBranch(for: effectivePreference)
         let workerPrompt = queuedRemoteTaskPrompt(from: prompt)
         var lastError: Error?
         var skippedLabels: [String] = []
@@ -2058,14 +2138,14 @@ final class OpenAIService: ObservableObject {
                 log("createTask response bytes=\(data.count)")
 
                 let taskID = try decodeTaskID(from: data)
-                await environmentRouter.remember(environment, for: preference)
+                await environmentRouter.remember(environment, for: effectivePreference)
                 return taskID
             } catch let error as BackendRequestFailure
                 where error.detailType == "repo_not_accessible" {
                     let label = environment.label ?? environment.id
                     skippedLabels.append(label)
                     lastError = error
-                    await environmentRouter.quarantine(environment.id, for: preference)
+                    await environmentRouter.quarantine(environment.id, for: effectivePreference)
                     log("createTask skipping environment \(label) due to repo_not_accessible")
                     continue
                 } catch {
@@ -2128,7 +2208,8 @@ final class OpenAIService: ObservableObject {
     }
 
     private func resolvePostGitHubOAuthExecutionSetupState(
-        fallbackMessage: String
+        fallbackMessage: String,
+        workspaceContext: GitHubWorkspaceContext?
     ) async -> OAuthExecutionSetupSnapshot {
         let outcome = await autoBootstrapOAuthExecutionEnvironmentIfPossible()
 
@@ -2139,19 +2220,43 @@ final class OpenAIService: ObservableObject {
                 phase: .ready,
                 message: nil,
                 environmentLabel: preferredEnvironment?.label,
-                machineLabel: nil
+                machineLabel: nil,
+                workspaceRepositoryFullName: workspaceContext?.repositoryFullName
             )
+        }
+
+        let shouldEscalateToManualFinish: Bool
+        switch outcome {
+        case .autoProvisioning:
+            shouldEscalateToManualFinish = false
+            await oauthSetupBootstrap.recordProgress()
+        case .waitingForMachine, .waitingForEnvironment:
+            shouldEscalateToManualFinish = await oauthSetupBootstrap.recordUnresolvedStateObservation()
         }
 
         switch outcome {
         case .waitingForMachine:
+            if shouldEscalateToManualFinish {
+                return OAuthExecutionSetupSnapshot(
+                    phase: .manualFinish,
+                    message: manualEnvironmentCompletionMessage(
+                        workspaceContext: workspaceContext,
+                        detail: "Codex has not exposed a usable repository-bound machine template to Sidekick yet."
+                    ),
+                    environmentLabel: nil,
+                    machineLabel: nil,
+                    workspaceRepositoryFullName: workspaceContext?.repositoryFullName
+                )
+            }
+
             return OAuthExecutionSetupSnapshot(
                 phase: .waitingForMachine,
                 message: """
-                GitHub is connected, but Codex has not exposed a runtime template yet. Leave this screen open. Sidekick will keep checking and will create a Sidekick runtime automatically as soon as one becomes available.
+                GitHub is connected, but Codex has not exposed a usable repository-bound runtime template yet. Leave this screen open. Sidekick will keep checking and will create your Sidekick workspace environment automatically as soon as one becomes available.
                 """,
                 environmentLabel: nil,
-                machineLabel: nil
+                machineLabel: nil,
+                workspaceRepositoryFullName: workspaceContext?.repositoryFullName
             )
         case let .autoProvisioning(machineLabel):
             let suffix: String
@@ -2164,12 +2269,26 @@ final class OpenAIService: ObservableObject {
             return OAuthExecutionSetupSnapshot(
                 phase: .autoProvisioning,
                 message: """
-                GitHub is connected. Sidekick is creating and verifying your Codex runtime\(suffix) Keep this sheet open and your held papers will resume automatically when the environment is ready.
+                GitHub is connected. Sidekick is creating and verifying your repository-bound Codex environment\(suffix) Keep this sheet open and your held papers will resume automatically when the environment is ready.
                 """,
                 environmentLabel: nil,
-                machineLabel: machineLabel
+                machineLabel: machineLabel,
+                workspaceRepositoryFullName: workspaceContext?.repositoryFullName
             )
         case let .waitingForEnvironment(machineLabel, detail):
+            if shouldEscalateToManualFinish {
+                return OAuthExecutionSetupSnapshot(
+                    phase: .manualFinish,
+                    message: manualEnvironmentCompletionMessage(
+                        workspaceContext: workspaceContext,
+                        detail: detail
+                    ),
+                    environmentLabel: nil,
+                    machineLabel: machineLabel,
+                    workspaceRepositoryFullName: workspaceContext?.repositoryFullName
+                )
+            }
+
             let detailSuffix: String
             if let detail,
                !detail.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
@@ -2189,9 +2308,30 @@ final class OpenAIService: ObservableObject {
                 phase: .waitingForEnvironment,
                 message: fallbackMessage + machineSuffix + detailSuffix,
                 environmentLabel: nil,
-                machineLabel: machineLabel
+                machineLabel: machineLabel,
+                workspaceRepositoryFullName: workspaceContext?.repositoryFullName
             )
         }
+    }
+
+    private func manualEnvironmentCompletionMessage(
+        workspaceContext: GitHubWorkspaceContext?,
+        detail: String?
+    ) -> String {
+        let repoName = workspaceContext?.repositoryFullName ?? "your Sidekick workspace repo"
+        let normalizedDetail = detail?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let detailSuffix: String
+
+        if let normalizedDetail, !normalizedDetail.isEmpty {
+            detailSuffix = " Last backend response: \(normalizedDetail)"
+        } else {
+            detailSuffix = ""
+        }
+
+        return """
+        GitHub is connected and Sidekick already scoped Codex to \(repoName), but Codex has not surfaced a usable repository-bound environment automatically. Open Codex Environments to finish or verify the environment for \(repoName), then come back and tap Check Again Now.\(detailSuffix)
+        """
     }
 
     private func autoBootstrapOAuthExecutionEnvironmentIfPossible() async -> OAuthExecutionSetupBootstrapOutcome {
@@ -2277,13 +2417,20 @@ final class OpenAIService: ObservableObject {
     }
 
     private func createOAuthExecutionEnvironment(machineID: String) async throws -> String? {
+        guard let workspaceContext = github.workspaceContext else {
+            throw ServiceError.taskFailed("Sidekick has not provisioned a workspace repository yet.")
+        }
+
         let data = try await sendBackendRequest(
             pathComponents: ["wham", "environments"],
             method: "POST",
             body: [
                 "machine_id": machineID,
-                "label": sidekickRuntimeEnvironmentLabel,
-                "repos": []
+                "label": sidekickOfflineEnvironmentLabel,
+                "repos": [workspaceContext.repositoryFullName],
+                "agent_network_access": [
+                    "mode": "off"
+                ]
             ]
         )
         persistDebugPayload(data, named: "environment-create-response.json")
@@ -2335,8 +2482,8 @@ final class OpenAIService: ObservableObject {
         from environments: [CloudTaskEnvironment]
     ) -> CloudTaskEnvironment? {
         environments.max { lhs, rhs in
-            environmentPriority(lhs, for: .networkedSelfContained)
-                < environmentPriority(rhs, for: .networkedSelfContained)
+            environmentPriority(lhs, for: .repositoryBound)
+                < environmentPriority(rhs, for: .repositoryBound)
         }
     }
 
@@ -2397,17 +2544,20 @@ final class OpenAIService: ObservableObject {
         for preference: CloudTaskEnvironmentPreference
     ) async throws -> [CloudTaskEnvironment] {
         let environments = try await fetchEnvironments()
+        let effectivePreference = effectiveTaskPreference(for: preference)
         let compatibleEnvironments: [CloudTaskEnvironment]
 
-        switch preference {
+        switch effectivePreference {
         case .networkedSelfContained:
             let networkEnabled = environments.filter { $0.agentNetworkAccess?.mode?.lowercased() == "on" }
             compatibleEnvironments = networkEnabled.isEmpty ? environments : networkEnabled
-        case .repositoryBound, .selfContainedBundle:
+        case .repositoryBound:
+            compatibleEnvironments = environments.filter(\.isRepositoryBound)
+        case .selfContainedBundle:
             compatibleEnvironments = environments
         }
 
-        let quarantinedIDs = await environmentRouter.quarantinedIDs(for: preference)
+        let quarantinedIDs = await environmentRouter.quarantinedIDs(for: effectivePreference)
         let viableEnvironments =
             quarantinedIDs.isEmpty
             ? compatibleEnvironments
@@ -2415,13 +2565,12 @@ final class OpenAIService: ObservableObject {
         let environmentPool = viableEnvironments.isEmpty ? compatibleEnvironments : viableEnvironments
         let candidates: [CloudTaskEnvironment]
 
-        switch preference {
+        switch effectivePreference {
         case .repositoryBound:
-            let networkEnabled = environmentPool.filter { $0.agentNetworkAccess?.mode?.lowercased() != "off" }
-            var prioritized = (networkEnabled.isEmpty ? environmentPool : networkEnabled)
-                .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
+            var prioritized = environmentPool
+                .sorted { environmentPriority($0, for: effectivePreference) > environmentPriority($1, for: effectivePreference) }
 
-            if let remembered = await environmentRouter.cached(for: preference),
+            if let remembered = await environmentRouter.cached(for: effectivePreference),
                let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
                 let cached = prioritized.remove(at: index)
                 prioritized.insert(cached, at: 0)
@@ -2435,12 +2584,12 @@ final class OpenAIService: ObservableObject {
             let fallbackPool = environmentPool.filter { !preferredIDs.contains($0.id) }
             var prioritized =
                 preferredPool
-                .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
+                .sorted { environmentPriority($0, for: effectivePreference) > environmentPriority($1, for: effectivePreference) }
                 + fallbackPool.sorted {
-                    environmentPriority($0, for: preference) > environmentPriority($1, for: preference)
+                    environmentPriority($0, for: effectivePreference) > environmentPriority($1, for: effectivePreference)
                 }
 
-            if let remembered = await environmentRouter.cached(for: preference),
+            if let remembered = await environmentRouter.cached(for: effectivePreference),
                let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
                 let cached = prioritized.remove(at: index)
                 prioritized.insert(cached, at: 0)
@@ -2454,12 +2603,12 @@ final class OpenAIService: ObservableObject {
             let fallbackPool = environmentPool.filter { !preferredIDs.contains($0.id) }
             var prioritized =
                 preferredPool
-                .sorted { environmentPriority($0, for: preference) > environmentPriority($1, for: preference) }
+                .sorted { environmentPriority($0, for: effectivePreference) > environmentPriority($1, for: effectivePreference) }
                 + fallbackPool.sorted {
-                    environmentPriority($0, for: preference) > environmentPriority($1, for: preference)
+                    environmentPriority($0, for: effectivePreference) > environmentPriority($1, for: effectivePreference)
                 }
 
-            if let remembered = await environmentRouter.cached(for: preference),
+            if let remembered = await environmentRouter.cached(for: effectivePreference),
                let index = prioritized.firstIndex(where: { $0.id == remembered.id }) {
                 let cached = prioritized.remove(at: index)
                 prioritized.insert(cached, at: 0)
@@ -2572,13 +2721,27 @@ final class OpenAIService: ObservableObject {
 
         switch preference {
         case .repositoryBound:
-            if mode == "on" {
-                score += 1_000
+            if environment.isRepositoryBound {
+                score += 6_000
+            } else {
+                score -= 12_000
             }
-            if preset == "all" {
+            if environment.hasPythonRuntime {
+                score += 2_000
+            }
+            if mode == "off" {
+                score += 1_000
+            } else if mode == "on" {
+                score += 250
+            }
+            let normalizedLabel = label.lowercased()
+            if normalizedLabel.contains(sidekickOfflineEnvironmentLabel.lowercased()) {
+                score += 750
+            } else if normalizedLabel.contains(sidekickResearchEnvironmentLabel.lowercased()) {
+                score += 500
+            }
+            if preset == "codex" {
                 score += 100
-            } else if preset == "codex" {
-                score += 10
             }
 
         case .selfContainedBundle:
@@ -2636,6 +2799,12 @@ final class OpenAIService: ObservableObject {
         score -= environment.taskCount ?? 0
 
         return score
+    }
+
+    private func effectiveTaskPreference(
+        for preference: CloudTaskEnvironmentPreference
+    ) -> CloudTaskEnvironmentPreference {
+        hasUserAPIKeyOverride ? preference : .repositoryBound
     }
 
     private func sendJSONRequest(
@@ -3875,6 +4044,74 @@ final class OpenAIService: ObservableObject {
         )
     }
 
+    private func qaForcedOAuthExecutionSetupSnapshot() -> OAuthExecutionSetupSnapshot? {
+        guard let rawPhase = ProcessInfo.processInfo.environment[qaForceOAuthSetupPhaseEnvironmentVariable]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+              let phase = OAuthExecutionSetupSnapshot.Phase(rawValue: rawPhase) else {
+            return nil
+        }
+
+        let repo = ProcessInfo.processInfo.environment[qaForceOAuthWorkspaceRepoEnvironmentVariable]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let message = ProcessInfo.processInfo.environment[qaForceOAuthSetupMessageEnvironmentVariable]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        switch phase {
+        case .ready:
+            return .ready
+        case .connectGitHub:
+            return OAuthExecutionSetupSnapshot(
+                phase: .connectGitHub,
+                message: message?.isEmpty == false ? message : connectorBootstrapMessage(for: nil),
+                environmentLabel: nil,
+                machineLabel: nil,
+                workspaceRepositoryFullName: repo
+            )
+        case .confirmRepositoryScope:
+            return OAuthExecutionSetupSnapshot(
+                phase: .confirmRepositoryScope,
+                message: message?.isEmpty == false ? message : """
+                Sidekick opened GitHub with only \(repo ?? "sidekick-workspace") preselected. Confirm that you left the ChatGPT Codex Connector on Only selected repositories and that this workspace repo was the only selected repo.
+                """,
+                environmentLabel: nil,
+                machineLabel: nil,
+                workspaceRepositoryFullName: repo
+            )
+        case .waitingForMachine:
+            return OAuthExecutionSetupSnapshot(
+                phase: .waitingForMachine,
+                message: message?.isEmpty == false ? message : "GitHub is connected. Sidekick is waiting for Codex to expose a usable machine template for the workspace repo.",
+                environmentLabel: nil,
+                machineLabel: nil,
+                workspaceRepositoryFullName: repo
+            )
+        case .autoProvisioning:
+            return OAuthExecutionSetupSnapshot(
+                phase: .autoProvisioning,
+                message: message?.isEmpty == false ? message : "GitHub is connected. Sidekick is creating and verifying the repository-bound Codex environment.",
+                environmentLabel: nil,
+                machineLabel: "QA simulator machine",
+                workspaceRepositoryFullName: repo
+            )
+        case .waitingForEnvironment:
+            return OAuthExecutionSetupSnapshot(
+                phase: .waitingForEnvironment,
+                message: message?.isEmpty == false ? message : "GitHub is connected. Sidekick is waiting for the repository-bound Codex environment to appear.",
+                environmentLabel: nil,
+                machineLabel: "QA simulator machine",
+                workspaceRepositoryFullName: repo
+            )
+        case .manualFinish:
+            return OAuthExecutionSetupSnapshot(
+                phase: .manualFinish,
+                message: message?.isEmpty == false ? message : "GitHub is connected, but ChatGPT still needs a repository-bound environment for \(repo ?? "sidekick-workspace"). Open Codex Environments, finish or verify it there, then come back and check again.",
+                environmentLabel: nil,
+                machineLabel: "QA simulator machine",
+                workspaceRepositoryFullName: repo
+            )
+        }
+    }
+
     private func storedAPIKey() -> String? {
         let value = (try? apiKeychain.load(account: apiKeyAccount)).map {
             $0.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3927,20 +4164,91 @@ final class OpenAIService: ObservableObject {
         }
     }
 
-    private func oauthExecutionRequiresGitHubConnection() async -> Bool {
+    private func oauthExecutionGitHubInstallationExists() async -> Bool {
         do {
-            _ = try await sendBackendRequest(
+            let data = try await sendBackendRequest(
                 pathComponents: ["wham", "github", "installations"],
                 method: "GET",
                 body: nil
             )
-            return false
+            if data.isEmpty {
+                return false
+            }
+            return true
         } catch let error as BackendRequestFailure {
-            return error.detailType == "missing_github_connector_link"
-                || error.localizedDescription.localizedCaseInsensitiveContains("github connection not found for user")
+            if error.statusCode == 404 {
+                return false
+            }
+            return !(error.detailType == "missing_github_connector_link"
+                || error.localizedDescription.localizedCaseInsensitiveContains("github connection not found for user"))
         } catch {
             return false
         }
+    }
+
+    private func fetchConnectedGitHubRepositoriesDiagnostics(
+        workspaceContext: GitHubWorkspaceContext?
+    ) async -> ConnectedGitHubRepositoriesDiagnostics {
+        guard let workspaceContext else {
+            return .unavailable
+        }
+
+        let candidatePaths = [
+            ["wham", "github", "repos"],
+            ["wham", "repos"],
+        ]
+
+        for path in candidatePaths {
+            do {
+                let data = try await sendBackendRequest(
+                    pathComponents: path,
+                    method: "GET",
+                    body: nil
+                )
+                let repositories = decodeConnectedGitHubRepositories(from: data)
+                guard !repositories.isEmpty else {
+                    return .mismatch(
+                        """
+                        Codex reported a GitHub connection, but Sidekick could not confirm that only \(workspaceContext.repositoryFullName) is connected. Review GitHub access again and leave the connector on Only selected repositories.
+                        """
+                    )
+                }
+
+                guard repositories.count == 1 else {
+                    return .mismatch(
+                        """
+                        Codex reported \(repositories.count) connected repositories. Sidekick only supports one workspace repo per user. Review GitHub access again and leave the connector scoped only to \(workspaceContext.repositoryFullName).
+                        """
+                    )
+                }
+
+                let connectedRepository = repositories[0]
+                if connectedRepository.matches(workspaceContext: workspaceContext) {
+                    return .matched
+                }
+
+                return .mismatch(
+                    """
+                    Codex reported \(connectedRepository.displayName) instead of \(workspaceContext.repositoryFullName). Review GitHub access again and leave the connector scoped only to \(workspaceContext.repositoryFullName).
+                    """
+                )
+            } catch let error as BackendRequestFailure where error.statusCode == 404 {
+                continue
+            } catch {
+                log("connected repo diagnostics failed for \(path.joined(separator: "/")): \(error.localizedDescription)")
+            }
+        }
+
+        return .unavailable
+    }
+
+    private func decodeConnectedGitHubRepositories(from data: Data) -> [ConnectedGitHubRepository] {
+        guard let json = try? JSONSerialization.jsonObject(with: data) else {
+            return []
+        }
+
+        let dictionaries = dictionaryArray(fromJSONObject: json)
+        return dictionaries.compactMap(ConnectedGitHubRepository.init)
     }
 
     private func persistUserAPIKeyFailureIfNeeded(_ message: String) {
@@ -4091,6 +4399,12 @@ private enum CloudTaskEnvironmentPreference: String, Codable {
     case networkedSelfContained
 }
 
+private enum ConnectedGitHubRepositoriesDiagnostics {
+    case matched
+    case mismatch(String)
+    case unavailable
+}
+
 private struct BackendRequestFailure: LocalizedError {
     let statusCode: Int
     let detailType: String?
@@ -4138,6 +4452,8 @@ private actor OAuthExecutionSetupBootstrapCoordinator {
     private var isAttemptInFlight = false
     private var lastAttemptedMachineID: String?
     private var lastAttemptAt: Date?
+    private var unresolvedStateFirstObservedAt: Date?
+    private var unresolvedStateObservationCount = 0
 
     func beginAttempt(
         machineID: String,
@@ -4167,10 +4483,36 @@ private actor OAuthExecutionSetupBootstrapCoordinator {
         lastAttemptAt = Date()
     }
 
+    func recordProgress() {
+        unresolvedStateFirstObservedAt = nil
+        unresolvedStateObservationCount = 0
+    }
+
+    func recordUnresolvedStateObservation(
+        minimumObservations: Int = 4,
+        timeout: TimeInterval = 45
+    ) -> Bool {
+        let now = Date()
+        unresolvedStateObservationCount += 1
+
+        if unresolvedStateFirstObservedAt == nil {
+            unresolvedStateFirstObservedAt = now
+        }
+
+        guard let unresolvedStateFirstObservedAt else {
+            return false
+        }
+
+        return unresolvedStateObservationCount >= minimumObservations
+            || now.timeIntervalSince(unresolvedStateFirstObservedAt) >= timeout
+    }
+
     func reset() {
         isAttemptInFlight = false
         lastAttemptedMachineID = nil
         lastAttemptAt = nil
+        unresolvedStateFirstObservedAt = nil
+        unresolvedStateObservationCount = 0
     }
 }
 
@@ -4388,6 +4730,8 @@ private struct CloudTaskEnvironment: Codable {
     let taskCount: Int?
     let agentNetworkAccess: CloudTaskAgentNetworkAccess?
     let envVars: [String: String]?
+    let repos: [CloudTaskEnvironmentRepository]?
+    let repositories: [CloudTaskEnvironmentRepository]?
 
     enum CodingKeys: String, CodingKey {
         case id
@@ -4396,10 +4740,113 @@ private struct CloudTaskEnvironment: Codable {
         case taskCount = "task_count"
         case agentNetworkAccess = "agent_network_access"
         case envVars = "env_vars"
+        case repos
+        case repositories
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        label = try container.decodeIfPresent(String.self, forKey: .label)
+        isPinned = try container.decodeIfPresent(Bool.self, forKey: .isPinned)
+        taskCount = try container.decodeIfPresent(Int.self, forKey: .taskCount)
+        agentNetworkAccess = try container.decodeIfPresent(CloudTaskAgentNetworkAccess.self, forKey: .agentNetworkAccess)
+        envVars = try container.decodeIfPresent([String: String].self, forKey: .envVars)
+        repos = CloudTaskEnvironment.decodeRepositories(container: container, key: .repos)
+        repositories = CloudTaskEnvironment.decodeRepositories(container: container, key: .repositories)
     }
 
     var hasPythonRuntime: Bool {
         envVars?["CODEX_ENV_PYTHON_VERSION"] != nil
+    }
+
+    var isRepositoryBound: Bool {
+        let connectedRepositories = (repos ?? []) + (repositories ?? [])
+        if !connectedRepositories.isEmpty {
+            return true
+        }
+        return (label ?? "").contains("/")
+    }
+
+    private static func decodeRepositories(
+        container: KeyedDecodingContainer<CodingKeys>,
+        key: CodingKeys
+    ) -> [CloudTaskEnvironmentRepository]? {
+        if let repositories = try? container.decodeIfPresent([CloudTaskEnvironmentRepository].self, forKey: key) {
+            return repositories
+        }
+
+        if let names = try? container.decodeIfPresent([String].self, forKey: key) {
+            return names.map {
+                CloudTaskEnvironmentRepository(name: nil, fullName: $0)
+            }
+        }
+
+        return nil
+    }
+}
+
+private struct CloudTaskEnvironmentRepository: Codable {
+    let name: String?
+    let fullName: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case fullName = "full_name"
+    }
+}
+
+private struct ConnectedGitHubRepository {
+    let repositoryID: Int?
+    let name: String?
+    let fullName: String?
+
+    nonisolated init?(dictionary: [String: Any]) {
+        let repositoryID: Int?
+        if let intValue = dictionary["id"] as? Int {
+            repositoryID = intValue
+        } else if let stringValue = dictionary["id"] as? String {
+            repositoryID = Int(stringValue)
+        } else if let intValue = dictionary["repository_id"] as? Int {
+            repositoryID = intValue
+        } else if let stringValue = dictionary["repository_id"] as? String {
+            repositoryID = Int(stringValue)
+        } else {
+            repositoryID = nil
+        }
+
+        let name = (dictionary["name"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let fullName = (
+            (dictionary["full_name"] as? String)
+            ?? (dictionary["fullName"] as? String)
+            ?? (dictionary["repo"] as? String)
+        )?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard repositoryID != nil || name != nil || fullName != nil else {
+            return nil
+        }
+
+        self.repositoryID = repositoryID
+        self.name = name
+        self.fullName = fullName
+    }
+
+    var displayName: String {
+        fullName ?? name ?? "<unknown repository>"
+    }
+
+    func matches(workspaceContext: GitHubWorkspaceContext) -> Bool {
+        if let repositoryID, repositoryID == workspaceContext.repositoryID {
+            return true
+        }
+        if let fullName, fullName == workspaceContext.repositoryFullName {
+            return true
+        }
+        if let name, name == workspaceContext.repositoryName {
+            return true
+        }
+        return false
     }
 }
 

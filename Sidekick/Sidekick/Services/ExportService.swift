@@ -263,19 +263,17 @@ private enum LatexRenderer {
         line.hasPrefix("|") && line.hasSuffix("|") && line.contains("|")
     }
 
-    nonisolated private static func isTableSeparatorRow(_ columns: [String]) -> Bool {
-        let stripped = columns
-            .joined()
-            .replacingOccurrences(of: ":", with: "")
-            .replacingOccurrences(of: "-", with: "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        return stripped.isEmpty
-    }
-
     nonisolated private static func parseTableRow(_ line: String) -> [String] {
         line
             .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
-            .split(separator: "|", omittingEmptySubsequences: false)
+            .split(separator: "|")
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+    }
+
+    nonisolated private static func isTableSeparatorRow(_ columns: [String]) -> Bool {
+        !columns.isEmpty && columns.allSatisfy { column in
+            let trimmed = column.replacingOccurrences(of: ":", with: "")
+            return !trimmed.isEmpty && trimmed.allSatisfy { $0 == "-" }
+        }
     }
 }

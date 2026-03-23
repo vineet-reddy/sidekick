@@ -4,7 +4,6 @@ import Foundation
 import Network
 import Security
 import UIKit
-private let openAIEnvironmentRouterDefaultsKey = "com.vineet.sidekick.openai-environment-router"
 
 @MainActor
 final class AuthService: ObservableObject {
@@ -67,6 +66,14 @@ final class AuthService: ObservableObject {
         self.issuer = issuer.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         self.callbackPort = callbackPort
         self.scopes = scopes
+
+        if let qaEmail = ProcessInfo.processInfo.environment["SIDEKICK_QA_MOCK_AUTH_EMAIL"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+           !qaEmail.isEmpty {
+            isAuthenticated = true
+            userEmail = qaEmail
+            return
+        }
 
         let hasRefresh = ((try? keychain.load(account: refreshTokenAccount)) ?? "").isEmpty == false
         isAuthenticated = hasRefresh
@@ -159,6 +166,7 @@ final class AuthService: ObservableObject {
         clearOAuthWorkspaceState()
         isAuthenticated = false
         userEmail = nil
+        NotificationCenter.default.post(name: .sidekickDidSignOut, object: nil)
     }
 
     // MARK: - Get Valid Token
@@ -279,7 +287,11 @@ final class AuthService: ObservableObject {
     }
 
     private func clearOAuthWorkspaceState() {
-        UserDefaults.standard.removeObject(forKey: openAIEnvironmentRouterDefaultsKey)
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: sidekickOpenAIEnvironmentRouterDefaultsKey)
+        defaults.removeObject(forKey: sidekickGitHubWorkspaceContextDefaultsKey)
+        defaults.removeObject(forKey: sidekickGitHubBootstrapSessionDefaultsKey)
+        defaults.removeObject(forKey: sidekickConnectorScopeAttestationDefaultsKey)
     }
 
     // MARK: - PKCE Helpers

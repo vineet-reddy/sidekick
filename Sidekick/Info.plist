@@ -30,6 +30,8 @@
   <string>Sidekick uses speech recognition to capture research notes hands-free.</string>
   <key>NSMicrophoneUsageDescription</key>
   <string>Sidekick uses the microphone when you dictate a note.</string>
+  <key>SidekickGitHubBootstrapBaseURL</key>
+  <string>https://sidekick-github-bootstrap.onrender.com</string>
   <key>UIApplicationSceneManifest</key>
   <dict>
     <key>UIApplicationSupportsMultipleScenes</key>

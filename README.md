@@ -20,3 +20,7 @@ The script writes local runtime state under `.sidekick-runtime/`:
 - the persistent capture itself lives in `~/Library/Logs/Sidekick/`
 
 `start` installs or refreshes a user LaunchAgent so the capture survives future agent sessions. `stream` is the foreground live view for the current shell.
+
+## GitHub Bootstrap Service
+
+Sidekick's secure one-repo Codex setup flow needs a small GitHub bootstrap backend. Deployment notes live in [docs/bootstrap-service.md](docs/bootstrap-service.md).
