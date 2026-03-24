@@ -7,6 +7,20 @@ enum PaperStatus: String, Codable, CaseIterable {
     case failed
 }
 
+enum PublishedManuscriptKind: String, Codable {
+    case paper
+    case memo
+
+    var displayTitle: String {
+        switch self {
+        case .paper:
+            return "Paper"
+        case .memo:
+            return "Research Memo"
+        }
+    }
+}
+
 @Model
 final class Note {
     var id: UUID

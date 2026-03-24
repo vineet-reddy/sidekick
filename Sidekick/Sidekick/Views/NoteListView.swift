@@ -4,11 +4,13 @@ import SwiftUI
 struct NoteListView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject private var heartbeat: HeartbeatManager
+    @EnvironmentObject private var researchInputs: ResearchInputStore
     @Query(sort: \Note.updatedAt, order: .reverse) private var notes: [Note]
 
     @State private var searchText = ""
     @State private var editingNote: Note?
     @State private var newNoteText = ""
+    @State private var isShowingResearchInputs = false
     @FocusState private var isNewNoteFocused: Bool
     @State private var prioritizedNoteID: UUID?
 
@@ -29,6 +31,8 @@ struct NoteListView: View {
 
             ScrollView {
                 LazyVStack(spacing: 12) {
+                    researchInputsCard
+
                     if filteredNotes.isEmpty && newNoteText.isEmpty {
                         Text("Jot something down below to get started.")
                             .font(.subheadline)
@@ -91,6 +95,10 @@ struct NoteListView: View {
         .sheet(item: $editingNote) { note in
             NoteEditorView(note: note)
         }
+        .sheet(isPresented: $isShowingResearchInputs) {
+            ResearchInputsSheet()
+                .environmentObject(researchInputs)
+        }
     }
 
     private var inlineComposer: some View {
@@ -126,6 +134,46 @@ struct NoteListView: View {
         .padding(.horizontal, 16)
         .padding(.bottom, 4)
         .accessibilityIdentifier("notes.inlineComposer")
+    }
+
+    private var researchInputsCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Research Inputs")
+                        .font(.headline)
+                    Text(researchInputsSubtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Spacer()
+
+                Button("Add Sources") {
+                    isShowingResearchInputs = true
+                }
+                .buttonStyle(.bordered)
+            }
+
+            if !researchInputs.domainGuidance.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                Text(researchInputs.domainGuidance.trimmingCharacters(in: .whitespacesAndNewlines))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(3)
+            }
+        }
+        .glassCard(padding: 14)
+    }
+
+    private var researchInputsSubtitle: String {
+        let sourceCount = researchInputs.snapshot.mustUseSources.count
+        if sourceCount == 0 {
+            return "Add papers, datasets, or codebases that future runs must use."
+        }
+
+        return sourceCount == 1
+            ? "1 must-use source will be passed into upcoming runs."
+            : "\(sourceCount) must-use sources will be passed into upcoming runs."
     }
 
     private func noteCard(for note: Note) -> some View {

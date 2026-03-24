@@ -108,9 +108,16 @@ struct PaperDetailView: View {
                 message: "Sidekick is typesetting the final paper PDF."
             )
         case let .ready(url):
-            PaperPDFView(url: url)
-                .glassCard(padding: 0)
-                .padding(14)
+            VStack(alignment: .leading, spacing: 10) {
+                if manuscriptKind == .memo {
+                    StatusPill(title: manuscriptKind.displayTitle, tint: .orange)
+                        .padding(.horizontal, 14)
+                }
+
+                PaperPDFView(url: url)
+                    .glassCard(padding: 0)
+            }
+            .padding(14)
         case let .failed(message):
             progressCard(
                 title: "PDF unavailable",
@@ -151,6 +158,10 @@ struct PaperDetailView: View {
 
     private var exportURL: URL? {
         exportMetadata?.repoURL
+    }
+
+    private var manuscriptKind: PublishedManuscriptKind {
+        exportMetadata?.manuscriptKind ?? .paper
     }
 
     private func progressCard(title: String, message: String) -> some View {

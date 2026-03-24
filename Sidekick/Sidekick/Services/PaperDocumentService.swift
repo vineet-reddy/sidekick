@@ -18,7 +18,7 @@ enum PaperDocumentService {
         }
     }
 
-    private static let renderVersion = 9
+    private static let renderVersion = 10
 
     static func ensurePDF(for paper: Paper) async throws -> URL {
         try await ensureRenderedBundle(for: paper).pdfURL
@@ -95,6 +95,18 @@ enum PaperDocumentService {
             plan: plan,
             analysis: analysis
         )
+        if let published = try await publishedManuscript(for: paper) {
+            return try PaperArtifactStore.persistRenderedBundle(
+                taskID: taskID,
+                title: paper.title,
+                fingerprint: fingerprint,
+                html: html,
+                latex: published.latex,
+                figures: paper.figureData,
+                pdfData: published.pdfData
+            )
+        }
+
         let latex = ExportService.latexDocument(
             for: paper,
             figureCaptions: figureCaptions,
@@ -112,6 +124,15 @@ enum PaperDocumentService {
             figures: paper.figureData,
             pdfData: pdfData
         )
+    }
+
+    private static func publishedManuscript(for paper: Paper) async throws -> PublishedManuscriptBundle? {
+        let taskID = artifactKey(for: paper)
+        guard let metadata = PaperArtifactStore.exportMetadata(for: taskID) else {
+            return nil
+        }
+
+        return try await PublishedArtifactService.fetchManuscript(metadata: metadata)
     }
 
     private static func artifactKey(for paper: Paper) -> String {

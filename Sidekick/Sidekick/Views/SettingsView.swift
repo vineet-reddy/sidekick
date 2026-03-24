@@ -23,7 +23,7 @@ struct SettingsView: View {
 
                         Text(
                             github.isConnected
-                                ? "Sidekick publishes every completed paper into your public GitHub repo as LaTeX plus reproducibility code."
+                                ? "Sidekick publishes every completed paper or memo into your public GitHub repo as canonical LaTeX, PDF, references, figures, and reproducibility artifacts."
                                 : "GitHub is required before Sidekick starts a paper. Every run publishes to a public repo in the user’s account."
                         )
                         .font(.subheadline)
@@ -62,7 +62,7 @@ struct SettingsView: View {
                         Text("Execution")
                             .font(.headline)
 
-                        Text("Sidekick runs planning, data inspection, analysis, verification, and final paper writing on Sidekick-hosted OpenAI compute. The app keeps notes, cached artifacts, and local PDF rendering on device.")
+                        Text("Sidekick runs planning, data inspection, analysis, verification, manuscript writing, and server-side PDF compilation on Sidekick-hosted OpenAI compute. The app keeps notes, cached artifacts, and a local preview fallback on device.")
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
 

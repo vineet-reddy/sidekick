@@ -24,6 +24,7 @@ enum PaperArtifactStore {
         let commitSHA: String?
         let repoPath: String?
         let publishedAt: Date?
+        let manuscriptKind: PublishedManuscriptKind
     }
 
     private struct PendingSubmission: Codable {
@@ -64,12 +65,14 @@ enum PaperArtifactStore {
         let commitSHA: String?
         let repoPath: String?
         let publishedAt: Date
+        let manuscriptKind: PublishedManuscriptKind?
 
         enum CodingKeys: String, CodingKey {
             case repoURL = "repo_url"
             case commitSHA = "commit_sha"
             case repoPath = "repo_path"
             case publishedAt = "published_at"
+            case manuscriptKind = "manuscript_kind"
         }
     }
 
@@ -152,13 +155,15 @@ enum PaperArtifactStore {
         repoURL: URL?,
         commitSHA: String?,
         repoPath: String?,
+        manuscriptKind: PublishedManuscriptKind = .paper,
         publishedAt: Date = .now
     ) throws {
         let metadata = StoredExportMetadata(
             repoURL: repoURL,
             commitSHA: commitSHA,
             repoPath: repoPath,
-            publishedAt: publishedAt
+            publishedAt: publishedAt,
+            manuscriptKind: manuscriptKind
         )
         try write(metadata, to: exportMetadataURL(for: taskID))
     }
@@ -172,7 +177,8 @@ enum PaperArtifactStore {
             repoURL: stored.repoURL,
             commitSHA: stored.commitSHA,
             repoPath: stored.repoPath,
-            publishedAt: stored.publishedAt
+            publishedAt: stored.publishedAt,
+            manuscriptKind: stored.manuscriptKind ?? .paper
         )
     }
 

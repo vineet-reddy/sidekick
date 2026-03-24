@@ -19,12 +19,14 @@ struct PaperExportMetadata {
     let commitSHA: String?
     let repoPath: String?
     let publishedAt: Date?
+    let manuscriptKind: PublishedManuscriptKind
 }
 
 struct PaperArtifacts {
     let title: String
     let markdown: String
     let latex: String
+    let manuscriptKind: PublishedManuscriptKind
     let figures: [Data]
     let provenance: TaskOutputProvenance?
     let plan: ResearchPlanArtifact?
@@ -111,12 +113,14 @@ private struct PublicationPayload: Decodable {
     let commitSHA: String?
     let repoPath: String?
     let publishedAt: Date?
+    let manuscriptKind: PublishedManuscriptKind?
 
     enum CodingKeys: String, CodingKey {
         case repoURL = "repo_url"
         case commitSHA = "commit_sha"
         case repoPath = "repo_path"
         case publishedAt = "published_at"
+        case manuscriptKind = "manuscript_kind"
     }
 }
 
@@ -127,7 +131,8 @@ private struct AnalysisFilePayload: Decodable {
 
 private struct PaperBundlePayload: Decodable {
     let title: String
-    let markdown: String
+    let manuscriptKind: PublishedManuscriptKind?
+    let sections: ManuscriptSectionsPayload?
     let latex: String?
     let analysisFiles: [AnalysisFilePayload]?
     let figures: [ResearchFigureArtifact]?
@@ -141,7 +146,8 @@ private struct PaperBundlePayload: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case title
-        case markdown
+        case manuscriptKind = "manuscript_kind"
+        case sections
         case latex
         case analysisFiles = "analysis_files"
         case figures
@@ -152,6 +158,46 @@ private struct PaperBundlePayload: Decodable {
         case analysis
         case verification
         case draft
+    }
+}
+
+private struct ManuscriptSectionsPayload: Decodable {
+    let title: String?
+    let abstract: String?
+    let introduction: String?
+    let methods: String?
+    let results: String?
+    let discussion: String?
+    let limitations: String?
+    let references: [String]?
+
+    func markdownPreview(fallbackTitle: String, manuscriptKind: PublishedManuscriptKind) -> String {
+        let resolvedTitle = (title ?? fallbackTitle).trimmingCharacters(in: .whitespacesAndNewlines)
+        let heading = manuscriptKind == .memo ? "Research Memo" : "Paper"
+        var blocks = ["# \(resolvedTitle.isEmpty ? fallbackTitle : resolvedTitle)", "_\(heading)_"]
+        let orderedSections: [(String, String?)] = [
+            ("Abstract", abstract),
+            ("Introduction", introduction),
+            ("Methods", methods),
+            ("Results", results),
+            ("Discussion", discussion),
+            ("Limitations", limitations),
+        ]
+        for (label, value) in orderedSections {
+            let trimmed = (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty else {
+                continue
+            }
+            blocks.append("## \(label)\n\n\(trimmed)")
+        }
+        let trimmedReferences = (references ?? []).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }.filter { !$0.isEmpty }
+        if !trimmedReferences.isEmpty {
+            let list = trimmedReferences.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n")
+            blocks.append("## References\n\n\(list)")
+        }
+        return blocks.joined(separator: "\n\n")
     }
 }
 
@@ -237,16 +283,19 @@ final class OpenAIService: ObservableObject {
     private let github: GitHubService
     private let session: URLSession
     private let trustedDatasets: TrustedDatasetRegistry
+    private let researchInputStore: ResearchInputStore
     private let decoder = JSONDecoder()
 
     init(
         github: GitHubService,
         session: URLSession = .shared,
-        trustedDatasets: TrustedDatasetRegistry? = nil
+        trustedDatasets: TrustedDatasetRegistry? = nil,
+        researchInputStore: ResearchInputStore
     ) {
         self.github = github
         self.session = session
         self.trustedDatasets = trustedDatasets ?? TrustedDatasetRegistry(session: session, remoteURL: nil)
+        self.researchInputStore = researchInputStore
         decoder.dateDecodingStrategy = .iso8601
     }
 
@@ -302,7 +351,7 @@ final class OpenAIService: ObservableObject {
 
         return ResearchRunPreparation(
             selectedDatasetIDs: selectedDatasets.map(\.id),
-            allowedDomains: [],
+            allowedDomains: TrustedDatasetRegistry.allowedDomains(for: selectedDatasets),
             registryVersion: registryVersion,
             sourceSupportTier: selectedDatasets.isEmpty ? .experimental : .supported,
             schedulingDisposition: connected ? .autoStart : .hold,
@@ -329,15 +378,20 @@ final class OpenAIService: ObservableObject {
             noteTexts: notes.map(\.content),
             limit: 4
         )
+        let datasetHints = selectedDatasets.map { $0.taskLine() }
+        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
+        let researchInputs = researchInputStore.snapshot
         let response: JobCreateResponse = try await performRequest(
             path: "api/papers",
             method: "POST",
             body: [
                 "title": title,
                 "theme": theme,
-                "dataset_ids": [],
-                "dataset_hints": [],
-                "allowed_domains": [],
+                "dataset_ids": selectedDatasets.map(\.id),
+                "dataset_hints": datasetHints,
+                "allowed_domains": allowedDomains,
+                "must_use_sources": researchInputs.mustUseSources.map(\.requestPayload),
+                "domain_guidance": researchInputs.domainGuidance,
                 "notes": notes.map {
                     [
                         "id": $0.id.uuidString,
@@ -351,7 +405,7 @@ final class OpenAIService: ObservableObject {
         return PaperTaskSubmission(
             taskID: response.jobID,
             selectedDatasetIDs: selectedDatasets.map(\.id),
-            allowedDomains: [],
+            allowedDomains: allowedDomains,
             registryVersion: registryVersion
         )
     }
@@ -388,10 +442,18 @@ final class OpenAIService: ObservableObject {
             let topLevelFigures = bundle.figures ?? bundle.analysis?.figures ?? []
             let decodedFigures = topLevelFigures.compactMap(\.imageData)
             let figureBytes = decodedFigures.isEmpty ? (bundle.analysis?.figureData ?? []) : decodedFigures
+            let manuscriptKind = bundle.manuscriptKind ?? envelope.publication?.manuscriptKind ?? .paper
+            let markdown = bundle.draft?.markdown
+                ?? bundle.sections?.markdownPreview(
+                    fallbackTitle: bundle.title,
+                    manuscriptKind: manuscriptKind
+                )
+                ?? ""
             let artifacts = PaperArtifacts(
                 title: bundle.title,
-                markdown: bundle.markdown,
+                markdown: markdown,
                 latex: bundle.latex ?? "",
+                manuscriptKind: manuscriptKind,
                 figures: figureBytes,
                 provenance: bundle.provenance ?? bundle.analysis?.provenance,
                 plan: bundle.plan,
@@ -403,7 +465,8 @@ final class OpenAIService: ObservableObject {
                     repoURL: envelope.publication?.repoURL,
                     commitSHA: envelope.publication?.commitSHA ?? status.repoCommitSHA,
                     repoPath: envelope.publication?.repoPath ?? status.repoPath,
-                    publishedAt: envelope.publication?.publishedAt
+                    publishedAt: envelope.publication?.publishedAt,
+                    manuscriptKind: manuscriptKind
                 )
             )
             return .completed(snapshot, artifacts)

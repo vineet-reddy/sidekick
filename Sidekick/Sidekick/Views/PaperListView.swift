@@ -106,6 +106,7 @@ struct PaperListView: View {
     private func paperCard(for paper: Paper) -> some View {
         let run = runsByPaperID[paper.id]
         let shouldShowSummary = !(paper.status == .generating && paper.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        let manuscriptKind = manuscriptKind(for: paper)
 
         return VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .top) {
@@ -117,7 +118,7 @@ struct PaperListView: View {
 
                 Spacer()
 
-                statusPill(for: paper, run: run)
+                statusPill(for: paper, run: run, manuscriptKind: manuscriptKind)
             }
 
             HStack {
@@ -167,10 +168,12 @@ struct PaperListView: View {
     }
 
     @ViewBuilder
-    private func statusPill(for paper: Paper, run: ResearchRun?) -> some View {
+    private func statusPill(for paper: Paper, run: ResearchRun?, manuscriptKind: PublishedManuscriptKind) -> some View {
         switch paper.status {
         case .ready:
-            EmptyView()
+            if manuscriptKind == .memo {
+                StatusPill(title: manuscriptKind.displayTitle, tint: .orange)
+            }
         case .generating:
             if let run {
                 StatusPill(title: run.listStatusLabel, tint: statusTint(for: run))
@@ -180,6 +183,15 @@ struct PaperListView: View {
         case .failed:
             StatusPill(title: "Needs retry", tint: .red)
         }
+    }
+
+    private func manuscriptKind(for paper: Paper) -> PublishedManuscriptKind {
+        let key = paper.codexTaskID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            return .paper
+        }
+
+        return PaperArtifactStore.exportMetadata(for: key)?.manuscriptKind ?? .paper
     }
 
     private func statusTint(for run: ResearchRun) -> Color {

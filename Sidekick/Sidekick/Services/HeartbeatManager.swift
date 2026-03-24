@@ -274,6 +274,7 @@ final class HeartbeatManager: ObservableObject {
                 repoURL: export.repoURL,
                 commitSHA: export.commitSHA,
                 repoPath: export.repoPath,
+                manuscriptKind: export.manuscriptKind,
                 publishedAt: export.publishedAt ?? .now
             )
         }
@@ -301,7 +302,7 @@ final class HeartbeatManager: ObservableObject {
             paper.lastNotifiedAt = .now
         }
 
-        run.markCompleted(message: "Paper ready.")
+        run.markCompleted(message: artifacts.manuscriptKind == .memo ? "Research memo ready." : "Paper ready.")
         try persistModelChanges(in: run.modelContext)
     }
 
@@ -353,7 +354,8 @@ final class HeartbeatManager: ObservableObject {
             paper.lastNotifiedAt = .now
         }
 
-        run.markCompleted(message: "Paper ready.")
+        let manuscriptKind = PaperArtifactStore.exportMetadata(for: taskID)?.manuscriptKind ?? .paper
+        run.markCompleted(message: manuscriptKind == .memo ? "Research memo ready." : "Paper ready.")
         persistModelChangesIfPossible(in: run.modelContext, context: "repair completed paper")
         return true
     }

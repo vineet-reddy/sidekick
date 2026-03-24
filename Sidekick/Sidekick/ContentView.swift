@@ -469,7 +469,7 @@ private struct GitHubRequiredView: View {
                     Text("Connect GitHub To Use Sidekick")
                         .font(.title2.weight(.semibold))
 
-                    Text("GitHub is required before the app unlocks. Sidekick publishes every paper as LaTeX, code, manifests, and figures into a public repo in your GitHub account.")
+                    Text("GitHub is required before the app unlocks. Sidekick publishes every paper or memo as LaTeX, PDF, references, manifests, and figures into a public repo in your GitHub account.")
                         .font(.body)
                         .foregroundStyle(.secondary)
 
