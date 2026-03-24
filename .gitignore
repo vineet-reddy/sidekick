@@ -9,6 +9,7 @@
 /SESSION_HANDOFF_*.md
 /REDESIGN*.md
 /handoff.md
+/overnight_report.md
 /error.log
 TRUSTED_DATASET_REGISTRY_SPEC.md
 
@@ -22,3 +23,10 @@ build/
 
 # Local runtime tooling state
 /.sidekick-runtime/
+/.tmp-sidekick-tests/
+/relevantcode.md
+/paperlab/runs/*
+!/paperlab/runs/.gitkeep
+
+# Vineet notes
+vineet_notes.md
