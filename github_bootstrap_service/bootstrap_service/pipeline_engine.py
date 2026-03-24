@@ -59,10 +59,65 @@ def extract_json_object(raw_text: str) -> dict[str, Any]:
         try:
             payload, _ = decoder.raw_decode(raw_text[index:])
         except json.JSONDecodeError:
-            continue
+            try:
+                payload, _ = decoder.raw_decode(_repair_json_like_text(raw_text[index:]))
+            except json.JSONDecodeError:
+                continue
         if isinstance(payload, dict):
             return payload
     raise ValueError("Model output did not contain a JSON object.")
+
+
+def _repair_json_like_text(raw_text: str) -> str:
+    repaired: list[str] = []
+    in_string = False
+    index = 0
+    length = len(raw_text)
+    while index < length:
+        character = raw_text[index]
+        if not in_string:
+            repaired.append(character)
+            if character == '"':
+                in_string = True
+            index += 1
+            continue
+
+        if character == "\\":
+            next_character = raw_text[index + 1] if index + 1 < length else ""
+            if next_character in {'"', "\\", "/", "b", "f", "n", "r", "t"}:
+                repaired.append("\\")
+                repaired.append(next_character)
+                index += 2
+                continue
+            if next_character == "u" and index + 5 < length and all(
+                part in "0123456789abcdefABCDEF" for part in raw_text[index + 2 : index + 6]
+            ):
+                repaired.append(raw_text[index : index + 6])
+                index += 6
+                continue
+            repaired.append("\\\\")
+            index += 1
+            continue
+
+        if character == "\n":
+            repaired.append("\\n")
+            index += 1
+            continue
+        if character == "\r":
+            repaired.append("\\r")
+            index += 1
+            continue
+        if character == "\t":
+            repaired.append("\\t")
+            index += 1
+            continue
+
+        repaired.append(character)
+        if character == '"':
+            in_string = False
+        index += 1
+
+    return "".join(repaired)
 
 
 def normalize_text_list(value: Any) -> list[str]:

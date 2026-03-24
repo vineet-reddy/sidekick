@@ -9,7 +9,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bootstrap_service.config import BootstrapServiceConfig
 from bootstrap_service.openai_client import OpenAIContainerFile, OpenAIResponseResult, OpenAIUsage
-from bootstrap_service.pipeline_engine import PaperPipelineEngine
+from bootstrap_service.pipeline_engine import PaperPipelineEngine, extract_json_object
 
 
 def _config(root: pathlib.Path) -> BootstrapServiceConfig:
@@ -114,6 +114,17 @@ def _fake_compile(job_directory: pathlib.Path, *, tex_filename: str) -> dict[str
 
 
 class PipelineEngineTests(unittest.TestCase):
+    def test_extract_json_object_repairs_unescaped_latex_inside_strings(self) -> None:
+        raw = (
+            '{"title":"Example","results":"\\\\subsection*{Heading}"}'
+            .replace("\\\\subsection", "\\subsection")
+        )
+
+        payload = extract_json_object(raw)
+
+        self.assertEqual(payload["title"], "Example")
+        self.assertEqual(payload["results"], "\\subsection*{Heading}")
+
     def test_engine_execute_writes_local_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = pathlib.Path(tempdir)
