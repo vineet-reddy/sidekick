@@ -27,6 +27,7 @@ struct PaperArtifacts {
     let markdown: String
     let latex: String
     let manuscriptKind: PublishedManuscriptKind
+    let figureArtifacts: [ResearchFigureArtifact]
     let figures: [Data]
     let provenance: TaskOutputProvenance?
     let plan: ResearchPlanArtifact?
@@ -454,6 +455,7 @@ final class OpenAIService: ObservableObject {
                 markdown: markdown,
                 latex: bundle.latex ?? "",
                 manuscriptKind: manuscriptKind,
+                figureArtifacts: topLevelFigures,
                 figures: figureBytes,
                 provenance: bundle.provenance ?? bundle.analysis?.provenance,
                 plan: bundle.plan,

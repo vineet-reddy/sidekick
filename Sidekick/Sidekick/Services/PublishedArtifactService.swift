@@ -1,7 +1,7 @@
 import Foundation
 
 struct PublishedManuscriptBundle {
-    let pdfData: Data
+    let pdfData: Data?
     let latex: String
 }
 
@@ -9,28 +9,31 @@ enum PublishedArtifactService {
     static func fetchManuscript(
         metadata: PaperArtifactStore.ExportMetadataSnapshot
     ) async throws -> PublishedManuscriptBundle? {
-        guard let pdfURL = rawGitHubURL(
-            metadata: metadata,
-            filename: metadata.manuscriptKind == .memo ? "memo.pdf" : "paper.pdf"
-        ),
-        let latexURL = rawGitHubURL(
+        guard let latexURL = rawGitHubURL(
             metadata: metadata,
             filename: metadata.manuscriptKind == .memo ? "memo.tex" : "paper.tex"
         ) else {
             return nil
         }
 
-        async let pdfFetch = URLSession.shared.data(from: pdfURL)
-        async let latexFetch = URLSession.shared.data(from: latexURL)
-        let ((pdfData, pdfResponse), (latexData, latexResponse)) = try await (pdfFetch, latexFetch)
-
-        guard let pdfHTTP = pdfResponse as? HTTPURLResponse,
-              (200 ..< 300).contains(pdfHTTP.statusCode),
-              let latexHTTP = latexResponse as? HTTPURLResponse,
+        let (latexData, latexResponse) = try await URLSession.shared.data(from: latexURL)
+        guard let latexHTTP = latexResponse as? HTTPURLResponse,
               (200 ..< 300).contains(latexHTTP.statusCode),
               let latex = String(data: latexData, encoding: .utf8),
               !latex.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             return nil
+        }
+
+        var pdfData: Data?
+        if let pdfURL = rawGitHubURL(
+            metadata: metadata,
+            filename: metadata.manuscriptKind == .memo ? "memo.pdf" : "paper.pdf"
+        ) {
+            let (fetchedPDFData, pdfResponse) = try await URLSession.shared.data(from: pdfURL)
+            if let pdfHTTP = pdfResponse as? HTTPURLResponse,
+               (200 ..< 300).contains(pdfHTTP.statusCode) {
+                pdfData = fetchedPDFData
+            }
         }
 
         return PublishedManuscriptBundle(pdfData: pdfData, latex: latex)

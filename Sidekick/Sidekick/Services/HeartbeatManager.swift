@@ -265,7 +265,8 @@ final class HeartbeatManager: ObservableObject {
         }
         let draftArtifact = artifacts.draft ?? ResearchDraftArtifact(
             title: artifacts.title,
-            markdown: artifacts.markdown
+            markdown: artifacts.markdown,
+            figures: artifacts.figureArtifacts
         )
         try? PaperArtifactStore.persistStageArtifact(draftArtifact, runID: run.runID, stage: .write)
         if let export = artifacts.exportMetadata {
@@ -328,7 +329,9 @@ final class HeartbeatManager: ObservableObject {
 
         let recoveredTitle = (draft?.title ?? paper.title).trimmingCharacters(in: .whitespacesAndNewlines)
         let recoveredMarkdown = (draft?.markdown ?? paper.markdown).trimmingCharacters(in: .whitespacesAndNewlines)
-        let recoveredFigures = paper.figureData.isEmpty ? (analysis?.figureData ?? []) : paper.figureData
+        let recoveredFigures = paper.figureData.isEmpty
+            ? (!(draft?.figureData.isEmpty ?? true) ? (draft?.figureData ?? []) : (analysis?.figureData ?? []))
+            : paper.figureData
 
         guard !recoveredMarkdown.isEmpty else {
             return false

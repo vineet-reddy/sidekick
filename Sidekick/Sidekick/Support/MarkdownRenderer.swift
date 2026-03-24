@@ -326,6 +326,24 @@ enum PaperContentNormalizer {
             template: "this paper"
         )
 
+        value = replacing(
+            pattern: #"\[\[CITE:([A-Za-z0-9_, -]+)\]\]"#,
+            in: value,
+            template: "[$1]"
+        )
+
+        value = replacing(
+            pattern: #"\[\[REF:fig:[^\]]+\]\]"#,
+            in: value,
+            template: "Figure"
+        )
+
+        value = replacing(
+            pattern: #"\[\[REF:tab:[^\]]+\]\]"#,
+            in: value,
+            template: "Table"
+        )
+
         value = materializeBareFigureReferences(in: value, figureCaptions: figureCaptions)
         value = enrichedMarkdownIfNeeded(
             value,

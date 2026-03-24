@@ -867,6 +867,11 @@ private enum SidekickImageValidator {
 nonisolated struct ResearchDraftArtifact: Codable {
     let title: String
     let markdown: String
+    let figures: [ResearchFigureArtifact]?
+
+    var figureData: [Data] {
+        (figures ?? []).compactMap(\.imageData)
+    }
 }
 
 nonisolated struct ResearchRunPreparation {

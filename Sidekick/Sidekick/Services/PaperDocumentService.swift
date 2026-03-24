@@ -18,7 +18,7 @@ enum PaperDocumentService {
         }
     }
 
-    private static let renderVersion = 10
+    private static let renderVersion = 11
 
     static func ensurePDF(for paper: Paper) async throws -> URL {
         try await ensureRenderedBundle(for: paper).pdfURL
@@ -48,12 +48,18 @@ enum PaperDocumentService {
             runID: taskID,
             stage: .plan
         )
+        let draft = PaperArtifactStore.stageArtifact(
+            ResearchDraftArtifact.self,
+            runID: taskID,
+            stage: .write
+        )
         let analysis = PaperArtifactStore.stageArtifact(
             ResearchAnalysisArtifact.self,
             runID: taskID,
             stage: .analyze
         )
-        let figureCaptions = analysis?.figures.map(\.caption) ?? []
+        let figureArtifacts = !(draft?.figures?.isEmpty ?? true) ? (draft?.figures ?? []) : (analysis?.figures ?? [])
+        let figureCaptions = figureArtifacts.map(\.caption)
         let normalizedExistingFigures = paper.figureData.compactMap(normalizedSidekickRenderableImageData)
 
         if normalizedExistingFigures != paper.figureData {
@@ -66,8 +72,8 @@ enum PaperDocumentService {
             updateFigureDataPreservingTimestamp(normalizedExistingFigures, for: paper)
         }
 
-        if paper.figureData.isEmpty, let analysis {
-            let recoveredFigures = analysis.figureData
+        if paper.figureData.isEmpty {
+            let recoveredFigures = !figureArtifacts.isEmpty ? figureArtifacts.compactMap(\.imageData) : (analysis?.figureData ?? [])
             if !recoveredFigures.isEmpty {
                 print("[PaperDocs] recovered \(recoveredFigures.count) figure(s) from staged analysis task=\(taskID)")
                 updateFigureDataPreservingTimestamp(recoveredFigures, for: paper)
@@ -96,6 +102,11 @@ enum PaperDocumentService {
             analysis: analysis
         )
         if let published = try await publishedManuscript(for: paper) {
+            let resolvedPDFData = if let publishedPDFData = published.pdfData {
+                publishedPDFData
+            } else {
+                try await renderPDF(from: html)
+            }
             return try PaperArtifactStore.persistRenderedBundle(
                 taskID: taskID,
                 title: paper.title,
@@ -103,7 +114,7 @@ enum PaperDocumentService {
                 html: html,
                 latex: published.latex,
                 figures: paper.figureData,
-                pdfData: published.pdfData
+                pdfData: resolvedPDFData
             )
         }
 
