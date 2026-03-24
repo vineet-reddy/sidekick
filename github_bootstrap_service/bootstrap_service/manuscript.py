@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import csv
 import json
+import platform
 import re
 import shutil
 import subprocess
+import tarfile
+import tempfile
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -42,7 +46,7 @@ def results_to_markdown(sections: dict[str, Any], *, manuscript_kind: str) -> st
         ("Limitations", sections.get("limitations")),
     ]
     for title, body in ordered_sections:
-        text = str(body or "").strip()
+        text = _display_inline_tokens(str(body or "").strip())
         if text:
             blocks.append(f"## {title}\n\n{text}")
 
@@ -159,14 +163,14 @@ def render_latex(
         for entry in reference_catalog
         if str(entry.get("key") or "").strip() and str(entry.get("text") or "").strip()
     }
-    prose_blocks = [
-        str(sections.get("abstract") or ""),
-        str(sections.get("introduction") or ""),
-        str(sections.get("methods") or ""),
-        str(sections.get("results") or ""),
-        str(sections.get("discussion") or ""),
-        str(sections.get("limitations") or ""),
-    ]
+    prose_blocks = [_normalize_inline_commands(str(sections.get(key) or "")) for key in (
+        "abstract",
+        "introduction",
+        "methods",
+        "results",
+        "discussion",
+        "limitations",
+    )]
     cited_keys: list[str] = []
     for block in prose_blocks:
         for match in re.findall(r"\\cite\{([^}]+)\}", block):
@@ -196,6 +200,7 @@ def render_latex(
         )
     references_bib = "\n\n".join(bibliography_lines).strip()
 
+    abstract_body = _latex_escape_prose(str(sections.get("abstract") or ""))
     section_blocks = [
         ("Introduction", _latex_escape_prose(str(sections.get("introduction") or ""))),
         ("Methods", _latex_escape_prose(str(sections.get("methods") or ""))),
@@ -203,7 +208,7 @@ def render_latex(
         ("Discussion", _latex_escape_prose(str(sections.get("discussion") or ""))),
         ("Limitations", _latex_escape_prose(str(sections.get("limitations") or ""))),
     ]
-    rendered_sections = [f"\\section*{{Abstract}}\n{_latex_escape_prose(str(sections.get('abstract') or ''))}"]
+    rendered_sections: list[str] = []
     for heading, body in section_blocks:
         if body:
             rendered_sections.append(f"\\section{{{heading}}}\n{body}")
@@ -213,9 +218,9 @@ def render_latex(
         figure_blocks.append(
             "\n".join(
                 [
-                    "\\begin{figure}[t]",
+                    "\\begin{figure}[tbp]",
                     "\\centering",
-                    f"\\includegraphics[width=0.95\\linewidth]{{{_latex_escape_text(str(figure.get('path') or ''))}}}",
+                    f"\\includegraphics[width=0.94\\linewidth]{{{_latex_escape_text(str(figure.get('path') or ''))}}}",
                     f"\\caption{{{_latex_escape_prose(str(figure.get('caption') or ''))}}}",
                     f"\\label{{{_latex_escape_text(str(figure.get('label') or ''))}}}",
                     "\\end{figure}",
@@ -229,20 +234,21 @@ def render_latex(
         if rows:
             header = rows[0]
             body_rows = rows[1:]
-            column_spec = "l" * max(1, min(6, len(header)))
+            column_count = max(1, min(6, len(header)))
+            column_spec = "".join([">{\\raggedright\\arraybackslash}p{0.15\\linewidth}"] * column_count)
             table_lines = [
-                "\\begin{table}[t]",
+                "\\begin{table}[tbp]",
                 "\\centering",
                 f"\\caption{{{_latex_escape_prose(str(table.get('caption') or ''))}}}",
                 f"\\label{{{_latex_escape_text(str(table.get('label') or ''))}}}",
                 f"\\begin{{tabular}}{{{column_spec}}}",
                 "\\toprule",
-                " & ".join(_latex_escape_text(cell) for cell in header[: len(column_spec)]) + " \\\\",
+                " & ".join(_latex_escape_text(cell) for cell in header[:column_count]) + " \\\\",
                 "\\midrule",
             ]
             for row in body_rows[:10]:
                 table_lines.append(
-                    " & ".join(_latex_escape_text(cell) for cell in row[: len(column_spec)]) + " \\\\"
+                    " & ".join(_latex_escape_text(cell) for cell in row[:column_count]) + " \\\\"
                 )
             table_lines.extend(["\\bottomrule", "\\end{tabular}", "\\end{table}"])
             table_blocks.append("\n".join(table_lines))
@@ -262,21 +268,45 @@ def render_latex(
 
     manuscript_label = "Research Memo" if manuscript_kind == "memo" else "Research Paper"
     bibliography_block = "\\bibliographystyle{plainnat}\n\\bibliography{references}" if references_bib else ""
+    float_blocks = table_blocks + figure_blocks
+    if float_blocks and rendered_sections:
+        rendered_sections[2 if len(rendered_sections) >= 3 else -1] = (
+            rendered_sections[2 if len(rendered_sections) >= 3 else -1]
+            + "\n\n"
+            + "\n\n".join(float_blocks)
+        )
+        figure_blocks = []
+        table_blocks = []
     latex = "\n\n".join(
         [
             "\\documentclass[11pt]{article}",
+            "\\usepackage[T1]{fontenc}",
+            "\\usepackage[utf8]{inputenc}",
             "\\usepackage[margin=1in]{geometry}",
             "\\usepackage{graphicx}",
             "\\usepackage{amsmath}",
+            "\\usepackage{amssymb}",
             "\\usepackage{booktabs}",
+            "\\usepackage{array}",
+            "\\usepackage{tabularx}",
+            "\\usepackage{caption}",
+            "\\usepackage{float}",
+            "\\usepackage{microtype}",
+            "\\usepackage{mathptmx}",
             "\\usepackage{natbib}",
             "\\usepackage[hidelinks]{hyperref}",
+            "\\captionsetup{font=small,labelfont=bf}",
+            "\\setlength{\\parindent}{1.25em}",
+            "\\setlength{\\parskip}{0pt}",
             "\\title{" + _latex_escape_text(title) + "}",
             "\\author{}",
             "\\date{}",
             "\\begin{document}",
             "\\maketitle",
-            "\\begin{center}\\textit{" + _latex_escape_text(manuscript_label) + "}\\end{center}",
+            "\\begin{center}\\small\\textit{" + _latex_escape_text(manuscript_label) + "}\\end{center}",
+            "\\begin{abstract}",
+            abstract_body,
+            "\\end{abstract}",
             *rendered_sections,
             *figure_blocks,
             *table_blocks,
@@ -289,32 +319,70 @@ def render_latex(
 
 def compile_pdf(job_directory: Path, *, tex_filename: str) -> dict[str, Any]:
     stem = Path(tex_filename).stem
-    compile_commands = [
-        ["pdflatex", "-interaction=nonstopmode", tex_filename],
-        ["bibtex", stem],
-        ["pdflatex", "-interaction=nonstopmode", tex_filename],
-        ["pdflatex", "-interaction=nonstopmode", tex_filename],
-    ]
     outputs: list[str] = []
-    references_path = job_directory / "references.bib"
-    for command in compile_commands:
-        if command[0] == "bibtex" and (not references_path.exists() or not references_path.read_text(encoding="utf-8").strip()):
-            continue
+    if shutil.which("pdflatex"):
+        compile_commands = [
+            ["pdflatex", "-interaction=nonstopmode", tex_filename],
+            ["bibtex", stem],
+            ["pdflatex", "-interaction=nonstopmode", tex_filename],
+            ["pdflatex", "-interaction=nonstopmode", tex_filename],
+        ]
+        references_path = job_directory / "references.bib"
+        for command in compile_commands:
+            if command[0] == "bibtex" and (not references_path.exists() or not references_path.read_text(encoding="utf-8").strip()):
+                continue
+            try:
+                completed = subprocess.run(
+                    command,
+                    cwd=job_directory,
+                    capture_output=True,
+                    text=True,
+                    check=False,
+                )
+            except FileNotFoundError:
+                return {
+                    "ok": False,
+                    "error": f"{command[0]} is not installed in the backend runtime.",
+                    "log": "\n\n".join(outputs).strip(),
+                    "pdf_path": "",
+                }
+            output = "\n".join(part for part in [completed.stdout, completed.stderr] if part.strip()).strip()
+            if output:
+                outputs.append(f"$ {' '.join(command)}\n{output}")
+            if completed.returncode != 0:
+                return {
+                    "ok": False,
+                    "error": f"{' '.join(command)} failed with exit code {completed.returncode}",
+                    "log": "\n\n".join(outputs).strip(),
+                    "pdf_path": "",
+                }
+    else:
         try:
-            completed = subprocess.run(
-                command,
-                cwd=job_directory,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-        except FileNotFoundError:
+            tectonic_path = _ensure_tectonic_binary(job_directory.parent / "_toolcache")
+        except RuntimeError as error:
             return {
                 "ok": False,
-                "error": f"{command[0]} is not installed in the backend runtime.",
+                "error": str(error),
                 "log": "\n\n".join(outputs).strip(),
                 "pdf_path": "",
             }
+        command = [
+            str(tectonic_path),
+            "-X",
+            "compile",
+            "--keep-intermediates",
+            "--keep-logs",
+            "--outdir",
+            ".",
+            tex_filename,
+        ]
+        completed = subprocess.run(
+            command,
+            cwd=job_directory,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
         output = "\n".join(part for part in [completed.stdout, completed.stderr] if part.strip()).strip()
         if output:
             outputs.append(f"$ {' '.join(command)}\n{output}")
@@ -399,7 +467,7 @@ def _latex_escape_bib_value(value: str) -> str:
 
 
 def _latex_escape_prose(value: str) -> str:
-    text = str(value or "").strip()
+    text = _normalize_inline_commands(str(value or "")).strip()
     if not text:
         return ""
 
@@ -420,3 +488,86 @@ def _latex_escape_prose(value: str) -> str:
         escaped = escaped.replace(_latex_escape_text(token), original)
     paragraphs = [paragraph.strip() for paragraph in escaped.split("\n\n") if paragraph.strip()]
     return "\n\n".join(paragraphs)
+
+
+def _normalize_inline_commands(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    text = re.sub(r"\[\[CITE:([A-Za-z0-9_, -]+)\]\]", lambda m: f"\\cite{{{m.group(1).strip()}}}", text)
+    text = re.sub(r"\[\[REF:([A-Za-z0-9:.-]+)\]\]", lambda m: f"\\ref{{{m.group(1).strip()}}}", text)
+    return text
+
+
+def _display_inline_tokens(value: str) -> str:
+    text = str(value or "")
+    if not text:
+        return ""
+    text = re.sub(r"\[\[CITE:([A-Za-z0-9_, -]+)\]\]", lambda m: f"[{m.group(1).strip()}]", text)
+    text = re.sub(r"\[\[REF:fig:[^\]]+\]\]", "Figure", text)
+    text = re.sub(r"\[\[REF:tab:[^\]]+\]\]", "Table", text)
+    text = re.sub(r"\\cite\{([^}]+)\}", lambda m: f"[{m.group(1).strip()}]", text)
+    text = re.sub(r"\\ref\{fig:[^}]+\}", "Figure", text)
+    text = re.sub(r"\\ref\{tab:[^}]+\}", "Table", text)
+    return text
+
+
+def _ensure_tectonic_binary(cache_directory: Path) -> Path:
+    cache_directory.mkdir(parents=True, exist_ok=True)
+    binary_name = "tectonic.exe" if platform.system().lower() == "windows" else "tectonic"
+    binary_path = cache_directory / binary_name
+    if binary_path.exists():
+        return binary_path
+
+    release = _tectonic_latest_release()
+    asset_name = _tectonic_asset_name(str(release.get("tag_name") or "").strip())
+    asset_url = next(
+        (
+            str(asset.get("browser_download_url") or "").strip()
+            for asset in release.get("assets", [])
+            if str(asset.get("name") or "").strip() == asset_name
+        ),
+        "",
+    )
+    if not asset_url:
+        raise RuntimeError(f"Tectonic asset {asset_name} was not found in the latest release.")
+
+    archive_path = cache_directory / asset_name
+    urllib.request.urlretrieve(asset_url, archive_path)
+    with tarfile.open(archive_path, "r:gz") as archive:
+        with tempfile.TemporaryDirectory() as tempdir:
+            archive.extractall(tempdir)
+            extracted = Path(tempdir)
+            candidate = next(extracted.rglob(binary_name), None)
+            if candidate is None:
+                raise RuntimeError("Downloaded Tectonic archive did not contain the compiler binary.")
+            shutil.copy2(candidate, binary_path)
+    archive_path.unlink(missing_ok=True)
+    binary_path.chmod(0o755)
+    return binary_path
+
+
+def _tectonic_asset_name(tag_name: str) -> str:
+    version = tag_name.removeprefix("tectonic@").strip() or tag_name.strip()
+    if not version:
+        raise RuntimeError("Unable to determine the latest Tectonic release version.")
+    system_name = platform.system().lower()
+    machine = platform.machine().lower()
+    if system_name == "linux" and machine in {"x86_64", "amd64"}:
+        return f"tectonic-{version}-x86_64-unknown-linux-gnu.tar.gz"
+    if system_name == "linux" and machine in {"arm64", "aarch64"}:
+        return f"tectonic-{version}-aarch64-unknown-linux-musl.tar.gz"
+    if system_name == "darwin" and machine in {"arm64", "aarch64"}:
+        return f"tectonic-{version}-aarch64-apple-darwin.tar.gz"
+    if system_name == "darwin" and machine in {"x86_64", "amd64"}:
+        return f"tectonic-{version}-x86_64-apple-darwin.tar.gz"
+    raise RuntimeError(f"Tectonic auto-install is not supported on {platform.system()} {platform.machine()}.")
+
+
+def _tectonic_latest_release() -> dict[str, Any]:
+    request = urllib.request.Request(
+        "https://api.github.com/repos/tectonic-typesetting/tectonic/releases/latest",
+        headers={"Accept": "application/vnd.github+json", "User-Agent": "sidekick-backend"},
+    )
+    with urllib.request.urlopen(request, timeout=30) as response:
+        return json.loads(response.read().decode("utf-8"))

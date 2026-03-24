@@ -1,5 +1,6 @@
 import base64
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -133,7 +134,7 @@ class PublicationGateTests(unittest.TestCase):
             "abstract": "We measured a public prevalence estimate.",
             "introduction": "This study investigates the public estimate.",
             "methods": "We downloaded the file and computed the statistic in Python.",
-            "results": "The estimate was 0.18 (Table \\ref{tab:artifact-2}; Figure \\ref{fig:artifact-1}; \\cite{ref1}).",
+            "results": "The estimate was 0.18 (Table [[REF:tab:artifact-2]]; Figure [[REF:fig:artifact-1]]; [[CITE:ref1]]).",
             "discussion": "The result is descriptive but useful.",
             "limitations": "Only one public slice was available.",
             "references": ["Example public source."],
@@ -167,8 +168,12 @@ class PublicationGateTests(unittest.TestCase):
         )
 
         self.assertIn("\\section{Results}", latex)
+        self.assertIn("\\begin{abstract}", latex)
         self.assertIn("\\includegraphics", latex)
         self.assertIn("\\begin{table}", latex)
+        self.assertIn("\\ref{tab:artifact-2}", latex)
+        self.assertIn("\\ref{fig:artifact-1}", latex)
+        self.assertIn("\\cite{ref1}", latex)
         self.assertIn("\\bibliography{references}", latex)
         self.assertIn("@misc{ref1", references_bib)
 
@@ -180,11 +185,38 @@ class PublicationGateTests(unittest.TestCase):
             (job_dir / "paper.tex").write_text("\\documentclass{article}\\begin{document}Test\\end{document}", encoding="utf-8")
             (job_dir / "references.bib").write_text("", encoding="utf-8")
 
-            with patch("bootstrap_service.manuscript.subprocess.run", side_effect=FileNotFoundError):
+            with patch("bootstrap_service.manuscript.shutil.which", return_value=None), patch(
+                "bootstrap_service.manuscript._ensure_tectonic_binary",
+                side_effect=RuntimeError("tectonic is not installed in the backend runtime."),
+            ):
                 result = compile_pdf(job_dir, tex_filename="paper.tex")
 
             self.assertFalse(result["ok"])
             self.assertIn("not installed", result["error"])
+
+    def test_compile_pdf_falls_back_to_tectonic(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            job_dir = root / "artifacts" / "job-tectonic"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            (job_dir / "paper.tex").write_text("\\documentclass{article}\\begin{document}Test\\end{document}", encoding="utf-8")
+            (job_dir / "references.bib").write_text("", encoding="utf-8")
+            (job_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+
+            completed = subprocess.CompletedProcess(
+                args=["tectonic"],
+                returncode=0,
+                stdout="compiled",
+                stderr="",
+            )
+            with patch("bootstrap_service.manuscript.shutil.which", return_value=None), patch(
+                "bootstrap_service.manuscript._ensure_tectonic_binary",
+                return_value=root / "tectonic",
+            ), patch("bootstrap_service.manuscript.subprocess.run", return_value=completed):
+                result = compile_pdf(job_dir, tex_filename="paper.tex")
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["pdf_path"], "paper.pdf")
 
     def test_bundle_figures_use_saved_image_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -848,9 +848,11 @@ Return strict JSON only with this exact shape:
 Rules:
 - Use only `validation.approved_results` as factual findings. Do not add new findings, estimates, or sources.
 - Use `validation.manuscript_kind` as authoritative. Do not upgrade a memo into a paper.
-- Use only citation keys from `validation.reference_catalog` such as `\\cite{ref1}`.
-- You may use `\\ref{fig:...}` and `\\ref{tab:...}` only for labels present in `artifact_manifest`.
+- Use citation placeholders like `[[CITE:ref1]]` and cross-reference placeholders like `[[REF:fig:artifact-1]]` or `[[REF:tab:artifact-2]]`. Do not emit raw backslash LaTeX commands inside JSON strings.
+- Use only citation keys from `validation.reference_catalog`.
+- Use only figure/table labels present in `artifact_manifest`.
 - Write plain prose only. Do not include a LaTeX preamble or environments.
+- When tables or figures are present, discuss the key empirical pattern they show in the Results section instead of ignoring them.
 - Include the research question, methods performed in this run, and limitations honestly.
 - Do not use draft, demo, placeholder, simulated, synthetic, or definitive-proof language.
 """
