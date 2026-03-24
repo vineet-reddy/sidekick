@@ -3,11 +3,13 @@ import pathlib
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bootstrap_service.config import BootstrapServiceConfig
 from bootstrap_service.database import SidekickDatabase
+from bootstrap_service.manuscript import compile_pdf, render_latex
 from bootstrap_service.openai_client import OpenAIContainerFile
 from bootstrap_service.server import JobProcessor
 
@@ -31,8 +33,8 @@ def _processor(root: pathlib.Path, *, openai_client: object | None = None) -> Jo
     return JobProcessor(
         config=config,
         database=database,
-        github_client=object(),  # not used by these tests
-        openai_client=openai_client or object(),  # not used by these tests
+        github_client=object(),
+        openai_client=openai_client or object(),
     )
 
 
@@ -41,23 +43,33 @@ def _write(path: pathlib.Path, data: bytes) -> None:
     path.write_bytes(data)
 
 
+def _methods_text() -> str:
+    return (
+        "We downloaded the public source file, inspected the available columns, cleaned the extracted values, "
+        "computed the requested summary statistics in Python, and saved the resulting analysis table for this run. "
+        "We compared the observed prevalence estimate across the retrieved records, checked the intermediate outputs, "
+        "and recorded the final result only after the saved artifact matched the reported calculation."
+    )
+
+
 class PublicationGateTests(unittest.TestCase):
-    def test_validation_approves_claim_with_real_receipts(self) -> None:
+    def test_validation_routes_artifact_backed_result_to_paper(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = pathlib.Path(tempdir)
             processor = _processor(root)
-            job_id = "job-approved"
-            _write(root / "artifacts" / job_id / "artifacts" / "table_1.csv", b"metric,value\nodds_ratio,1.2\n")
+            job_id = "job-paper"
+            _write(root / "artifacts" / job_id / "artifacts" / "table_1.csv", b"metric,value\nprevalence,0.18\n")
 
             ledger = {
-                "title": "Validated ledger",
-                "recommended_format": "brief_report",
+                "title": "Validated study",
+                "research_question": "What prevalence is visible in the public table?",
+                "methods": _methods_text(),
+                "limitations": ["Single public table only."],
                 "sources": [
                     {
                         "source_id": "source_1",
-                        "label": "GEO study",
-                        "accession_id": "GSE12345",
-                        "download_url": "https://example.org/download/GSE12345.tsv",
+                        "label": "CDC public table",
+                        "download_url": "https://example.org/download/table_1.csv",
                     }
                 ],
                 "artifacts": [
@@ -69,31 +81,33 @@ class PublicationGateTests(unittest.TestCase):
                         "source_ids": ["source_1"],
                     }
                 ],
-                "claims": [
+                "results": [
                     {
-                        "claim_id": "claim_1",
-                        "text": "The observed association is positive in this public dataset.",
+                        "result_id": "result_1",
+                        "text": "The public table reports a prevalence estimate of 0.18 in the retrieved slice.",
                         "artifact_ids": ["artifact_1"],
-                        "source_ids": ["source_1"],
                     }
                 ],
             }
 
             validation = processor._validate_ledger(job_id, ledger)
-            self.assertEqual(validation["status"], "approved")
-            self.assertEqual(validation["final_format"], "brief_report")
-            self.assertEqual(validation["approved_claim_ids"], ["claim_1"])
-            self.assertEqual(len(validation["dropped_claims"]), 0)
 
-    def test_validation_blocks_when_zero_claims_survive(self) -> None:
+            self.assertEqual(validation["status"], "paper")
+            self.assertEqual(validation["manuscript_kind"], "paper")
+            self.assertEqual(validation["approved_result_ids"], ["result_1"])
+            self.assertEqual(len(validation["reference_catalog"]), 1)
+
+    def test_validation_routes_weak_run_to_memo(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = pathlib.Path(tempdir)
             processor = _processor(root)
-            job_id = "job-blocked"
+            job_id = "job-memo"
 
             ledger = {
-                "title": "Blocked ledger",
-                "recommended_format": "full_paper",
+                "title": "Weak run",
+                "research_question": "Can the idea be answered with current material?",
+                "methods": "We reviewed public literature and summarized what others reported.",
+                "limitations": ["No direct analysis completed."],
                 "sources": [
                     {
                         "source_id": "source_1",
@@ -101,33 +115,76 @@ class PublicationGateTests(unittest.TestCase):
                         "landing_page_url": "https://example.org/study",
                     }
                 ],
-                "artifacts": [
-                    {
-                        "artifact_id": "artifact_1",
-                        "path": "artifacts/table_1.csv",
-                        "kind": "table",
-                        "source_ids": ["source_1"],
-                    }
-                ],
-                "claims": [
-                    {
-                        "claim_id": "claim_1",
-                        "text": "This proves the mechanism is causal.",
-                        "artifact_ids": ["artifact_1"],
-                        "source_ids": ["source_1"],
-                    }
-                ],
+                "artifacts": [],
+                "results": [],
             }
 
             validation = processor._validate_ledger(job_id, ledger)
-            self.assertEqual(validation["status"], "blocked")
-            self.assertEqual(validation["final_format"], "blocked")
-            self.assertEqual(validation["approved_claim_ids"], [])
-            self.assertEqual(len(validation["dropped_claims"]), 1)
-            reasons = " ".join(validation["dropped_claims"][0]["reasons"])
-            self.assertIn("saved artifact", reasons)
-            self.assertIn("reproducible source provenance", reasons)
-            self.assertIn("banned language", reasons)
+
+            self.assertEqual(validation["status"], "memo")
+            self.assertEqual(validation["final_format"], "memo")
+            self.assertFalse(validation["paper_checks"]["described_work_performed_here"])
+            self.assertIn("paper gate", validation["summary"].lower())
+            self.assertTrue(validation["memo_reasons"])
+
+    def test_render_latex_includes_sections_figures_tables_and_bibliography(self) -> None:
+        sections = {
+            "title": "Example manuscript",
+            "abstract": "We measured a public prevalence estimate.",
+            "introduction": "This study investigates the public estimate.",
+            "methods": "We downloaded the file and computed the statistic in Python.",
+            "results": "The estimate was 0.18 (Table \\ref{tab:artifact-2}; Figure \\ref{fig:artifact-1}; \\cite{ref1}).",
+            "discussion": "The result is descriptive but useful.",
+            "limitations": "Only one public slice was available.",
+            "references": ["Example public source."],
+        }
+        manifest = {
+            "figures": [
+                {
+                    "artifact_id": "artifact_1",
+                    "label": "fig:artifact-1",
+                    "caption": "Main figure",
+                    "path": "figures/figure_1.png",
+                }
+            ],
+            "tables": [
+                {
+                    "artifact_id": "artifact_2",
+                    "label": "tab:artifact-2",
+                    "caption": "Main table",
+                    "path": "tables/table_1.csv",
+                    "rows": [["metric", "value"], ["prevalence", "0.18"]],
+                }
+            ],
+        }
+
+        latex, references_bib = render_latex(
+            title="Example manuscript",
+            sections=sections,
+            manifest=manifest,
+            manuscript_kind="paper",
+            reference_catalog=[{"key": "ref1", "text": "Example public source."}],
+        )
+
+        self.assertIn("\\section{Results}", latex)
+        self.assertIn("\\includegraphics", latex)
+        self.assertIn("\\begin{table}", latex)
+        self.assertIn("\\bibliography{references}", latex)
+        self.assertIn("@misc{ref1", references_bib)
+
+    def test_compile_pdf_reports_missing_runtime_tools(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            job_dir = root / "artifacts" / "job-compile"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            (job_dir / "paper.tex").write_text("\\documentclass{article}\\begin{document}Test\\end{document}", encoding="utf-8")
+            (job_dir / "references.bib").write_text("", encoding="utf-8")
+
+            with patch("bootstrap_service.manuscript.subprocess.run", side_effect=FileNotFoundError):
+                result = compile_pdf(job_dir, tex_filename="paper.tex")
+
+            self.assertFalse(result["ok"])
+            self.assertIn("not installed", result["error"])
 
     def test_bundle_figures_use_saved_image_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
@@ -182,8 +239,9 @@ class PublicationGateTests(unittest.TestCase):
             processor = _processor(root, openai_client=openai_client)
             job_id = "job-materialized"
             ledger = {
-                "title": "Materialized ledger",
-                "recommended_format": "brief_report",
+                "title": "Materialized study",
+                "research_question": "What prevalence is visible in the public table?",
+                "methods": _methods_text(),
                 "sources": [
                     {
                         "source_id": "source_1",
@@ -199,12 +257,11 @@ class PublicationGateTests(unittest.TestCase):
                         "source_ids": ["source_1"],
                     }
                 ],
-                "claims": [
+                "results": [
                     {
-                        "claim_id": "claim_1",
-                        "text": "The estimated prevalence is reported in the public table.",
+                        "result_id": "result_1",
+                        "text": "The retrieved table reports a prevalence estimate of 0.18.",
                         "artifact_ids": ["artifact_1"],
-                        "source_ids": ["source_1"],
                     }
                 ],
             }
@@ -219,8 +276,8 @@ class PublicationGateTests(unittest.TestCase):
 
             self.assertEqual(getattr(openai_client, "container_id", None), "cntr_123")
             self.assertEqual(getattr(openai_client, "downloaded", None), ("cntr_123", "cfile_1"))
-            self.assertEqual(validation["status"], "approved")
-            self.assertEqual(validation["approved_claim_ids"], ["claim_1"])
+            self.assertEqual(validation["status"], "paper")
+            self.assertEqual(validation["approved_result_ids"], ["result_1"])
 
 
 if __name__ == "__main__":

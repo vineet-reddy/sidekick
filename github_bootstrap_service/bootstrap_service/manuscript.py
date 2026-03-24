@@ -1,0 +1,422 @@
+from __future__ import annotations
+
+import csv
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+from typing import Any
+
+
+def normalize_manuscript_sections(raw_sections: dict[str, Any], *, title_fallback: str) -> dict[str, Any]:
+    if not isinstance(raw_sections, dict):
+        raw_sections = {}
+    references = raw_sections.get("references")
+    if not isinstance(references, list):
+        references = []
+    return {
+        "title": str(raw_sections.get("title") or title_fallback).strip() or title_fallback,
+        "abstract": str(raw_sections.get("abstract") or "").strip(),
+        "introduction": str(raw_sections.get("introduction") or "").strip(),
+        "methods": str(raw_sections.get("methods") or "").strip(),
+        "results": str(raw_sections.get("results") or "").strip(),
+        "discussion": str(raw_sections.get("discussion") or "").strip(),
+        "limitations": str(raw_sections.get("limitations") or "").strip(),
+        "references": [str(entry).strip() for entry in references if str(entry).strip()],
+    }
+
+
+def results_to_markdown(sections: dict[str, Any], *, manuscript_kind: str) -> str:
+    heading = "Research Memo" if manuscript_kind == "memo" else "Paper"
+    blocks = [
+        f"# {sections.get('title') or 'Untitled Manuscript'}",
+        f"_{heading}_",
+    ]
+    ordered_sections = [
+        ("Abstract", sections.get("abstract")),
+        ("Introduction", sections.get("introduction")),
+        ("Methods", sections.get("methods")),
+        ("Results", sections.get("results")),
+        ("Discussion", sections.get("discussion")),
+        ("Limitations", sections.get("limitations")),
+    ]
+    for title, body in ordered_sections:
+        text = str(body or "").strip()
+        if text:
+            blocks.append(f"## {title}\n\n{text}")
+
+    references = [str(entry).strip() for entry in sections.get("references") or [] if str(entry).strip()]
+    if references:
+        blocks.append("## References\n\n" + "\n".join(f"{index + 1}. {entry}" for index, entry in enumerate(references)))
+
+    return "\n\n".join(blocks).strip()
+
+
+def format_reference_from_source(source: dict[str, Any]) -> str:
+    label = str(source.get("label") or source.get("title") or "Source").strip() or "Source"
+    accession_id = str(source.get("accession_id") or "").strip()
+    download_url = str(source.get("download_url") or "").strip()
+    landing_page_url = str(source.get("landing_page_url") or "").strip()
+    api_endpoint = str(source.get("api_endpoint") or "").strip()
+    notes = str(source.get("notes") or "").strip()
+    parts = [label]
+    if accession_id:
+        parts.append(f"Accession: {accession_id}")
+    if download_url:
+        parts.append(download_url)
+    elif api_endpoint:
+        parts.append(api_endpoint)
+    elif landing_page_url:
+        parts.append(landing_page_url)
+    if notes:
+        parts.append(notes)
+    return ". ".join(part for part in parts if part).strip()
+
+
+def build_manuscript_manifest(
+    *,
+    job_directory: Path,
+    artifacts: list[dict[str, Any]],
+    sanitize_relative_path: Any,
+    artifact_path_value: Any,
+    guess_mime_type: Any,
+) -> dict[str, Any]:
+    figures_directory = job_directory / "figures"
+    tables_directory = job_directory / "tables"
+    shutil.rmtree(figures_directory, ignore_errors=True)
+    shutil.rmtree(tables_directory, ignore_errors=True)
+    figures_directory.mkdir(parents=True, exist_ok=True)
+    tables_directory.mkdir(parents=True, exist_ok=True)
+
+    manifest: dict[str, Any] = {"figures": [], "tables": []}
+    figure_index = 0
+    table_index = 0
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        artifact_id = str(artifact.get("artifact_id") or "").strip()
+        artifact_path = sanitize_relative_path(
+            artifact_path_value(artifact),
+            fallback=f"artifacts/{artifact_id or 'artifact'}",
+        )
+        source_path = job_directory / artifact_path
+        if not source_path.exists() or not source_path.is_file():
+            continue
+
+        mime_type = str(artifact.get("mime_type") or "").strip() or guess_mime_type(artifact_path)
+        description = str(artifact.get("description") or artifact_id or source_path.name).strip() or source_path.name
+        if mime_type.startswith("image/"):
+            figure_index += 1
+            suffix = source_path.suffix or ".png"
+            relative_path = f"figures/figure_{figure_index}{suffix}"
+            shutil.copy2(source_path, job_directory / relative_path)
+            manifest["figures"].append(
+                {
+                    "artifact_id": artifact_id,
+                    "label": _sanitize_label(artifact_id or f"figure-{figure_index}", prefix="fig"),
+                    "caption": description,
+                    "path": relative_path,
+                    "mime_type": mime_type,
+                }
+            )
+            continue
+
+        if str(artifact.get("kind") or "").strip().lower() == "table" or mime_type in {
+            "text/csv",
+            "text/tab-separated-values",
+            "application/json",
+            "text/plain",
+        }:
+            table_index += 1
+            suffix = source_path.suffix or ".txt"
+            relative_path = f"tables/table_{table_index}{suffix}"
+            shutil.copy2(source_path, job_directory / relative_path)
+            manifest["tables"].append(
+                {
+                    "artifact_id": artifact_id,
+                    "label": _sanitize_label(artifact_id or f"table-{table_index}", prefix="tab"),
+                    "caption": description,
+                    "path": relative_path,
+                    "mime_type": mime_type,
+                    "rows": _load_table_rows(source_path, mime_type=mime_type),
+                }
+            )
+
+    return manifest
+
+
+def render_latex(
+    *,
+    title: str,
+    sections: dict[str, Any],
+    manifest: dict[str, Any],
+    manuscript_kind: str,
+    reference_catalog: list[dict[str, Any]],
+) -> tuple[str, str]:
+    catalog_by_key = {
+        str(entry.get("key") or "").strip(): str(entry.get("text") or "").strip()
+        for entry in reference_catalog
+        if str(entry.get("key") or "").strip() and str(entry.get("text") or "").strip()
+    }
+    prose_blocks = [
+        str(sections.get("abstract") or ""),
+        str(sections.get("introduction") or ""),
+        str(sections.get("methods") or ""),
+        str(sections.get("results") or ""),
+        str(sections.get("discussion") or ""),
+        str(sections.get("limitations") or ""),
+    ]
+    cited_keys: list[str] = []
+    for block in prose_blocks:
+        for match in re.findall(r"\\cite\{([^}]+)\}", block):
+            for key in [part.strip() for part in match.split(",") if part.strip()]:
+                if key not in cited_keys:
+                    cited_keys.append(key)
+
+    reference_texts = [str(entry).strip() for entry in sections.get("references") or [] if str(entry).strip()]
+    if not cited_keys and reference_texts:
+        cited_keys = [f"ref{index + 1}" for index in range(len(reference_texts))]
+    bibliography_lines: list[str] = []
+    for index, key in enumerate(cited_keys):
+        reference_text = reference_texts[index] if index < len(reference_texts) else ""
+        if not reference_text:
+            reference_text = catalog_by_key.get(key, "")
+        if not reference_text:
+            continue
+        bibliography_lines.append(
+            "\n".join(
+                [
+                    f"@misc{{{key},",
+                    f"  title = {{{_latex_escape_bib_value(f'Reference {index + 1}')}}},",
+                    f"  note = {{{_latex_escape_bib_value(reference_text)}}}",
+                    "}",
+                ]
+            )
+        )
+    references_bib = "\n\n".join(bibliography_lines).strip()
+
+    section_blocks = [
+        ("Introduction", _latex_escape_prose(str(sections.get("introduction") or ""))),
+        ("Methods", _latex_escape_prose(str(sections.get("methods") or ""))),
+        ("Results", _latex_escape_prose(str(sections.get("results") or ""))),
+        ("Discussion", _latex_escape_prose(str(sections.get("discussion") or ""))),
+        ("Limitations", _latex_escape_prose(str(sections.get("limitations") or ""))),
+    ]
+    rendered_sections = [f"\\section*{{Abstract}}\n{_latex_escape_prose(str(sections.get('abstract') or ''))}"]
+    for heading, body in section_blocks:
+        if body:
+            rendered_sections.append(f"\\section{{{heading}}}\n{body}")
+
+    figure_blocks = []
+    for figure in manifest.get("figures", []):
+        figure_blocks.append(
+            "\n".join(
+                [
+                    "\\begin{figure}[t]",
+                    "\\centering",
+                    f"\\includegraphics[width=0.95\\linewidth]{{{_latex_escape_text(str(figure.get('path') or ''))}}}",
+                    f"\\caption{{{_latex_escape_prose(str(figure.get('caption') or ''))}}}",
+                    f"\\label{{{_latex_escape_text(str(figure.get('label') or ''))}}}",
+                    "\\end{figure}",
+                ]
+            )
+        )
+
+    table_blocks = []
+    for table in manifest.get("tables", []):
+        rows = table.get("rows") or []
+        if rows:
+            header = rows[0]
+            body_rows = rows[1:]
+            column_spec = "l" * max(1, min(6, len(header)))
+            table_lines = [
+                "\\begin{table}[t]",
+                "\\centering",
+                f"\\caption{{{_latex_escape_prose(str(table.get('caption') or ''))}}}",
+                f"\\label{{{_latex_escape_text(str(table.get('label') or ''))}}}",
+                f"\\begin{{tabular}}{{{column_spec}}}",
+                "\\toprule",
+                " & ".join(_latex_escape_text(cell) for cell in header[: len(column_spec)]) + " \\\\",
+                "\\midrule",
+            ]
+            for row in body_rows[:10]:
+                table_lines.append(
+                    " & ".join(_latex_escape_text(cell) for cell in row[: len(column_spec)]) + " \\\\"
+                )
+            table_lines.extend(["\\bottomrule", "\\end{tabular}", "\\end{table}"])
+            table_blocks.append("\n".join(table_lines))
+        else:
+            table_blocks.append(
+                "\n".join(
+                    [
+                        "\\begin{table}[t]",
+                        "\\centering",
+                        f"\\caption{{{_latex_escape_prose(str(table.get('caption') or ''))}}}",
+                        f"\\label{{{_latex_escape_text(str(table.get('label') or ''))}}}",
+                        f"\\texttt{{{_latex_escape_text(str(table.get('path') or ''))}}}",
+                        "\\end{table}",
+                    ]
+                )
+            )
+
+    manuscript_label = "Research Memo" if manuscript_kind == "memo" else "Research Paper"
+    bibliography_block = "\\bibliographystyle{plainnat}\n\\bibliography{references}" if references_bib else ""
+    latex = "\n\n".join(
+        [
+            "\\documentclass[11pt]{article}",
+            "\\usepackage[margin=1in]{geometry}",
+            "\\usepackage{graphicx}",
+            "\\usepackage{amsmath}",
+            "\\usepackage{booktabs}",
+            "\\usepackage{natbib}",
+            "\\usepackage[hidelinks]{hyperref}",
+            "\\title{" + _latex_escape_text(title) + "}",
+            "\\author{}",
+            "\\date{}",
+            "\\begin{document}",
+            "\\maketitle",
+            "\\begin{center}\\textit{" + _latex_escape_text(manuscript_label) + "}\\end{center}",
+            *rendered_sections,
+            *figure_blocks,
+            *table_blocks,
+            bibliography_block,
+            "\\end{document}",
+        ]
+    ).strip() + "\n"
+    return latex, references_bib
+
+
+def compile_pdf(job_directory: Path, *, tex_filename: str) -> dict[str, Any]:
+    stem = Path(tex_filename).stem
+    compile_commands = [
+        ["pdflatex", "-interaction=nonstopmode", tex_filename],
+        ["bibtex", stem],
+        ["pdflatex", "-interaction=nonstopmode", tex_filename],
+        ["pdflatex", "-interaction=nonstopmode", tex_filename],
+    ]
+    outputs: list[str] = []
+    references_path = job_directory / "references.bib"
+    for command in compile_commands:
+        if command[0] == "bibtex" and (not references_path.exists() or not references_path.read_text(encoding="utf-8").strip()):
+            continue
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=job_directory,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "error": f"{command[0]} is not installed in the backend runtime.",
+                "log": "\n\n".join(outputs).strip(),
+                "pdf_path": "",
+            }
+        output = "\n".join(part for part in [completed.stdout, completed.stderr] if part.strip()).strip()
+        if output:
+            outputs.append(f"$ {' '.join(command)}\n{output}")
+        if completed.returncode != 0:
+            return {
+                "ok": False,
+                "error": f"{' '.join(command)} failed with exit code {completed.returncode}",
+                "log": "\n\n".join(outputs).strip(),
+                "pdf_path": "",
+            }
+
+    pdf_path = job_directory / f"{stem}.pdf"
+    if not pdf_path.exists() or not pdf_path.is_file():
+        return {
+            "ok": False,
+            "error": f"{pdf_path.name} was not produced by LaTeX compilation.",
+            "log": "\n\n".join(outputs).strip(),
+            "pdf_path": "",
+        }
+
+    return {
+        "ok": True,
+        "error": "",
+        "log": "\n\n".join(outputs).strip(),
+        "pdf_path": pdf_path.name,
+    }
+
+
+def _load_table_rows(path: Path, *, mime_type: str) -> list[list[str]]:
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+
+    rows: list[list[str]] = []
+    if mime_type == "application/json":
+        try:
+            payload = json.loads(raw_text)
+        except json.JSONDecodeError:
+            return []
+        if isinstance(payload, list) and payload and isinstance(payload[0], dict):
+            headers = [str(key) for key in list(payload[0].keys())[:8]]
+            rows.append(headers)
+            for entry in payload[:12]:
+                if isinstance(entry, dict):
+                    rows.append([str(entry.get(header, ""))[:80] for header in headers])
+        return rows
+
+    delimiter = "\t" if mime_type == "text/tab-separated-values" or path.suffix.lower() == ".tsv" else ","
+    reader = csv.reader(raw_text.splitlines(), delimiter=delimiter)
+    for row in reader:
+        cleaned = [str(cell).strip()[:80] for cell in row[:8]]
+        if any(cleaned):
+            rows.append(cleaned)
+        if len(rows) >= 12:
+            break
+    return rows
+
+
+def _sanitize_label(value: str, *, prefix: str) -> str:
+    cleaned = re.sub(r"[^a-zA-Z0-9:-]+", "-", value.strip())
+    cleaned = re.sub(r"-+", "-", cleaned).strip("-")
+    return f"{prefix}:{cleaned or 'item'}"
+
+
+def _latex_escape_text(value: str) -> str:
+    return (
+        value.replace("\\", "\\textbackslash{}")
+        .replace("{", "\\{")
+        .replace("}", "\\}")
+        .replace("&", "\\&")
+        .replace("%", "\\%")
+        .replace("#", "\\#")
+        .replace("_", "\\_")
+        .replace("^", "\\textasciicircum{}")
+        .replace("~", "\\textasciitilde{}")
+    )
+
+
+def _latex_escape_bib_value(value: str) -> str:
+    return _latex_escape_text(value).replace("$", "\\$")
+
+
+def _latex_escape_prose(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+
+    placeholders: dict[str, str] = {}
+
+    def protect(pattern: str, source_text: str) -> str:
+        def replace(match: re.Match[str]) -> str:
+            token = f"@@LATEX_{len(placeholders)}@@"
+            placeholders[token] = match.group(0)
+            return token
+
+        return re.sub(pattern, replace, source_text, flags=re.DOTALL)
+
+    protected = protect(r"\\(?:cite|ref)\{[^}]+\}", text)
+    protected = protect(r"\$[^$]+\$", protected)
+    escaped = _latex_escape_text(protected).replace("$", "\\$")
+    for token, original in placeholders.items():
+        escaped = escaped.replace(_latex_escape_text(token), original)
+    paragraphs = [paragraph.strip() for paragraph in escaped.split("\n\n") if paragraph.strip()]
+    return "\n\n".join(paragraphs)
