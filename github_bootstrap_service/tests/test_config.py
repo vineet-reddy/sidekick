@@ -22,7 +22,7 @@ class ConfigTests(unittest.TestCase):
 
         self.assertEqual(config.openai_model, "gpt-5.4")
         self.assertEqual(config.openai_workspace_model, "gpt-5.4")
-        self.assertEqual(config.openai_writer_model, "gpt-5.4-mini")
+        self.assertEqual(config.openai_writer_model, "gpt-5.4")
 
     def test_stage_models_can_be_overridden_independently(self) -> None:
         env = {

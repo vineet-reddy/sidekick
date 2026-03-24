@@ -24,7 +24,7 @@ def _config(root: pathlib.Path) -> BootstrapServiceConfig:
         backend_database_path=str(root / "backend.sqlite3"),
         backend_artifact_root=str(root / "artifacts"),
         openai_workspace_model="gpt-5.4",
-        openai_writer_model="gpt-5.4-mini",
+        openai_writer_model="gpt-5.4",
     )
 
 
@@ -134,7 +134,10 @@ class PublicationGateTests(unittest.TestCase):
             "abstract": "We measured a public prevalence estimate.",
             "introduction": "This study investigates the public estimate.",
             "methods": "We downloaded the file and computed the statistic in Python.",
-            "results": "The estimate was 0.18 (Table [[REF:tab:artifact-2]]; Figure [[REF:fig:artifact-1]]; [[CITE:ref1]]).",
+            "results": (
+                "The estimate was 0.18 at a cost of $4.75/kg in the base case "
+                "(Table [[REF:tab:artifact-2]]; Figure [[REF:fig:artifact-1]]; [[CITE:ref1]])."
+            ),
             "discussion": "The result is descriptive but useful.",
             "limitations": "Only one public slice was available.",
             "references": ["Example public source."],
@@ -174,6 +177,8 @@ class PublicationGateTests(unittest.TestCase):
         self.assertIn("\\ref{tab:artifact-2}", latex)
         self.assertIn("\\ref{fig:artifact-1}", latex)
         self.assertIn("\\cite{ref1}", latex)
+        self.assertIn("\\$4.75/kg", latex)
+        self.assertNotIn("@@LATEX_", latex)
         self.assertIn("\\bibliography{references}", latex)
         self.assertIn("@misc{ref1", references_bib)
 
@@ -217,6 +222,30 @@ class PublicationGateTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertEqual(result["pdf_path"], "paper.pdf")
+
+    def test_compile_pdf_decodes_non_utf8_output_without_crashing(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            job_dir = root / "artifacts" / "job-decode"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            (job_dir / "paper.tex").write_text("\\documentclass{article}\\begin{document}Test\\end{document}", encoding="utf-8")
+            (job_dir / "references.bib").write_text("", encoding="utf-8")
+            (job_dir / "paper.pdf").write_bytes(b"%PDF-1.4\n")
+
+            completed = subprocess.CompletedProcess(
+                args=["pdflatex"],
+                returncode=0,
+                stdout=b"compiled \xb7 ok",
+                stderr=b"",
+            )
+            with patch("bootstrap_service.manuscript.shutil.which", return_value="/usr/bin/pdflatex"), patch(
+                "bootstrap_service.manuscript.subprocess.run",
+                return_value=completed,
+            ):
+                result = compile_pdf(job_dir, tex_filename="paper.tex")
+
+            self.assertTrue(result["ok"])
+            self.assertIn("compiled", result["log"])
 
     def test_bundle_figures_use_saved_image_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import json
 import platform
 import re
@@ -232,25 +233,26 @@ def render_latex(
     for table in manifest.get("tables", []):
         rows = table.get("rows") or []
         if rows:
-            header = rows[0]
-            body_rows = rows[1:]
+            header = [_display_table_cell(cell, header_cell=True) for cell in rows[0]]
+            body_rows = [[_display_table_cell(cell) for cell in row] for row in rows[1:]]
             column_count = max(1, min(6, len(header)))
-            column_spec = "".join([">{\\raggedright\\arraybackslash}p{0.15\\linewidth}"] * column_count)
+            column_spec = "".join([">{\\raggedright\\arraybackslash}X"] * column_count)
             table_lines = [
                 "\\begin{table}[tbp]",
                 "\\centering",
+                "\\small",
                 f"\\caption{{{_latex_escape_prose(str(table.get('caption') or ''))}}}",
                 f"\\label{{{_latex_escape_text(str(table.get('label') or ''))}}}",
-                f"\\begin{{tabular}}{{{column_spec}}}",
+                f"\\begin{{tabularx}}{{\\linewidth}}{{{column_spec}}}",
                 "\\toprule",
                 " & ".join(_latex_escape_text(cell) for cell in header[:column_count]) + " \\\\",
                 "\\midrule",
             ]
-            for row in body_rows[:10]:
+            for row in body_rows[:8]:
                 table_lines.append(
                     " & ".join(_latex_escape_text(cell) for cell in row[:column_count]) + " \\\\"
                 )
-            table_lines.extend(["\\bottomrule", "\\end{tabular}", "\\end{table}"])
+            table_lines.extend(["\\bottomrule", "\\end{tabularx}", "\\end{table}"])
             table_blocks.append("\n".join(table_lines))
         else:
             table_blocks.append(
@@ -292,7 +294,7 @@ def render_latex(
             "\\usepackage{caption}",
             "\\usepackage{float}",
             "\\usepackage{microtype}",
-            "\\usepackage{mathptmx}",
+            "\\usepackage{lmodern}",
             "\\usepackage{natbib}",
             "\\usepackage[hidelinks]{hyperref}",
             "\\captionsetup{font=small,labelfont=bf}",
@@ -336,7 +338,7 @@ def compile_pdf(job_directory: Path, *, tex_filename: str) -> dict[str, Any]:
                     command,
                     cwd=job_directory,
                     capture_output=True,
-                    text=True,
+                    text=False,
                     check=False,
                 )
             except FileNotFoundError:
@@ -346,7 +348,7 @@ def compile_pdf(job_directory: Path, *, tex_filename: str) -> dict[str, Any]:
                     "log": "\n\n".join(outputs).strip(),
                     "pdf_path": "",
                 }
-            output = "\n".join(part for part in [completed.stdout, completed.stderr] if part.strip()).strip()
+            output = _decode_process_output(completed.stdout, completed.stderr)
             if output:
                 outputs.append(f"$ {' '.join(command)}\n{output}")
             if completed.returncode != 0:
@@ -380,10 +382,10 @@ def compile_pdf(job_directory: Path, *, tex_filename: str) -> dict[str, Any]:
             command,
             cwd=job_directory,
             capture_output=True,
-            text=True,
+            text=False,
             check=False,
         )
-        output = "\n".join(part for part in [completed.stdout, completed.stderr] if part.strip()).strip()
+        output = _decode_process_output(completed.stdout, completed.stderr)
         if output:
             outputs.append(f"$ {' '.join(command)}\n{output}")
         if completed.returncode != 0:
@@ -431,6 +433,12 @@ def _load_table_rows(path: Path, *, mime_type: str) -> list[list[str]]:
                     rows.append([str(entry.get(header, ""))[:80] for header in headers])
         return rows
 
+    if mime_type == "text/plain":
+        lines = [line.strip()[:100] for line in raw_text.splitlines() if line.strip()]
+        if not lines:
+            return []
+        return [["excerpt"], *[[line] for line in lines[:10]]]
+
     delimiter = "\t" if mime_type == "text/tab-separated-values" or path.suffix.lower() == ".tsv" else ","
     reader = csv.reader(raw_text.splitlines(), delimiter=delimiter)
     for row in reader:
@@ -473,21 +481,122 @@ def _latex_escape_prose(value: str) -> str:
 
     placeholders: dict[str, str] = {}
 
-    def protect(pattern: str, source_text: str) -> str:
+    def protect(pattern: str, source_text: str, *, flags: int = re.DOTALL) -> str:
         def replace(match: re.Match[str]) -> str:
             token = f"@@LATEX_{len(placeholders)}@@"
             placeholders[token] = match.group(0)
             return token
 
-        return re.sub(pattern, replace, source_text, flags=re.DOTALL)
+        return re.sub(pattern, replace, source_text, flags=flags)
 
-    protected = protect(r"\\(?:cite|ref)\{[^}]+\}", text)
-    protected = protect(r"\$[^$]+\$", protected)
+    protected = protect(r"\\(?:cite|ref|eqref)\{[^}]+\}", text)
+    protected = protect(r"\\(?:emph|textit|textbf|subsection|subsubsection|paragraph)\*?\{[^}]+\}", protected)
+    protected = protect(r"\\\[[\s\S]*?\\\]", protected)
+    protected = protect(r"\\\([\s\S]*?\\\)", protected)
+    protected = protect(
+        r"\\begin\{(?:equation|equation\*|align|align\*|gather|gather\*|multline|multline\*)\}[\s\S]*?\\end\{(?:equation|equation\*|align|align\*|gather|gather\*|multline|multline\*)\}",
+        protected,
+    )
+    protected = _protect_inline_math(protected, placeholders)
     escaped = _latex_escape_text(protected).replace("$", "\\$")
     for token, original in placeholders.items():
         escaped = escaped.replace(_latex_escape_text(token), original)
     paragraphs = [paragraph.strip() for paragraph in escaped.split("\n\n") if paragraph.strip()]
     return "\n\n".join(paragraphs)
+
+
+def _protect_inline_math(text: str, placeholders: dict[str, str]) -> str:
+    chunks: list[str] = []
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("$", cursor)
+        if start == -1:
+            chunks.append(text[cursor:])
+            break
+        if start > 0 and text[start - 1] == "\\":
+            chunks.append(text[cursor : start + 1])
+            cursor = start + 1
+            continue
+        end = text.find("$", start + 1)
+        if end == -1:
+            chunks.append(text[cursor:])
+            break
+        candidate = text[start + 1 : end]
+        if _looks_like_inline_math(candidate):
+            chunks.append(text[cursor:start])
+            token = f"@@LATEX_{len(placeholders)}@@"
+            placeholders[token] = text[start : end + 1]
+            chunks.append(token)
+            cursor = end + 1
+            continue
+        chunks.append(text[cursor : start + 1])
+        cursor = start + 1
+    return "".join(chunks)
+
+
+def _looks_like_inline_math(candidate: str) -> bool:
+    content = candidate.strip()
+    if not content or "\n\n" in content:
+        return False
+    if content.count(" ") > 8 and not re.search(r"[=<>+\-*/_^\\]", content):
+        return False
+    math_signals = [
+        r"\\[A-Za-z]+",
+        r"[=<>]|\\leq|\\geq|\\approx|\\sim|\\times",
+        r"[_^]",
+        r"\b(?:alpha|beta|gamma|delta|theta|lambda|mu|sigma|pi)\b",
+        r"\b[A-Za-z]\d*\b",
+    ]
+    if any(re.search(pattern, content) for pattern in math_signals):
+        return True
+    return bool(re.fullmatch(r"[-+]?(\d+(\.\d+)?|\.\d+)\s*(?:[%A-Za-z/().-]+)?", content))
+
+
+def _display_table_cell(value: str, *, header_cell: bool = False) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if header_cell:
+        return re.sub(r"\s+", " ", text.replace("_", " ")).strip()
+
+    normalized = re.sub(r"\s+", " ", text.replace("_", " ")).strip()
+    try:
+        number = float(normalized.replace(",", ""))
+    except ValueError:
+        return normalized[:80]
+
+    if not math.isfinite(number):
+        return normalized[:80]
+    if number.is_integer():
+        magnitude = abs(number)
+        if magnitude >= 1000:
+            return f"{int(number):,}"
+        return str(int(number))
+    if abs(number) >= 1000:
+        return f"{number:,.1f}".rstrip("0").rstrip(".")
+    if abs(number) >= 1:
+        return f"{number:.3f}".rstrip("0").rstrip(".")
+    if abs(number) >= 0.01:
+        return f"{number:.4f}".rstrip("0").rstrip(".")
+    return f"{number:.2e}"
+
+
+def _decode_process_output(*streams: bytes | str | None) -> str:
+    decoded_parts: list[str] = []
+    for stream in streams:
+        if stream is None:
+            continue
+        if isinstance(stream, str):
+            text = stream
+        else:
+            try:
+                text = stream.decode("utf-8")
+            except UnicodeDecodeError:
+                text = stream.decode("utf-8", errors="replace")
+        cleaned = text.strip()
+        if cleaned:
+            decoded_parts.append(cleaned)
+    return "\n".join(decoded_parts).strip()
 
 
 def _normalize_inline_commands(value: str) -> str:

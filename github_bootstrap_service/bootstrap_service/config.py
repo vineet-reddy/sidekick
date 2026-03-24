@@ -49,7 +49,7 @@ class BootstrapServiceConfig:
     backend_artifact_ttl_seconds: int = 24 * 60 * 60
     openai_model: str = "gpt-5.4"
     openai_workspace_model: str = "gpt-5.4"
-    openai_writer_model: str = "gpt-5.4-mini"
+    openai_writer_model: str = "gpt-5.4"
     openai_reasoning_effort: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_estimated_input_cost_per_million: float = 0.25
@@ -121,7 +121,7 @@ class BootstrapServiceConfig:
             backend_artifact_ttl_seconds=_int_env("SIDEKICK_BACKEND_ARTIFACT_TTL_SECONDS", 24 * 60 * 60),
             openai_model=legacy_model,
             openai_workspace_model=os.getenv("SIDEKICK_OPENAI_WORKSPACE_MODEL", legacy_model).strip() or legacy_model,
-            openai_writer_model=os.getenv("SIDEKICK_OPENAI_WRITER_MODEL", "gpt-5.4-mini").strip() or "gpt-5.4-mini",
+            openai_writer_model=os.getenv("SIDEKICK_OPENAI_WRITER_MODEL", "gpt-5.4").strip() or "gpt-5.4",
             openai_reasoning_effort=os.getenv("SIDEKICK_OPENAI_REASONING_EFFORT", "").strip(),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1",
             openai_estimated_input_cost_per_million=_float_env(
