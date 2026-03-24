@@ -31,6 +31,7 @@ from .manuscript import (
     results_to_markdown,
 )
 from .openai_client import OpenAIClient, OpenAIContainerFile
+from .pipeline_engine import PaperPipelineEngine, PipelineExecutionError
 
 
 def _json_dumps(payload: dict[str, Any]) -> bytes:
@@ -325,10 +326,7 @@ class JobContext:
     request_payload: dict[str, Any]
 
 
-class JobExecutionError(RuntimeError):
-    def __init__(self, message: str, *, stage: str):
-        super().__init__(message)
-        self.stage = stage
+JobExecutionError = PipelineExecutionError
 
 
 class JobProcessor(threading.Thread):
@@ -345,6 +343,12 @@ class JobProcessor(threading.Thread):
         self._database = database
         self._github_client = github_client
         self._openai_client = openai_client
+        self._engine = PaperPipelineEngine(
+            config=config,
+            openai_client=openai_client,
+            status_callback=self._record_pipeline_status,
+            metrics_callback=self._record_response_metrics,
+        )
         self._stop_event = threading.Event()
 
     def stop(self) -> None:
@@ -441,134 +445,25 @@ class JobProcessor(threading.Thread):
             estimated_cost_usd=self._estimate_cost(input_tokens, output_tokens),
         )
 
+    def _record_pipeline_status(
+        self,
+        job_id: str,
+        *,
+        stage: str,
+        progress_message: str,
+        status: str | None = None,
+        openai_response_id: str | None = None,
+    ) -> None:
+        self._database.update_paper_job(
+            job_id,
+            stage=stage,
+            status=status,
+            progress_message=progress_message,
+            openai_response_id=openai_response_id,
+        )
+
     def _run_research_workspace(self, context: JobContext) -> dict[str, Any]:
-        self._database.update_paper_job(
-            context.job["id"],
-            status="running",
-            stage="inspect",
-            progress_message="Inspecting data and executing the research workspace.",
-        )
-        instructions = """
-You are a scientist. The user has a research idea. Turn it into a real study.
-
-1. Formulate a specific, testable research question from the user's idea.
-2. Design a methods approach using available data and tools.
-3. Execute the analysis: gather data, run computations, produce figures and tables, and save every artifact as a real file.
-4. Record the results honestly.
-
-Return strict JSON only with this exact shape:
-{
-  "title": "string",
-  "research_question": "string",
-  "methods": "string describing what you actually did in this run",
-  "results": [
-    {
-      "text": "string",
-      "artifact_ids": ["artifact_1"]
-    }
-  ],
-  "limitations": ["string"],
-  "sources": [
-    {
-      "source_id": "source_1",
-      "label": "string",
-      "landing_page_url": "string",
-      "download_url": "string",
-      "accession_id": "string",
-      "api_endpoint": "string",
-      "api_query": "string or object",
-      "notes": "string"
-    }
-  ],
-  "artifacts": [
-    {
-      "artifact_id": "artifact_1",
-      "path": "artifacts/table_1.csv",
-      "kind": "table or figure or stats or notebook or log",
-      "mime_type": "text/csv",
-      "description": "string",
-      "source_ids": ["source_1"]
-    }
-  ]
-}
-Rules:
-- Do original analytic work. Do not just summarize what others have found.
-- Save every cited artifact as a real file in the container. Do not inline binary data or giant tables into JSON.
-- Reference each saved file exactly by the filename or path you created so it can be retrieved later.
-- Before returning, ensure every `artifacts[].path` value matches a real saved container file path or basename exactly. Rename files if needed.
-- Every result must be backed by an artifact you created and saved in this run.
-- Source provenance must include reproducible retrieval information such as an accession id, direct download URL, or concrete API query. Landing pages alone are insufficient.
-- If the scientist provided must-use materials, use them as primary inputs.
-- Methods must describe what you actually did in this run, not what prior literature says.
-- If meaningful original work is not possible with available materials, return no results and explain that honestly in `limitations`.
-- Be honest about limitations. Do not overclaim.
-- Do not use synthetic, simulated, placeholder, demo, or draft language.
-"""
-        payload = {
-            "title": context.request_payload["title"],
-            "theme": context.request_payload["theme"],
-            "notes": context.request_payload["notes"],
-            "dataset_ids": context.request_payload.get("dataset_ids") or [],
-            "dataset_hints": context.request_payload.get("dataset_hints") or [],
-            "domain_guidance": str(context.request_payload.get("domain_guidance") or "").strip(),
-        }
-        must_use_sources = context.request_payload.get("must_use_sources") or []
-        input_prefix_lines: list[str] = []
-        if must_use_sources:
-            input_prefix_lines.append("The scientist provided these materials as primary inputs. Use them:")
-            for source in must_use_sources:
-                if not isinstance(source, dict):
-                    continue
-                kind = str(source.get("kind") or "source").strip() or "source"
-                url = str(source.get("url") or "").strip()
-                notes = str(source.get("notes") or "").strip()
-                if not url:
-                    continue
-                suffix = f": {notes}" if notes else ""
-                input_prefix_lines.append(f"- [{kind}] {url}{suffix}")
-        domain_guidance = str(context.request_payload.get("domain_guidance") or "").strip()
-        if domain_guidance:
-            input_prefix_lines.append("")
-            input_prefix_lines.append("Scientist guidance:")
-            input_prefix_lines.append(domain_guidance)
-
-        input_text = json.dumps(payload, sort_keys=True)
-        if input_prefix_lines:
-            input_text = "\n".join(input_prefix_lines).strip() + "\n\nTask payload:\n" + input_text
-        response = self._openai_client.generate_json(
-            instructions=instructions,
-            input_text=input_text,
-            use_code_interpreter=True,
-            use_web_search=True,
-            timeout_seconds=self._config.backend_max_job_runtime_seconds,
-            model=self._config.openai_workspace_model,
-        )
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="inspect",
-            progress_message="Research workspace complete. Saving artifact files and receipts.",
-            openai_response_id=response.response_id,
-        )
-        self._record_response_metrics(
-            job_id=context.job["id"],
-            model=self._config.openai_workspace_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-
-        ledger = _normalize_ledger(
-            _extract_json_object(response.output_text),
-            title_fallback=str(context.request_payload.get("title") or "Research paper"),
-        )
-        container_ids = self._openai_client.extract_container_ids(response)
-        downloaded_files = self._materialize_workspace_files(
-            context.job["id"],
-            ledger,
-            container_ids=container_ids,
-        )
-        self._apply_downloaded_files_to_ledger(ledger, downloaded_files)
-        _write_json_file(self._job_directory(context.job["id"]) / "ledger.json", ledger)
-        return ledger
+        return self._engine.run_research_workspace(run_id=context.job["id"], request_payload=context.request_payload)
 
     def _materialize_workspace_files(
         self,
@@ -577,412 +472,24 @@ Rules:
         *,
         container_ids: list[str],
     ) -> list[DownloadedArtifactFile]:
-        workspace_directory = self._job_directory(job_id)
-        downloaded_files: list[DownloadedArtifactFile] = []
-        claimed_artifact_ids: set[str] = set()
-        container_files: list[OpenAIContainerFile] = []
-        seen_file_keys: set[tuple[str, str]] = set()
-        for container_id in container_ids:
-            for container_file in self._openai_client.list_container_files(container_id=container_id):
-                key = (container_file.container_id, container_file.file_id)
-                if key in seen_file_keys:
-                    continue
-                seen_file_keys.add(key)
-                container_files.append(container_file)
-
-        claimed_file_keys: set[tuple[str, str]] = set()
-        for artifact in ledger.get("artifacts", []):
-            if not isinstance(artifact, dict):
-                continue
-            artifact_id = str(artifact.get("artifact_id") or "").strip()
-            if artifact_id and artifact_id in claimed_artifact_ids:
-                continue
-            declared_path = _artifact_path_value(artifact)
-            artifact_candidates = _path_candidates(declared_path)
-            if not artifact_candidates:
-                continue
-
-            matched_file = next(
-                (
-                    container_file
-                    for container_file in container_files
-                    if (container_file.container_id, container_file.file_id) not in claimed_file_keys
-                    and artifact_candidates
-                    & (_path_candidates(container_file.path) | _path_candidates(container_file.filename))
-                ),
-                None,
-            )
-            if matched_file is None:
-                continue
-
-            raw_bytes = self._openai_client.download_container_file_bytes(
-                container_id=matched_file.container_id,
-                file_id=matched_file.file_id,
-            )
-            fallback_name = Path(matched_file.path or matched_file.filename or matched_file.file_id).name or f"{matched_file.file_id}.bin"
-            relative_path = _sanitize_relative_path(
-                declared_path or f"artifacts/{fallback_name}",
-                fallback=f"artifacts/{fallback_name}",
-            )
-            destination = workspace_directory / relative_path
-            destination.parent.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(raw_bytes)
-
-            mime_type = matched_file.mime_type or _guess_mime_type(relative_path)
-            downloaded_files.append(
-                DownloadedArtifactFile(
-                    artifact_id=artifact_id or None,
-                    container_id=matched_file.container_id,
-                    file_id=matched_file.file_id,
-                    filename=Path(relative_path).name,
-                    relative_path=relative_path,
-                    metadata_path=matched_file.path,
-                    mime_type=mime_type,
-                    sha256=_sha256_bytes(raw_bytes),
-                )
-            )
-            claimed_file_keys.add((matched_file.container_id, matched_file.file_id))
-            if artifact_id:
-                claimed_artifact_ids.add(artifact_id)
-
-        return downloaded_files
+        return self._engine.materialize_workspace_files(run_id=job_id, ledger=ledger, container_ids=container_ids)
 
     def _apply_downloaded_files_to_ledger(self, ledger: dict[str, Any], downloaded_files: list[DownloadedArtifactFile]) -> None:
-        by_artifact_id = {
-            downloaded_file.artifact_id: downloaded_file
-            for downloaded_file in downloaded_files
-            if downloaded_file.artifact_id
-        }
-        artifact_files: list[dict[str, Any]] = []
-        for artifact in ledger.get("artifacts", []):
-            artifact_id = str(artifact.get("artifact_id") or "").strip()
-            downloaded_file = by_artifact_id.get(artifact_id)
-            if downloaded_file is None:
-                continue
-            artifact["path"] = downloaded_file.relative_path
-            artifact["mime_type"] = artifact.get("mime_type") or downloaded_file.mime_type
-            artifact["sha256"] = downloaded_file.sha256
-            artifact_files.append(
-                {
-                    "artifact_id": artifact_id,
-                    "path": downloaded_file.relative_path,
-                    "mime_type": artifact.get("mime_type") or downloaded_file.mime_type,
-                    "sha256": downloaded_file.sha256,
-                }
-            )
-        ledger["artifact_files"] = artifact_files
+        self._engine.apply_downloaded_files_to_ledger(ledger, downloaded_files)
 
     def _validate_ledger(self, job_id: str, ledger: dict[str, Any]) -> dict[str, Any]:
-        self._database.update_paper_job(
-            job_id,
-            stage="verify",
-            progress_message="Verifying source receipts, artifacts, and manuscript routing.",
-        )
-        job_directory = self._job_directory(job_id)
-        valid_sources: dict[str, dict[str, Any]] = {}
-        source_issues: list[str] = []
-        for source in ledger.get("sources", []):
-            if not isinstance(source, dict):
-                continue
-            source_id = str(source.get("source_id") or "").strip()
-            if not source_id:
-                continue
-            if _source_has_reproducible_receipt(source):
-                valid_sources[source_id] = source
-            else:
-                source_issues.append(f"{source_id} is missing reproducible retrieval info.")
-
-        valid_artifacts: dict[str, dict[str, Any]] = {}
-        artifact_issues: list[str] = []
-        for artifact in ledger.get("artifacts", []):
-            if not isinstance(artifact, dict):
-                continue
-            artifact_id = str(artifact.get("artifact_id") or "").strip()
-            artifact_path = _sanitize_relative_path(
-                _artifact_path_value(artifact),
-                fallback=f"artifacts/{artifact_id or 'artifact'}",
-            )
-            path = job_directory / artifact_path
-            if artifact_id and path.exists() and path.is_file():
-                artifact["path"] = artifact_path
-                artifact["mime_type"] = artifact.get("mime_type") or _guess_mime_type(artifact_path)
-                valid_artifacts[artifact_id] = artifact
-            elif artifact_id:
-                artifact_issues.append(f"{artifact_id} does not resolve to a saved file.")
-
-        approved_results: list[dict[str, Any]] = []
-        dropped_results: list[dict[str, Any]] = []
-        for result in ledger.get("results", []):
-            if not isinstance(result, dict):
-                continue
-            result_id = str(result.get("result_id") or "").strip()
-            text = str(result.get("text") or "").strip()
-            artifact_ids = [artifact_id for artifact_id in _normalize_text_list(result.get("artifact_ids")) if artifact_id in valid_artifacts]
-
-            source_ids: list[str] = []
-            for artifact_id in artifact_ids:
-                for source_id in _artifact_source_ids(valid_artifacts[artifact_id]):
-                    if source_id in valid_sources and source_id not in source_ids:
-                        source_ids.append(source_id)
-
-            reasons: list[str] = []
-            if not text:
-                reasons.append("result text is empty")
-            banned_hits = _find_banned_phrases(text)
-            if banned_hits:
-                reasons.append("result uses banned language: " + ", ".join(banned_hits))
-            if not artifact_ids:
-                reasons.append("result does not reference a saved artifact")
-            if not source_ids:
-                reasons.append("result does not resolve to reproducible source provenance")
-
-            if reasons:
-                dropped_results.append({"result_id": result_id or "result", "reasons": reasons, "text": text})
-                continue
-
-            approved_results.append(
-                {
-                    "result_id": result_id or f"result_{len(approved_results) + 1}",
-                    "text": text,
-                    "artifact_ids": artifact_ids,
-                    "source_ids": source_ids,
-                }
-            )
-
-        methods_text = str(ledger.get("methods") or "").strip()
-        methods_lower = methods_text.lower()
-        passive_summary_patterns = [
-            r"\bwe reviewed\b",
-            r"\bwe summarized\b",
-            r"\bwe searched for\b",
-            r"\bwe surveyed\b",
-            r"\bwe examined the literature\b",
-            r"\bliterature review\b",
-        ]
-        active_analysis_patterns = [
-            r"\bwe (?:downloaded|queried|processed|cleaned|joined|fit|fitted|modeled|estimated|computed|analyzed|compared|calculated|measured)\b",
-            r"\busing python\b",
-            r"\bwe created\b",
-            r"\bwe generated\b",
-            r"\bwe extracted\b",
-        ]
-        passive_hits = [pattern for pattern in passive_summary_patterns if re.search(pattern, methods_lower)]
-        active_hits = [pattern for pattern in active_analysis_patterns if re.search(pattern, methods_lower)]
-        did_original_work = len(methods_text) >= 200 and bool(active_hits or not passive_hits)
-
-        paper_checks = {
-            "described_work_performed_here": did_original_work,
-            "has_original_result": bool(ledger.get("results") or []),
-            "has_artifact_backed_result": bool(approved_results),
-        }
-        memo_reasons: list[str] = []
-        if not paper_checks["described_work_performed_here"]:
-            memo_reasons.append("methods did not clearly describe substantial work performed in this run")
-        if not paper_checks["has_original_result"]:
-            memo_reasons.append("no artifact-backed original results survived validation")
-        if not paper_checks["has_artifact_backed_result"]:
-            memo_reasons.append("no original result resolved to a real saved artifact")
-
-        validation_issues = source_issues + artifact_issues
-        manuscript_kind = "paper" if all(paper_checks.values()) else "memo"
-        status = manuscript_kind
-
-        approved_source_ids: list[str] = []
-        for result in approved_results:
-            for source_id in result.get("source_ids") or []:
-                if source_id in valid_sources and source_id not in approved_source_ids:
-                    approved_source_ids.append(source_id)
-        if not approved_source_ids:
-            approved_source_ids = list(valid_sources.keys())
-
-        reference_catalog = [
-            {
-                "key": f"ref{index + 1}",
-                "source_id": source_id,
-                "text": format_reference_from_source(valid_sources[source_id]),
-            }
-            for index, source_id in enumerate(approved_source_ids)
-            if source_id in valid_sources
-        ]
-
-        validation = {
-            "status": status,
-            "manuscript_kind": manuscript_kind,
-            "final_format": manuscript_kind,
-            "approved_results": approved_results,
-            "approved_result_ids": [result["result_id"] for result in approved_results],
-            "dropped_results": dropped_results,
-            "validation_issues": validation_issues,
-            "paper_checks": paper_checks,
-            "memo_reasons": memo_reasons,
-            "reference_catalog": reference_catalog,
-            "summary": (
-                f"Paper checks passed with {len(approved_results)} artifact-backed result(s)."
-                if manuscript_kind == "paper"
-                else "Routing to a research memo because the run did not clear the paper gate."
-            ),
-        }
-        _write_json_file(job_directory / "validation.json", validation)
-        return validation
+        return self._engine.validate_ledger(run_id=job_id, ledger=ledger)
 
     def _write_bundle(self, context: JobContext, ledger: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="write",
-            progress_message="Writing manuscript sections from the validated research record.",
+        return self._engine.write_bundle(
+            run_id=context.job["id"],
+            request_payload=context.request_payload,
+            ledger=ledger,
+            validation=validation,
         )
-        instructions = """
-You are Sidekick's paper writer.
-You receive a validated research record and must write prose sections for the final manuscript.
-Return strict JSON only with this exact shape:
-{
-  "title": "string",
-  "abstract": "string",
-  "introduction": "string",
-  "methods": "string",
-  "results": "string",
-  "discussion": "string",
-  "limitations": "string",
-  "references": ["formatted reference strings"]
-}
-Rules:
-- Use only `validation.approved_results` as factual findings. Do not add new findings, estimates, or sources.
-- Use `validation.manuscript_kind` as authoritative. Do not upgrade a memo into a paper.
-- Use citation placeholders like `[[CITE:ref1]]` and cross-reference placeholders like `[[REF:fig:artifact-1]]` or `[[REF:tab:artifact-2]]`. Do not emit raw backslash LaTeX commands inside JSON strings.
-- Use only citation keys from `validation.reference_catalog`.
-- Use only figure/table labels present in `artifact_manifest`.
-- Write plain prose only. Do not include a LaTeX preamble or environments.
-- When tables or figures are present, discuss the key empirical pattern they show in the Results section instead of ignoring them.
-- Include the research question, methods performed in this run, and limitations honestly.
-- Do not use draft, demo, placeholder, simulated, synthetic, or definitive-proof language.
-"""
-        artifact_manifest = build_manuscript_manifest(
-            job_directory=self._job_directory(context.job["id"]),
-            artifacts=ledger.get("artifacts") or [],
-            sanitize_relative_path=_sanitize_relative_path,
-            artifact_path_value=_artifact_path_value,
-            guess_mime_type=_guess_mime_type,
-        )
-        input_text = json.dumps(
-            {
-                "title": context.request_payload["title"],
-                "theme": context.request_payload["theme"],
-                "ledger": ledger,
-                "validation": validation,
-                "artifact_manifest": artifact_manifest,
-            },
-            sort_keys=True,
-        )
-        response = self._openai_client.generate_json(
-            instructions=instructions,
-            input_text=input_text,
-            use_code_interpreter=False,
-            use_web_search=False,
-            timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
-            model=self._config.openai_writer_model,
-        )
-        self._database.update_paper_job(
-            context.job["id"],
-            stage="write",
-            progress_message="Manuscript prose complete. Rendering LaTeX and compiling the PDF.",
-            openai_response_id=response.response_id,
-        )
-        self._record_response_metrics(
-            job_id=context.job["id"],
-            model=self._config.openai_writer_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-
-        written = normalize_manuscript_sections(
-            _extract_json_object(response.output_text),
-            title_fallback=str(ledger.get("title") or context.request_payload["title"]),
-        )
-        prose_for_banned_check = "\n".join(
-            [
-                written.get("abstract") or "",
-                written.get("introduction") or "",
-                written.get("methods") or "",
-                written.get("results") or "",
-                written.get("discussion") or "",
-                written.get("limitations") or "",
-            ]
-        )
-        if not prose_for_banned_check.strip():
-            raise JobExecutionError("Writer did not return manuscript prose.", stage="write")
-        banned_hits = _find_banned_phrases(prose_for_banned_check)
-        if banned_hits:
-            raise JobExecutionError("Writer returned banned language in manuscript prose.", stage="write")
-
-        figures = self._bundle_figures_from_ledger(context.job["id"], ledger)
-        verification = _build_verification_payload(validation, figures)
-        provenance = _build_task_provenance(ledger)
-        manuscript_kind = str(validation.get("manuscript_kind") or "paper").strip() or "paper"
-        title = str(written.get("title") or ledger.get("title") or context.request_payload["title"]).strip() or context.request_payload["title"]
-        latex, references_bib = render_latex(
-            title=title,
-            sections=written,
-            manifest=artifact_manifest,
-            manuscript_kind=manuscript_kind,
-            reference_catalog=validation.get("reference_catalog") or [],
-        )
-        base_filename = "memo" if manuscript_kind == "memo" else "paper"
-        job_directory = self._job_directory(context.job["id"])
-        tex_filename = f"{base_filename}.tex"
-        (job_directory / tex_filename).write_text(latex, encoding="utf-8")
-        (job_directory / "references.bib").write_text(references_bib, encoding="utf-8")
-        compile_result = compile_pdf(job_directory, tex_filename=tex_filename)
-        if not compile_result["ok"]:
-            print(f"[sidekick-backend] LaTeX compilation failed for {context.job['id']}: {compile_result['error']}")
-            if compile_result.get("log"):
-                print(compile_result["log"])
-
-        markdown_preview = results_to_markdown(written, manuscript_kind=manuscript_kind)
-        bundle = {
-            "title": title,
-            "manuscript_kind": manuscript_kind,
-            "sections": written,
-            "latex": latex,
-            "references_bib": references_bib,
-            "artifact_manifest": artifact_manifest,
-            "pdf": {
-                "ok": bool(compile_result.get("ok")),
-                "filename": compile_result.get("pdf_path") or f"{base_filename}.pdf",
-                "error": str(compile_result.get("error") or "").strip(),
-                "log": str(compile_result.get("log") or "").strip(),
-            },
-            "figures": figures,
-            "provenance": provenance,
-            "verification": verification,
-            "draft": {"title": title, "markdown": markdown_preview},
-            "ledger": ledger,
-            "validation": validation,
-            "artifact_files": ledger.get("artifact_files", []),
-        }
-        return bundle
 
     def _bundle_figures_from_ledger(self, job_id: str, ledger: dict[str, Any]) -> list[dict[str, Any]]:
-        figures: list[dict[str, Any]] = []
-        job_directory = self._job_directory(job_id)
-        for artifact in ledger.get("artifacts", []):
-            if not isinstance(artifact, dict):
-                continue
-            artifact_path = str(artifact.get("path") or "").strip()
-            mime_type = str(artifact.get("mime_type") or "").strip() or _guess_mime_type(artifact_path)
-            if not artifact_path or not mime_type.startswith("image/"):
-                continue
-            path = job_directory / artifact_path
-            if not path.exists() or not path.is_file():
-                continue
-            figures.append(
-                {
-                    "filename": path.name,
-                    "caption": str(artifact.get("description") or "").strip(),
-                    "mime_type": mime_type,
-                    "base64_data": base64.b64encode(path.read_bytes()).decode("utf-8"),
-                }
-            )
-        return figures
+        return self._engine.bundle_figures_from_ledger(run_id=job_id, ledger=ledger)
 
     def _publish_bundle(self, context: JobContext, bundle: dict[str, Any]) -> dict[str, Any]:
         self._database.update_paper_job(
