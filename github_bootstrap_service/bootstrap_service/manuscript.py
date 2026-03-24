@@ -189,11 +189,15 @@ def render_latex(
             reference_text = catalog_by_key.get(key, "")
         if not reference_text:
             continue
+        reference_title = _reference_bib_title(reference_text, fallback=f"Reference {index + 1}")
+        reference_year = _reference_bib_year(reference_text)
         bibliography_lines.append(
             "\n".join(
                 [
                     f"@misc{{{key},",
-                    f"  title = {{{_latex_escape_bib_value(f'Reference {index + 1}')}}},",
+                    f"  title = {{{_latex_escape_bib_value(reference_title)}}},",
+                    f"  year = {{{_latex_escape_bib_value(reference_year)}}},",
+                    f"  key = {{{_latex_escape_bib_value(f'Reference {index + 1}')}}},",
                     f"  note = {{{_latex_escape_bib_value(reference_text)}}}",
                     "}",
                 ]
@@ -619,6 +623,22 @@ def _display_inline_tokens(value: str) -> str:
     text = re.sub(r"\\ref\{fig:[^}]+\}", "Figure", text)
     text = re.sub(r"\\ref\{tab:[^}]+\}", "Table", text)
     return text
+
+
+def _reference_bib_title(reference_text: str, *, fallback: str) -> str:
+    text = str(reference_text or "").strip()
+    if not text:
+        return fallback
+    primary = text.partition(". Accession:")[0].strip()
+    if primary:
+        return primary
+    sentence = text.split(". ", 1)[0].strip().rstrip(".")
+    return sentence or fallback
+
+
+def _reference_bib_year(reference_text: str) -> str:
+    match = re.search(r"\b(19|20)\d{2}\b", str(reference_text or ""))
+    return match.group(0) if match else "n.d."
 
 
 def _ensure_tectonic_binary(cache_directory: Path) -> Path:
