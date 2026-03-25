@@ -44,6 +44,20 @@ struct NoteListView: View {
                             .onTapGesture {
                                 editingNote = note
                             }
+                            .contextMenu {
+                                Button(note.priorityRequestedAt == nil ? "Prioritize" : "Prioritized") {
+                                    prioritize(note)
+                                }
+                                .disabled(note.priorityRequestedAt != nil)
+
+                                Button("Edit") {
+                                    editingNote = note
+                                }
+
+                                Button("Delete", role: .destructive) {
+                                    delete(note)
+                                }
+                            }
                             .simultaneousGesture(
                                 DragGesture(minimumDistance: 30, coordinateSpace: .local)
                                     .onEnded { value in
