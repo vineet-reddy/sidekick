@@ -779,23 +779,15 @@ final class HeartbeatManager: ObservableObject {
         let datasetCount = Double(Set(cluster.datasetIDs).count)
         let readinessBonus: Double
 
-        if cluster.isAutomaticallyRunnable {
+        switch cluster.readinessMode {
+        case .trustedReady:
             readinessBonus = 48
-        } else if isPromotableTrustedPartialCluster(cluster) {
-            readinessBonus = 38
-        } else if isPromotableExploratoryCluster(cluster) {
-            readinessBonus = 34
-        } else {
-            switch cluster.readinessMode {
-            case .trustedReady:
-                readinessBonus = 32
-            case .trustedPartial:
-                readinessBonus = 24
-            case .exploratoryReady:
-                readinessBonus = 18
-            case .needsData:
-                readinessBonus = 0
-            }
+        case .trustedPartial:
+            readinessBonus = 36
+        case .exploratoryReady:
+            readinessBonus = 30
+        case .needsData:
+            readinessBonus = 0
         }
 
         let noteCoverageBonus = min(noteCount, 4.0) * 12
@@ -803,27 +795,8 @@ final class HeartbeatManager: ObservableObject {
         return readinessBonus + noteCoverageBonus - datasetPenalty
     }
 
-    private func isPromotableTrustedPartialCluster(_ cluster: NoteCluster) -> Bool {
-        guard cluster.readinessMode == .trustedPartial else {
-            return false
-        }
-
-        let noteCount = Set(cluster.noteIDs).count
-        return noteCount >= 2 || (noteCount == 1 && Set(cluster.datasetIDs).count <= 1)
-    }
-
-    private func isPromotableExploratoryCluster(_ cluster: NoteCluster) -> Bool {
-        guard cluster.readinessMode == .exploratoryReady else {
-            return false
-        }
-
-        return Set(cluster.noteIDs).count >= 2
-    }
-
     private func isSubmissionCandidate(_ cluster: NoteCluster) -> Bool {
-        cluster.isAutomaticallyRunnable
-            || isPromotableTrustedPartialCluster(cluster)
-            || isPromotableExploratoryCluster(cluster)
+        !Set(cluster.noteIDs).isEmpty && cluster.readinessMode != .needsData
     }
 
     private func markResearchRunFailed(
