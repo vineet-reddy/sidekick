@@ -44,7 +44,7 @@ final class HeartbeatManager: ObservableObject {
     private let lastRunKey = "com.vineet.sidekick.lastHeartbeatAt"
     private let cooldown: TimeInterval = 20 * 60
     private let failedPaperRetryCooldown: TimeInterval = 20 * 60
-    private let maxConcurrentRuns = 1
+    private let maxConcurrentRuns = 4
     private let maxNoteAssessmentPasses = 3
 
     init(
@@ -436,8 +436,8 @@ final class HeartbeatManager: ObservableObject {
                 let queueState: ResearchRunQueueState = index == 0 ? .nextInLine : .waitingForCurrentPaper
                 run.markQueued(
                     message: index == 0
-                        ? "Waiting for the current paper to finish. This paper is next in line."
-                        : "Waiting for the current paper to finish. Sidekick runs one paper at a time per install.",
+                        ? "Waiting for an open execution slot. This paper is next in line."
+                        : "Waiting for an open execution slot. Sidekick is already running the maximum number of papers for this install.",
                     queueState: queueState
                 )
                 continue

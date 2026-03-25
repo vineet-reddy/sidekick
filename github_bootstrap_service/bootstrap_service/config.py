@@ -43,13 +43,13 @@ class BootstrapServiceConfig:
     backend_artifact_root: str = ".sidekick-runtime/paper-artifacts"
     backend_kill_switch: bool = False
     backend_max_daily_spend_usd: float = 100.0
-    backend_max_jobs_per_install_per_day: int = 8
+    backend_max_jobs_per_install_per_day: int = 0
     backend_max_job_runtime_seconds: int = 3600
-    backend_max_concurrent_jobs_per_install: int = 1
+    backend_max_concurrent_jobs_per_install: int = 4
     backend_artifact_ttl_seconds: int = 24 * 60 * 60
-    openai_model: str = "gpt-5.4"
-    openai_workspace_model: str = "gpt-5.4"
-    openai_writer_model: str = "gpt-5.4"
+    openai_model: str = "gpt-5-nano"
+    openai_workspace_model: str = "gpt-5-mini"
+    openai_writer_model: str = "gpt-5-nano"
     openai_reasoning_effort: str = ""
     openai_base_url: str = "https://api.openai.com/v1"
     openai_estimated_input_cost_per_million: float = 0.25
@@ -91,7 +91,7 @@ class BootstrapServiceConfig:
             raise ValueError("Missing SIDEKICK_BACKEND_BASE_URL")
         if not openai_api_key:
             raise ValueError("Missing OPENAI_API_KEY")
-        legacy_model = os.getenv("SIDEKICK_OPENAI_MODEL", "gpt-5.4").strip() or "gpt-5.4"
+        legacy_model = os.getenv("SIDEKICK_OPENAI_MODEL", "gpt-5-nano").strip() or "gpt-5-nano"
 
         return cls(
             github_client_id=client_id,
@@ -115,13 +115,13 @@ class BootstrapServiceConfig:
             or ".sidekick-runtime/paper-artifacts",
             backend_kill_switch=_bool_env("SIDEKICK_BACKEND_KILL_SWITCH", False),
             backend_max_daily_spend_usd=_float_env("SIDEKICK_BACKEND_MAX_DAILY_SPEND_USD", 100.0),
-            backend_max_jobs_per_install_per_day=_int_env("SIDEKICK_BACKEND_MAX_JOBS_PER_INSTALL_PER_DAY", 8),
+            backend_max_jobs_per_install_per_day=_int_env("SIDEKICK_BACKEND_MAX_JOBS_PER_INSTALL_PER_DAY", 0),
             backend_max_job_runtime_seconds=_int_env("SIDEKICK_BACKEND_MAX_JOB_RUNTIME_SECONDS", 3600),
-            backend_max_concurrent_jobs_per_install=_int_env("SIDEKICK_BACKEND_MAX_CONCURRENT_JOBS_PER_INSTALL", 1),
+            backend_max_concurrent_jobs_per_install=_int_env("SIDEKICK_BACKEND_MAX_CONCURRENT_JOBS_PER_INSTALL", 4),
             backend_artifact_ttl_seconds=_int_env("SIDEKICK_BACKEND_ARTIFACT_TTL_SECONDS", 24 * 60 * 60),
             openai_model=legacy_model,
-            openai_workspace_model=os.getenv("SIDEKICK_OPENAI_WORKSPACE_MODEL", legacy_model).strip() or legacy_model,
-            openai_writer_model=os.getenv("SIDEKICK_OPENAI_WRITER_MODEL", "gpt-5.4").strip() or "gpt-5.4",
+            openai_workspace_model=os.getenv("SIDEKICK_OPENAI_WORKSPACE_MODEL", "gpt-5-mini").strip() or "gpt-5-mini",
+            openai_writer_model=os.getenv("SIDEKICK_OPENAI_WRITER_MODEL", "gpt-5-nano").strip() or "gpt-5-nano",
             openai_reasoning_effort=os.getenv("SIDEKICK_OPENAI_REASONING_EFFORT", "").strip(),
             openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1",
             openai_estimated_input_cost_per_million=_float_env(

@@ -873,11 +873,12 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                 )
                 return
 
-            since = (utc_now() - timedelta(days=1)).isoformat()
-            recent_jobs = self.server.database.count_recent_jobs_for_install(install_session["id"], since)
-            if recent_jobs >= self.server.config.backend_max_jobs_per_install_per_day:
-                self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "install_daily_limit_reached"})
-                return
+            if self.server.config.backend_max_jobs_per_install_per_day > 0:
+                since = (utc_now() - timedelta(days=1)).isoformat()
+                recent_jobs = self.server.database.count_recent_jobs_for_install(install_session["id"], since)
+                if recent_jobs >= self.server.config.backend_max_jobs_per_install_per_day:
+                    self._send_json(HTTPStatus.TOO_MANY_REQUESTS, {"error": "install_daily_limit_reached"})
+                    return
 
             payload = self._read_json_body()
             title = str(payload.get("title") or "").strip()
