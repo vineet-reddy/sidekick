@@ -4,13 +4,11 @@ import SwiftUI
 struct NoteListView: View {
     @Environment(\.modelContext) private var modelContext
     @EnvironmentObject private var heartbeat: HeartbeatManager
-    @EnvironmentObject private var researchInputs: ResearchInputStore
     @Query(sort: \Note.updatedAt, order: .reverse) private var notes: [Note]
 
     @State private var searchText = ""
     @State private var editingNote: Note?
     @State private var newNoteText = ""
-    @State private var isShowingResearchInputs = false
     @FocusState private var isNewNoteFocused: Bool
     @State private var prioritizedNoteID: UUID?
 
@@ -31,8 +29,6 @@ struct NoteListView: View {
 
             ScrollView {
                 LazyVStack(spacing: 12) {
-                    researchInputsCard
-
                     if filteredNotes.isEmpty && newNoteText.isEmpty {
                         Text("Jot something down below to get started.")
                             .font(.subheadline)
@@ -57,15 +53,6 @@ struct NoteListView: View {
                                         }
                                     }
                             )
-                            .contextMenu {
-                                Button("Prioritize") {
-                                    prioritize(note)
-                                }
-
-                                Button("Delete", role: .destructive) {
-                                    delete(note)
-                                }
-                            }
                     }
                 }
                 .padding(.horizontal, 20)
@@ -94,10 +81,6 @@ struct NoteListView: View {
         }
         .sheet(item: $editingNote) { note in
             NoteEditorView(note: note)
-        }
-        .sheet(isPresented: $isShowingResearchInputs) {
-            ResearchInputsSheet()
-                .environmentObject(researchInputs)
         }
     }
 
@@ -136,46 +119,6 @@ struct NoteListView: View {
         .accessibilityIdentifier("notes.inlineComposer")
     }
 
-    private var researchInputsCard: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            HStack {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Research Inputs")
-                        .font(.headline)
-                    Text(researchInputsSubtitle)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-
-                Spacer()
-
-                Button("Add Sources") {
-                    isShowingResearchInputs = true
-                }
-                .buttonStyle(.bordered)
-            }
-
-            if !researchInputs.domainGuidance.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                Text(researchInputs.domainGuidance.trimmingCharacters(in: .whitespacesAndNewlines))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(3)
-            }
-        }
-        .glassCard(padding: 14)
-    }
-
-    private var researchInputsSubtitle: String {
-        let sourceCount = researchInputs.snapshot.mustUseSources.count
-        if sourceCount == 0 {
-            return "Add papers, datasets, or codebases that future runs must use."
-        }
-
-        return sourceCount == 1
-            ? "1 must-use source will be passed into upcoming runs."
-            : "\(sourceCount) must-use sources will be passed into upcoming runs."
-    }
-
     private func noteCard(for note: Note) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -189,6 +132,17 @@ struct NoteListView: View {
                 Text(note.updatedAt, style: .relative)
                     .font(.caption)
                     .foregroundStyle(.tertiary)
+
+                Button {
+                    prioritize(note)
+                } label: {
+                    Image(systemName: note.priorityRequestedAt == nil ? "arrow.up.circle.fill" : "checkmark.circle.fill")
+                        .font(.title3)
+                        .foregroundStyle(note.priorityRequestedAt == nil ? SidekickTheme.accent : .green)
+                }
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("note.prioritize.\(note.id.uuidString)")
+                .accessibilityLabel(note.priorityRequestedAt == nil ? "Prioritize note" : "Note prioritized")
             }
 
             if note.content.split(separator: "\n").count > 1 || note.content.count > 64 {
@@ -219,8 +173,8 @@ struct NoteListView: View {
 
     private func prioritize(_ note: Note) {
         prioritizedNoteID = note.id
-        let impact = UIImpactFeedbackGenerator(style: .medium)
-        impact.impactOccurred()
+        note.priorityRequestedAt = .now
+        try? modelContext.save()
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
             prioritizedNoteID = nil

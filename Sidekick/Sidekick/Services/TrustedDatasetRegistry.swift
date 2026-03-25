@@ -4,6 +4,7 @@ nonisolated enum NoteClusterReadinessMode: String, Codable, Hashable {
     case trustedReady = "trusted_ready"
     case trustedPartial = "trusted_partial"
     case exploratoryReady = "exploratory_ready"
+    case needsData = "needs_data"
 }
 
 nonisolated struct PaperTaskSubmission {

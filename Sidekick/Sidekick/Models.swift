@@ -27,17 +27,20 @@ final class Note {
     var content: String
     var createdAt: Date
     var updatedAt: Date
+    var priorityRequestedAt: Date?
 
     init(
         id: UUID = UUID(),
         content: String = "",
         createdAt: Date = .now,
-        updatedAt: Date = .now
+        updatedAt: Date = .now,
+        priorityRequestedAt: Date? = nil
     ) {
         self.id = id
         self.content = content
         self.createdAt = createdAt
         self.updatedAt = updatedAt
+        self.priorityRequestedAt = priorityRequestedAt
     }
 
     var title: String {

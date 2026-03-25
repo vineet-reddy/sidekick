@@ -284,19 +284,16 @@ final class OpenAIService: ObservableObject {
     private let github: GitHubService
     private let session: URLSession
     private let trustedDatasets: TrustedDatasetRegistry
-    private let researchInputStore: ResearchInputStore
     private let decoder = JSONDecoder()
 
     init(
         github: GitHubService,
         session: URLSession = .shared,
-        trustedDatasets: TrustedDatasetRegistry? = nil,
-        researchInputStore: ResearchInputStore
+        trustedDatasets: TrustedDatasetRegistry? = nil
     ) {
         self.github = github
         self.session = session
         self.trustedDatasets = trustedDatasets ?? TrustedDatasetRegistry(session: session, remoteURL: nil)
-        self.researchInputStore = researchInputStore
         decoder.dateDecodingStrategy = .iso8601
     }
 
@@ -331,7 +328,7 @@ final class OpenAIService: ObservableObject {
                 suggestedTitle: cluster.suggestedTitle,
                 isReady: cluster.isReady ?? true,
                 datasetIDs: cluster.datasetIDs ?? [],
-                readinessMode: NoteClusterReadinessMode(rawValue: cluster.readinessMode ?? "") ?? .trustedReady
+                readinessMode: NoteClusterReadinessMode(rawValue: cluster.readinessMode ?? "") ?? .needsData
             )
         }
     }
@@ -347,11 +344,15 @@ final class OpenAIService: ObservableObject {
             noteTexts: notes.map(\.content),
             limit: 4
         )
+        let passthroughDatasetIDs = datasetIDs.filter { datasetID in
+            !selectedDatasets.contains(where: { $0.id == datasetID })
+        }
+        let combinedDatasetIDs = selectedDatasets.map(\.id) + passthroughDatasetIDs
         let registryVersion = await trustedDatasets.registryVersion()
         let connected = github.isConnected
 
         return ResearchRunPreparation(
-            selectedDatasetIDs: selectedDatasets.map(\.id),
+            selectedDatasetIDs: combinedDatasetIDs,
             allowedDomains: TrustedDatasetRegistry.allowedDomains(for: selectedDatasets),
             registryVersion: registryVersion,
             sourceSupportTier: selectedDatasets.isEmpty ? .experimental : .supported,
@@ -379,20 +380,21 @@ final class OpenAIService: ObservableObject {
             noteTexts: notes.map(\.content),
             limit: 4
         )
+        let passthroughDatasetIDs = datasetIDs.filter { datasetID in
+            !selectedDatasets.contains(where: { $0.id == datasetID })
+        }
+        let combinedDatasetIDs = selectedDatasets.map(\.id) + passthroughDatasetIDs
         let datasetHints = selectedDatasets.map { $0.taskLine() }
         let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
-        let researchInputs = researchInputStore.snapshot
         let response: JobCreateResponse = try await performRequest(
             path: "api/papers",
             method: "POST",
             body: [
                 "title": title,
                 "theme": theme,
-                "dataset_ids": selectedDatasets.map(\.id),
+                "dataset_ids": combinedDatasetIDs,
                 "dataset_hints": datasetHints,
                 "allowed_domains": allowedDomains,
-                "must_use_sources": researchInputs.mustUseSources.map(\.requestPayload),
-                "domain_guidance": researchInputs.domainGuidance,
                 "notes": notes.map {
                     [
                         "id": $0.id.uuidString,
@@ -405,7 +407,7 @@ final class OpenAIService: ObservableObject {
 
         return PaperTaskSubmission(
             taskID: response.jobID,
-            selectedDatasetIDs: selectedDatasets.map(\.id),
+            selectedDatasetIDs: combinedDatasetIDs,
             allowedDomains: allowedDomains,
             registryVersion: registryVersion
         )

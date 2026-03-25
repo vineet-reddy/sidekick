@@ -501,13 +501,21 @@ final class HeartbeatManager: ObservableObject {
         let existingPapers = try modelContext.fetch(
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
-        guard shouldAssessNotes(notes: notes, existingPapers: existingPapers) else {
-            return 0
+        var submitted = try await submitManuallyPrioritizedNotes(
+            notes: notes,
+            existingPapers: existingPapers,
+            modelContext: modelContext
+        )
+
+        var currentPapers = try modelContext.fetch(
+            FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+        )
+        guard submitted > 0 || shouldAssessNotes(notes: notes, existingPapers: currentPapers) else {
+            return submitted
         }
 
         let clusters = try await assessNotesWithRescue(notes)
-        let surfacedClusters = selectedPresentationClusters(from: clusters)
-        var submitted = 0
+        let surfacedClusters = selectedSubmissionClusters(from: clusters)
 
         for cluster in surfacedClusters {
             let clusterNotes = notes.filter { cluster.noteIDs.contains($0.id) }
@@ -515,7 +523,7 @@ final class HeartbeatManager: ObservableObject {
                 continue
             }
 
-            let matchingPapers = existingPapers.filter { $0.matches(noteIDs: cluster.noteIDs) }
+            let matchingPapers = currentPapers.filter { $0.matches(noteIDs: cluster.noteIDs) }
             if matchingPapers.contains(where: { $0.status == .generating }) {
                 continue
             }
@@ -539,9 +547,70 @@ final class HeartbeatManager: ObservableObject {
                 modelContext: modelContext
             )
             submitted += 1
+            currentPapers = try modelContext.fetch(
+                FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
+            )
         }
 
         return submitted
+    }
+
+    @discardableResult
+    private func submitManuallyPrioritizedNotes(
+        notes: [Note],
+        existingPapers: [Paper],
+        modelContext: ModelContext
+    ) async throws -> Int {
+        let prioritizedNotes = notes
+            .filter { $0.priorityRequestedAt != nil }
+            .sorted { lhs, rhs in
+                (lhs.priorityRequestedAt ?? .distantPast) > (rhs.priorityRequestedAt ?? .distantPast)
+            }
+
+        guard !prioritizedNotes.isEmpty else {
+            return 0
+        }
+
+        var submitted = 0
+
+        for note in prioritizedNotes {
+            let matchingPapers = existingPapers.filter { $0.matches(noteIDs: [note.id]) }
+            if matchingPapers.contains(where: { $0.status == .generating }) {
+                note.priorityRequestedAt = nil
+                continue
+            }
+
+            let cluster = await manualPriorityCluster(for: note)
+            phase = .submittingPaper(cluster.suggestedTitle)
+            try await beginResearchRun(
+                cluster: cluster,
+                notes: [note],
+                modelContext: modelContext
+            )
+            note.priorityRequestedAt = nil
+            submitted += 1
+        }
+
+        try persistModelChanges(in: modelContext)
+        return submitted
+    }
+
+    private func manualPriorityCluster(for note: Note) async -> NoteCluster {
+        if let clusters = try? await openAI.assessNotes([note]),
+           let cluster = selectedPresentationClusters(from: clusters)
+            .first(where: { Set($0.noteIDs).contains(note.id) }) {
+            return cluster
+        }
+
+        let fallbackTheme = note.summary.trimmingCharacters(in: .whitespacesAndNewlines)
+        return NoteCluster(
+            noteIDs: [note.id],
+            theme: fallbackTheme.isEmpty ? note.title : fallbackTheme,
+            suggestedTitle: note.title,
+            isReady: true,
+            datasetIDs: [],
+            readinessMode: .trustedReady
+        )
     }
 
     private func beginResearchRun(
@@ -724,6 +793,8 @@ final class HeartbeatManager: ObservableObject {
                 readinessBonus = 24
             case .exploratoryReady:
                 readinessBonus = 18
+            case .needsData:
+                readinessBonus = 0
             }
         }
 
