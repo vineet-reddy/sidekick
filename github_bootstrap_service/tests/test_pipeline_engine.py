@@ -9,7 +9,7 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bootstrap_service.config import BootstrapServiceConfig
 from bootstrap_service.openai_client import OpenAIContainerFile, OpenAIResponseResult, OpenAIUsage
-from bootstrap_service.pipeline_engine import PaperPipelineEngine, extract_json_object
+from bootstrap_service.pipeline_engine import PaperPipelineEngine, PipelineExecutionError, extract_json_object
 
 
 def _config(root: pathlib.Path) -> BootstrapServiceConfig:
@@ -37,7 +37,8 @@ class FakeOpenAIClient:
   "results": [
     {
       "text": "The saved analysis table reports a prevalence estimate of 0.18 in the retrieved slice.",
-      "artifact_ids": ["artifact_1"]
+      "artifact_ids": ["artifact_1"],
+      "note_ids": ["note_1"]
     }
   ],
   "limitations": ["Only one public source file was available in this run."],
@@ -113,6 +114,25 @@ def _fake_compile(job_directory: pathlib.Path, *, tex_filename: str) -> dict[str
     return {"ok": True, "error": "", "log": "compiled", "pdf_path": pdf_path.name}
 
 
+class FakeResolver:
+    def __init__(self, resolution: dict[str, object]) -> None:
+        self._resolution = resolution
+
+    def resolve(self, **_: object):
+        class _Resolution:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self.paper_mode = str(payload.get("paper_mode") or "")
+                self.status = str(payload.get("status") or "")
+                self.blocking_reason = payload.get("blocking_reason")
+                self.summary = str(payload.get("summary") or "")
+
+            def as_dict(self) -> dict[str, object]:
+                return dict(self_payload)
+
+        self_payload = dict(self._resolution)
+        return _Resolution(self_payload)
+
+
 class PipelineEngineTests(unittest.TestCase):
     def test_extract_json_object_repairs_unescaped_latex_inside_strings(self) -> None:
         raw = (
@@ -162,6 +182,93 @@ class PipelineEngineTests(unittest.TestCase):
             self.assertEqual(outputs["bundle"]["pdf"]["ok"], True)
             self.assertGreaterEqual(len(statuses), 3)
             self.assertEqual(len(metrics), 2)
+
+    def test_workspace_blocks_when_empirical_resolution_is_blocked(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            engine = PaperPipelineEngine(
+                config=_config(root),
+                openai_client=FakeOpenAIClient(),
+                source_resolver=FakeResolver(
+                    {
+                        "paper_mode": "empirical_dataset",
+                        "status": "blocked",
+                        "summary": "No qualifying dataset found.",
+                        "blocking_reason": "No qualifying dataset found.",
+                        "selected_candidate": None,
+                        "candidates": [],
+                    }
+                ),
+            )
+
+            with self.assertRaises(PipelineExecutionError) as context:
+                engine.run_research_workspace(
+                    run_id="blocked-run",
+                    request_payload={
+                        "title": "Blocked study",
+                        "theme": "Blocked study",
+                        "notes": [{"id": "note_1", "title": "Blocked study", "content": "Need real data."}],
+                        "dataset_ids": [],
+                        "dataset_hints": [],
+                    },
+                )
+
+            self.assertEqual(context.exception.stage, "inspect")
+            self.assertIn("No qualifying dataset found", str(context.exception))
+
+    def test_single_note_validation_falls_back_when_result_note_ids_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            run_dir = root / "artifacts" / "single-note-run"
+            artifact_dir = run_dir / "artifacts"
+            artifact_dir.mkdir(parents=True, exist_ok=True)
+            (artifact_dir / "table_1.csv").write_text("metric,value\nprevalence,0.18\n", encoding="utf-8")
+
+            engine = PaperPipelineEngine(
+                config=_config(root),
+                openai_client=FakeOpenAIClient(),
+            )
+            validation = engine.validate_ledger(
+                run_id="single-note-run",
+                ledger={
+                    "title": "Example prevalence study",
+                    "research_question": "What prevalence estimate is visible in the saved table?",
+                    "methods": "We downloaded the public CSV, cleaned the extracted values, computed the descriptive prevalence estimate in Python, saved the analysis table, checked the resulting artifact, and documented the workflow so the run reflects direct empirical work rather than a summary of prior literature.",
+                    "limitations": ["Only one public source file was available in this run."],
+                    "sources": [
+                        {
+                            "source_id": "source_1",
+                            "label": "Public CSV",
+                            "download_url": "https://example.org/data/table_1.csv",
+                        }
+                    ],
+                    "artifacts": [
+                        {
+                            "artifact_id": "artifact_1",
+                            "path": "artifacts/table_1.csv",
+                            "kind": "table",
+                            "mime_type": "text/csv",
+                            "description": "Extracted prevalence table",
+                            "source_ids": ["source_1"],
+                        }
+                    ],
+                    "results": [
+                        {
+                            "result_id": "result_1",
+                            "text": "The saved analysis table reports a prevalence estimate of 0.18 in the retrieved slice.",
+                            "artifact_ids": ["artifact_1"],
+                        }
+                    ],
+                },
+                request_payload={
+                    "title": "Example prevalence study",
+                    "theme": "Example prevalence study",
+                    "notes": [{"id": "note_1", "title": "Example note", "content": "Estimate the prevalence available in the public file."}],
+                },
+            )
+
+            self.assertEqual(validation["manuscript_kind"], "paper")
+            self.assertEqual(validation["missing_note_ids"], [])
 
 
 if __name__ == "__main__":

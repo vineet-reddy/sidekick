@@ -128,6 +128,173 @@ class PublicationGateTests(unittest.TestCase):
             self.assertIn("paper gate", validation["summary"].lower())
             self.assertTrue(validation["memo_reasons"])
 
+    def test_validation_rejects_source_with_query_but_no_endpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            processor = _processor(root)
+            job_id = "job-query-only"
+            _write(root / "artifacts" / job_id / "artifacts" / "table_1.csv", b"metric,value\nprevalence,0.18\n")
+
+            ledger = {
+                "title": "Weak provenance study",
+                "research_question": "Can a query string alone count as provenance?",
+                "methods": _methods_text(),
+                "limitations": ["Query only."],
+                "sources": [
+                    {
+                        "source_id": "source_1",
+                        "label": "Bare query",
+                        "api_query": {"q": "epilepsy prevalence"},
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact_1",
+                        "path": "artifacts/table_1.csv",
+                        "kind": "table",
+                        "mime_type": "text/csv",
+                        "source_ids": ["source_1"],
+                    }
+                ],
+                "results": [
+                    {
+                        "result_id": "result_1",
+                        "text": "The saved table reports a prevalence estimate of 0.18.",
+                        "artifact_ids": ["artifact_1"],
+                    }
+                ],
+            }
+
+            validation = processor._validate_ledger(job_id, ledger)
+
+            self.assertEqual(validation["manuscript_kind"], "memo")
+            self.assertIn("reproducible", " ".join(validation["validation_issues"]).lower())
+
+    def test_validation_requires_resolved_primary_dataset_for_empirical_paper(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            processor = _processor(root)
+            job_id = "job-primary-dataset"
+            _write(root / "artifacts" / job_id / "artifacts" / "table_1.csv", b"metric,value\nprevalence,0.18\n")
+
+            ledger = {
+                "title": "Mismatched empirical study",
+                "research_question": "What prevalence is visible in the public table?",
+                "methods": _methods_text(),
+                "limitations": ["Single public table only."],
+                "sources": [
+                    {
+                        "source_id": "source_1",
+                        "label": "Wrong table",
+                        "download_url": "https://example.org/download/other_table.csv",
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact_1",
+                        "path": "artifacts/table_1.csv",
+                        "kind": "table",
+                        "mime_type": "text/csv",
+                        "source_ids": ["source_1"],
+                    }
+                ],
+                "results": [
+                    {
+                        "result_id": "result_1",
+                        "text": "The public table reports a prevalence estimate of 0.18 in the retrieved slice.",
+                        "artifact_ids": ["artifact_1"],
+                        "note_ids": ["note_1"],
+                    }
+                ],
+            }
+            request_payload = {
+                "title": "Mismatched empirical study",
+                "theme": "Mismatched empirical study",
+                "notes": [{"id": "note_1", "title": "Study", "content": "Need real prevalence data."}],
+                "resolution": {
+                    "paper_mode": "empirical_dataset",
+                    "status": "resolved",
+                    "summary": "Selected the public prevalence table.",
+                    "selected_candidate": {
+                        "dataset_id": "table_1.csv",
+                        "access_url": "https://example.org/download/table_1.csv",
+                        "api_url": "",
+                        "primary_domain": "example.org",
+                        "trusted_domains": ["example.org"],
+                    },
+                },
+            }
+
+            validation = processor._validate_ledger(job_id, ledger, request_payload=request_payload)
+
+            self.assertEqual(validation["manuscript_kind"], "memo")
+            self.assertFalse(validation["paper_checks"]["uses_resolved_primary_dataset"])
+            self.assertIn("primary dataset", " ".join(validation["memo_reasons"]).lower())
+
+    def test_validation_requires_note_coverage_for_all_requested_notes(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            processor = _processor(root)
+            job_id = "job-note-coverage"
+            _write(root / "artifacts" / job_id / "artifacts" / "table_1.csv", b"metric,value\nprevalence,0.18\n")
+
+            ledger = {
+                "title": "Partial note coverage study",
+                "research_question": "Can every note be answered from the retrieved source?",
+                "methods": _methods_text(),
+                "limitations": ["Single public table only."],
+                "sources": [
+                    {
+                        "source_id": "source_1",
+                        "label": "CDC public table",
+                        "download_url": "https://example.org/download/table_1.csv",
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact_1",
+                        "path": "artifacts/table_1.csv",
+                        "kind": "table",
+                        "mime_type": "text/csv",
+                        "source_ids": ["source_1"],
+                    }
+                ],
+                "results": [
+                    {
+                        "result_id": "result_1",
+                        "text": "The public table reports a prevalence estimate of 0.18 in the retrieved slice.",
+                        "artifact_ids": ["artifact_1"],
+                        "note_ids": ["note_1"],
+                    }
+                ],
+            }
+            request_payload = {
+                "title": "Partial note coverage study",
+                "theme": "Partial note coverage study",
+                "notes": [
+                    {"id": "note_1", "title": "First note", "content": "Need prevalence data."},
+                    {"id": "note_2", "title": "Second note", "content": "Need subgroup analysis."},
+                ],
+                "resolution": {
+                    "paper_mode": "empirical_dataset",
+                    "status": "resolved",
+                    "summary": "Selected the public prevalence table.",
+                    "selected_candidate": {
+                        "dataset_id": "table_1.csv",
+                        "access_url": "https://example.org/download/table_1.csv",
+                        "api_url": "",
+                        "primary_domain": "example.org",
+                        "trusted_domains": ["example.org"],
+                    },
+                },
+            }
+
+            validation = processor._validate_ledger(job_id, ledger, request_payload=request_payload)
+
+            self.assertEqual(validation["manuscript_kind"], "memo")
+            self.assertFalse(validation["paper_checks"]["covers_requested_notes"])
+            self.assertEqual(validation["missing_note_ids"], ["note_2"])
+
     def test_render_latex_includes_sections_figures_tables_and_bibliography(self) -> None:
         sections = {
             "title": "Example manuscript",

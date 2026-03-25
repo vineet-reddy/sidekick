@@ -19,6 +19,7 @@ from .manuscript import (
     results_to_markdown,
 )
 from .openai_client import OpenAIClient, OpenAIContainerFile
+from .resolver import SourceFamilyResolver
 
 StatusCallback = Callable[..., None]
 MetricsCallback = Callable[..., None]
@@ -128,6 +129,50 @@ def normalize_text_list(value: Any) -> list[str]:
     return []
 
 
+def derive_note_title(content: str, *, fallback: str) -> str:
+    for line in content.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:120]
+    return fallback
+
+
+def normalize_request_notes(value: Any) -> list[dict[str, str]]:
+    if isinstance(value, list):
+        normalized_notes: list[dict[str, str]] = []
+        for index, entry in enumerate(value):
+            if isinstance(entry, dict):
+                content = str(entry.get("content") or "").strip()
+                note_id = str(entry.get("id") or f"note_{index + 1}").strip() or f"note_{index + 1}"
+                title = str(entry.get("title") or "").strip()
+            else:
+                content = str(entry).strip()
+                note_id = f"note_{index + 1}"
+                title = ""
+            if not content:
+                continue
+            normalized_notes.append(
+                {
+                    "id": note_id,
+                    "title": title or derive_note_title(content, fallback=f"Note {index + 1}"),
+                    "content": content,
+                }
+            )
+        return normalized_notes
+
+    if isinstance(value, str) and value.strip():
+        content = value.strip()
+        return [
+            {
+                "id": "note_1",
+                "title": derive_note_title(content, fallback="Note 1"),
+                "content": content,
+            }
+        ]
+
+    return []
+
+
 def sanitize_relative_path(value: str, *, fallback: str) -> str:
     candidate = value.strip().replace("\\", "/")
     candidate = re.sub(r"^\./+", "", candidate)
@@ -173,7 +218,11 @@ def find_banned_phrases(text: str) -> list[str]:
     patterns = {
         "synthetic data": r"\bsynthetic\s+(?:data|dataset|results?|analysis)\b",
         "simulated data": r"\bsimulated\s+(?:data|dataset|results?|analysis)\b",
+        "simulation study": r"\bsimulation\s+study\b|\bsynthetic\s+benchmark\b",
         "mock data": r"\bmock\s+(?:data|dataset|results?)\b",
+        "proxy dataset": r"\bproxy\s+(?:data|dataset)\b|\bsurrogate\s+(?:data|dataset)\b",
+        "literature parameterization": r"\bliterature[-\s]parameteri[sz]ed\b|\bparameteri[sz]ed\s+from\s+literature\b",
+        "generated cohort": r"\bgenerated\s+(?:cohort|sample|dataset|population)\b",
         "placeholder": r"\bplaceholder\s+(?:data|dataset|results?|figure|table|text)\b",
         "demo mode": r"\bdemo(?:\s+mode)?\b",
         "draft language": r"\bthis draft\b|\(draft\)",
@@ -190,9 +239,7 @@ def source_has_reproducible_receipt(source: dict[str, Any]) -> bool:
     return bool(
         accession_id
         or _is_http_url(download_url)
-        or api_endpoint
-        or (isinstance(api_query, dict) and bool(api_query))
-        or (isinstance(api_query, str) and api_query.strip())
+        or (api_endpoint and ((isinstance(api_query, dict) and bool(api_query)) or (isinstance(api_query, str) and api_query.strip())))
     )
 
 
@@ -277,7 +324,46 @@ def _normalize_result(entry: Any, index: int) -> dict[str, Any]:
         "result_id": str(entry.get("result_id") or entry.get("id") or f"result_{index + 1}").strip() or f"result_{index + 1}",
         "text": str(entry.get("text") or entry.get("result") or "").strip(),
         "artifact_ids": normalize_text_list(entry.get("artifact_ids") or entry.get("artifacts")),
+        "note_ids": normalize_text_list(entry.get("note_ids")),
     }
+
+
+def source_matches_resolution_source(source: dict[str, Any], selected_candidate: dict[str, Any]) -> bool:
+    dataset_id = str(selected_candidate.get("dataset_id") or "").strip()
+    access_url = str(selected_candidate.get("access_url") or "").strip()
+    api_url = str(selected_candidate.get("api_url") or "").strip()
+    trusted_domains = {str(domain).strip().lower() for domain in selected_candidate.get("trusted_domains") or [] if str(domain).strip()}
+    primary_domain = str(selected_candidate.get("primary_domain") or "").strip().lower()
+    if primary_domain:
+        trusted_domains.add(primary_domain)
+
+    source_values = [
+        str(source.get("accession_id") or "").strip(),
+        str(source.get("download_url") or "").strip(),
+        str(source.get("landing_page_url") or "").strip(),
+        str(source.get("api_endpoint") or "").strip(),
+    ]
+    lowered_source_values = [value.lower() for value in source_values if value]
+    candidate_values = [value.lower() for value in (dataset_id, access_url, api_url) if value]
+
+    for candidate_value in candidate_values:
+        if any(candidate_value == value or candidate_value in value for value in lowered_source_values):
+            return True
+
+    if dataset_id:
+        normalized_dataset_id = dataset_id.lower()
+        if any(normalized_dataset_id in value for value in lowered_source_values):
+            return True
+
+    if dataset_id or access_url or api_url:
+        return False
+
+    for url in _source_external_urls(source):
+        domain = _domain_from_url(url)
+        if domain and domain in trusted_domains:
+            return True
+
+    return False
 
 
 def normalize_ledger(raw_ledger: dict[str, Any], *, title_fallback: str) -> dict[str, Any]:
@@ -357,19 +443,52 @@ class PaperPipelineEngine:
         openai_client: OpenAIClient,
         status_callback: StatusCallback | None = None,
         metrics_callback: MetricsCallback | None = None,
+        source_resolver: SourceFamilyResolver | None = None,
     ):
         self._config = config
         self._openai_client = openai_client
         self._status_callback = status_callback
         self._metrics_callback = metrics_callback
+        self._source_resolver = source_resolver
+
+    def resolve_request_payload(self, request_payload: dict[str, Any]) -> dict[str, Any]:
+        resolved_payload = dict(request_payload)
+        normalized_notes = normalize_request_notes(resolved_payload.get("notes"))
+        resolved_payload["notes"] = normalized_notes
+
+        if self._source_resolver is None or resolved_payload.get("resolution") or not normalized_notes:
+            return resolved_payload
+
+        resolution = self._source_resolver.resolve(
+            title=str(resolved_payload.get("title") or "Research paper").strip() or "Research paper",
+            theme=str(resolved_payload.get("theme") or resolved_payload.get("title") or "").strip(),
+            notes=normalized_notes,
+            dataset_hints=normalize_text_list(resolved_payload.get("dataset_hints")),
+            dataset_ids=normalize_text_list(resolved_payload.get("dataset_ids")),
+        )
+        resolved_payload["resolution"] = resolution.as_dict()
+        return resolved_payload
 
     def execute(self, *, run_id: str, request_payload: dict[str, Any]) -> dict[str, Any]:
-        ledger = self.run_research_workspace(run_id=run_id, request_payload=request_payload)
-        validation = self.validate_ledger(run_id=run_id, ledger=ledger)
-        bundle = self.write_bundle(run_id=run_id, request_payload=request_payload, ledger=ledger, validation=validation)
+        resolved_request_payload = self.resolve_request_payload(request_payload)
+        ledger = self.run_research_workspace(run_id=run_id, request_payload=resolved_request_payload)
+        validation = self.validate_ledger(run_id=run_id, ledger=ledger, request_payload=resolved_request_payload)
+        bundle = self.write_bundle(run_id=run_id, request_payload=resolved_request_payload, ledger=ledger, validation=validation)
         return {"ledger": ledger, "validation": validation, "bundle": bundle}
 
     def run_research_workspace(self, *, run_id: str, request_payload: dict[str, Any]) -> dict[str, Any]:
+        request_payload = self.resolve_request_payload(request_payload)
+        resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
+        paper_mode = str(resolution.get("paper_mode") or "").strip()
+        resolution_status = str(resolution.get("status") or "").strip()
+        if paper_mode == "empirical_dataset" and resolution_status == "blocked":
+            message = str(
+                resolution.get("blocking_reason")
+                or resolution.get("summary")
+                or "No qualifying open empirical dataset was resolved for this note."
+            ).strip()
+            raise PipelineExecutionError(message, stage="inspect")
+
         self._emit_status(run_id, stage="inspect", status="running", progress_message="Inspecting data and executing the research workspace.")
         instructions = """
 You are a scientist. The user has a research idea. Turn it into a real study.
@@ -387,7 +506,8 @@ Return strict JSON only with this exact shape:
   "results": [
     {
       "text": "string",
-      "artifact_ids": ["artifact_1"]
+      "artifact_ids": ["artifact_1"],
+      "note_ids": ["note_1"]
     }
   ],
   "limitations": ["string"],
@@ -416,10 +536,12 @@ Return strict JSON only with this exact shape:
 }
 Rules:
 - Do original analytic work. Do not just summarize what others have found.
+- For empirical work, use the resolved primary dataset as the required substrate. Do not replace it with literature summaries, simulations, proxy datasets, or synthetic stand-ins.
 - Save every cited artifact as a real file in the container. Do not inline binary data or giant tables into JSON.
 - Reference each saved file exactly by the filename or path you created so it can be retrieved later.
 - Before returning, ensure every `artifacts[].path` value matches a real saved container file path or basename exactly. Rename files if needed.
 - Every result must be backed by an artifact you created and saved in this run.
+- Every result must include the `note_ids` it answers. Do not omit note coverage.
 - Source provenance must include reproducible retrieval information such as an accession id, direct download URL, or concrete API query. Landing pages alone are insufficient.
 - If the scientist provided must-use materials, use them as primary inputs.
 - Methods must describe what you actually did in this run, not what prior literature says.
@@ -433,9 +555,27 @@ Rules:
             "notes": request_payload["notes"],
             "dataset_ids": request_payload.get("dataset_ids") or [],
             "dataset_hints": request_payload.get("dataset_hints") or [],
+            "allowed_domains": request_payload.get("allowed_domains") or [],
             "domain_guidance": str(request_payload.get("domain_guidance") or "").strip(),
+            "resolution": resolution,
+            "must_use_sources": request_payload.get("must_use_sources") or [],
         }
         must_use_sources = request_payload.get("must_use_sources") or []
+        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else None
+        if selected_candidate:
+            required_primary_source = {
+                "kind": "required_primary_dataset",
+                "url": str(selected_candidate.get("access_url") or "").strip(),
+                "notes": str(selected_candidate.get("title") or "").strip(),
+                "dataset_id": str(selected_candidate.get("dataset_id") or "").strip(),
+                "api_url": str(selected_candidate.get("api_url") or "").strip(),
+            }
+            if required_primary_source["url"]:
+                must_use_sources = [required_primary_source] + [
+                    source for source in must_use_sources
+                    if not isinstance(source, dict) or str(source.get("url") or "").strip() != required_primary_source["url"]
+                ]
+                payload["must_use_sources"] = must_use_sources
         input_prefix_lines: list[str] = []
         if must_use_sources:
             input_prefix_lines.append("The scientist provided these materials as primary inputs. Use them:")
@@ -452,6 +592,27 @@ Rules:
         domain_guidance = str(request_payload.get("domain_guidance") or "").strip()
         if domain_guidance:
             input_prefix_lines.extend(["", "Scientist guidance:", domain_guidance])
+        if resolution:
+            input_prefix_lines.extend(
+                [
+                    "",
+                    "Resolved study contract:",
+                    f"- paper_mode: {paper_mode or 'unknown'}",
+                    f"- status: {resolution_status or 'unknown'}",
+                    f"- summary: {str(resolution.get('summary') or '').strip()}",
+                ]
+            )
+            if selected_candidate:
+                input_prefix_lines.extend(
+                    [
+                        "- required_primary_dataset:",
+                        f"  - dataset_id: {str(selected_candidate.get('dataset_id') or '').strip()}",
+                        f"  - title: {str(selected_candidate.get('title') or '').strip()}",
+                        f"  - access_url: {str(selected_candidate.get('access_url') or '').strip()}",
+                        f"  - api_url: {str(selected_candidate.get('api_url') or '').strip()}",
+                        f"  - trusted_domains: {', '.join(str(domain).strip() for domain in selected_candidate.get('trusted_domains') or [] if str(domain).strip())}",
+                    ]
+                )
 
         input_text = json.dumps(payload, sort_keys=True)
         if input_prefix_lines:
@@ -593,9 +754,30 @@ Rules:
             )
         ledger["artifact_files"] = artifact_files
 
-    def validate_ledger(self, *, run_id: str, ledger: dict[str, Any]) -> dict[str, Any]:
+    def validate_ledger(
+        self,
+        *,
+        run_id: str,
+        ledger: dict[str, Any],
+        request_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         self._emit_status(run_id, stage="verify", progress_message="Verifying source receipts, artifacts, and manuscript routing.")
         run_directory = self.run_directory(run_id)
+        resolved_request_payload = self.resolve_request_payload(request_payload or {}) if request_payload else None
+        request_notes = normalize_request_notes(resolved_request_payload.get("notes")) if resolved_request_payload else []
+        expected_note_ids = [str(note.get("id") or "").strip() for note in request_notes if str(note.get("id") or "").strip()]
+        resolution = (
+            resolved_request_payload.get("resolution")
+            if resolved_request_payload and isinstance(resolved_request_payload.get("resolution"), dict)
+            else {}
+        )
+        paper_mode = str(resolution.get("paper_mode") or "").strip().lower()
+        selected_candidate = (
+            resolution.get("selected_candidate")
+            if isinstance(resolution.get("selected_candidate"), dict)
+            else {}
+        )
+
         valid_sources: dict[str, dict[str, Any]] = {}
         source_issues: list[str] = []
         for source in ledger.get("sources", []):
@@ -608,6 +790,12 @@ Rules:
                 valid_sources[source_id] = source
             else:
                 source_issues.append(f"{source_id} is missing reproducible retrieval info.")
+
+        required_primary_source_ids = {
+            source_id
+            for source_id, source in valid_sources.items()
+            if selected_candidate and source_matches_resolution_source(source, selected_candidate)
+        }
 
         valid_artifacts: dict[str, dict[str, Any]] = {}
         artifact_issues: list[str] = []
@@ -635,6 +823,9 @@ Rules:
             result_id = str(result.get("result_id") or "").strip()
             text = str(result.get("text") or "").strip()
             artifact_ids = [artifact_id for artifact_id in normalize_text_list(result.get("artifact_ids")) if artifact_id in valid_artifacts]
+            note_ids = [note_id for note_id in normalize_text_list(result.get("note_ids")) if note_id in expected_note_ids]
+            if not note_ids and len(expected_note_ids) == 1:
+                note_ids = expected_note_ids.copy()
 
             source_ids: list[str] = []
             for artifact_id in artifact_ids:
@@ -652,6 +843,13 @@ Rules:
                 reasons.append("result does not reference a saved artifact")
             if not source_ids:
                 reasons.append("result does not resolve to reproducible source provenance")
+            if expected_note_ids and not note_ids:
+                reasons.append("result does not map to a requested note")
+            if paper_mode == "empirical_dataset" and selected_candidate:
+                if not required_primary_source_ids:
+                    reasons.append("resolved primary dataset never appears in source provenance")
+                elif set(source_ids).isdisjoint(required_primary_source_ids):
+                    reasons.append("result does not resolve to the required primary dataset")
 
             if reasons:
                 dropped_results.append({"result_id": result_id or "result", "reasons": reasons, "text": text})
@@ -663,6 +861,7 @@ Rules:
                     "text": text,
                     "artifact_ids": artifact_ids,
                     "source_ids": source_ids,
+                    "note_ids": note_ids,
                 }
             )
 
@@ -680,17 +879,31 @@ Rules:
             r"\bwe (?:downloaded|queried|processed|cleaned|joined|fit|fitted|modeled|estimated|computed|analyzed|compared|calculated|measured)\b",
             r"\busing python\b",
             r"\bwe created\b",
-            r"\bwe generated\b",
             r"\bwe extracted\b",
         ]
         passive_hits = [pattern for pattern in passive_summary_patterns if re.search(pattern, methods_lower)]
         active_hits = [pattern for pattern in active_analysis_patterns if re.search(pattern, methods_lower)]
         did_original_work = len(methods_text) >= 200 and bool(active_hits or not passive_hits)
 
+        note_coverage: dict[str, list[str]] = {note_id: [] for note_id in expected_note_ids}
+        for result in approved_results:
+            for note_id in result.get("note_ids") or []:
+                note_coverage.setdefault(note_id, []).append(str(result.get("result_id") or "result"))
+        missing_note_ids = [note_id for note_id in expected_note_ids if not note_coverage.get(note_id)]
+
         paper_checks = {
             "described_work_performed_here": did_original_work,
             "has_original_result": bool(ledger.get("results") or []),
             "has_artifact_backed_result": bool(approved_results),
+            "covers_requested_notes": not expected_note_ids or not missing_note_ids,
+            "uses_resolved_primary_dataset": (
+                paper_mode != "empirical_dataset"
+                or (
+                    bool(selected_candidate)
+                    and bool(required_primary_source_ids)
+                    and any(not set(result.get("source_ids") or []).isdisjoint(required_primary_source_ids) for result in approved_results)
+                )
+            ),
         }
         memo_reasons: list[str] = []
         if not paper_checks["described_work_performed_here"]:
@@ -699,8 +912,14 @@ Rules:
             memo_reasons.append("no artifact-backed original results survived validation")
         if not paper_checks["has_artifact_backed_result"]:
             memo_reasons.append("no original result resolved to a real saved artifact")
+        if not paper_checks["covers_requested_notes"]:
+            memo_reasons.append("not every requested note is covered by a validated finding")
+        if not paper_checks["uses_resolved_primary_dataset"]:
+            memo_reasons.append("validated findings did not stay anchored to the resolved primary dataset")
 
         validation_issues = source_issues + artifact_issues
+        if paper_mode == "empirical_dataset" and selected_candidate and not required_primary_source_ids:
+            validation_issues.append("no validated source matched the resolved primary dataset")
         manuscript_kind = "paper" if all(paper_checks.values()) else "memo"
 
         approved_source_ids: list[str] = []
@@ -732,6 +951,9 @@ Rules:
             "paper_checks": paper_checks,
             "memo_reasons": memo_reasons,
             "reference_catalog": reference_catalog,
+            "note_coverage": note_coverage,
+            "missing_note_ids": missing_note_ids,
+            "resolution": resolution,
             "summary": (
                 f"Paper checks passed with {len(approved_results)} artifact-backed result(s)."
                 if manuscript_kind == "paper"

@@ -129,6 +129,7 @@ class SourceFamilyResolver:
         theme: str,
         notes: list[dict[str, Any]],
         dataset_hints: list[str],
+        dataset_ids: list[str] | None = None,
     ) -> ResolutionBundle:
         text = " ".join(
             [title, theme] + [str(note.get("title") or "") + " " + str(note.get("content") or "") for note in notes]
@@ -136,6 +137,7 @@ class SourceFamilyResolver:
         paper_mode = self._classify_paper_mode(text)
         inferred_modalities, acceptable_units = self._infer_modalities_and_units(text, paper_mode)
         mode_spec = self._registry.paper_mode(paper_mode)
+        normalized_dataset_ids = self._normalize_dataset_ids(dataset_ids)
 
         families = [
             family for family in self._registry.source_families()
@@ -149,9 +151,20 @@ class SourceFamilyResolver:
             reverse=True,
         )
 
-        candidates: list[DatasetCandidate] = []
-        for family in ranked_families[:8]:
-            candidates.extend(self._search_family(family, text, dataset_hints))
+        candidates = self._lookup_explicit_candidates(
+            ranked_families=ranked_families,
+            dataset_ids=normalized_dataset_ids,
+            text=text,
+            dataset_hints=dataset_hints,
+        )
+        seen_candidates = {(candidate.family_id, candidate.dataset_id) for candidate in candidates}
+        for family in ranked_families[:10]:
+            for candidate in self._search_family(family, text, dataset_hints):
+                key = (candidate.family_id, candidate.dataset_id)
+                if key in seen_candidates:
+                    continue
+                candidates.append(candidate)
+                seen_candidates.add(key)
 
         candidates.sort(key=lambda candidate: candidate.score, reverse=True)
 
@@ -220,6 +233,20 @@ class SourceFamilyResolver:
             return "literature_review"
         if any(phrase in text for phrase in ["bibliometric", "citation network", "publication trend", "scholarly output"]):
             return "bibliometric"
+        if any(
+            phrase in text for phrase in [
+                "kitaev chain",
+                "bdg formalism",
+                "bogoliubov-de gennes",
+                "braiding operators",
+                "clifford gates",
+                "heavy math paper",
+                "fault-tolerant quantum",
+                "surface code threshold",
+                "majorana zero modes",
+            ]
+        ):
+            return "theoretical_commentary"
         if any(phrase in text for phrase in ["simulation study", "benchmark", "methods paper", "synthetic benchmark"]):
             return "methods_simulation"
         if any(phrase in text for phrase in ["commentary", "perspective", "opinion", "theoretical"]):
@@ -229,16 +256,39 @@ class SourceFamilyResolver:
     def _infer_modalities_and_units(self, text: str, paper_mode: str) -> tuple[list[str], list[str]]:
         modalities: list[str] = []
         acceptable_units: list[str] = []
+        prevalence_terms = ["prevalence", "incidence", "epidemiology", "cohort", "registry", "survey"]
 
-        if any(token in text for token in ["glioblastoma", "gbm", "tumor", "cancer", "mutation", "survival"]):
+        if self._contains_any_phrase(text, ["glioblastoma", "gbm", "tumor", "cancer", "mutation", "survival"]):
             modalities.append("cancer_genomics")
             acceptable_units.extend(["patient", "tumor_sample"])
 
-        if any(token in text for token in ["epilepsy", "seizure", "ecog", "ieeg", "lfp", "spike", "rns", "responsive neurostimulation"]):
+        if self._contains_any_phrase(text, prevalence_terms):
+            modalities.append("clinical_cohort")
+            acceptable_units.extend(["patient", "subject", "row"])
+
+        epilepsy_tokens = ["epilepsy", "seizure", "seizures", "epileptic"]
+        specific_neurophysiology_tokens = ["ecog", "ieeg", "lfp", "spike", "rns", "responsive neurostimulation", "eeg"]
+        generic_neurophysiology_tokens = ["signal", "signals", "recording", "recordings"]
+        mentions_specific_neurophysiology = self._contains_any_phrase(text, specific_neurophysiology_tokens)
+        mentions_generic_neurophysiology = self._contains_any_phrase(text, generic_neurophysiology_tokens)
+        negates_neurophysiology = self._negates_any_phrase(
+            text,
+            specific_neurophysiology_tokens + ["recording", "recordings", "signal", "signals"],
+        )
+        prevalence_or_cohort_focus = self._contains_any_phrase(text, prevalence_terms)
+        if self._contains_any_phrase(text, epilepsy_tokens) and (
+            (mentions_specific_neurophysiology and not negates_neurophysiology)
+            or (mentions_generic_neurophysiology and not negates_neurophysiology and not prevalence_or_cohort_focus)
+            or (mentions_generic_neurophysiology and not negates_neurophysiology and self._contains_any_phrase(text, ["recording", "recordings"]))
+        ):
             modalities.append("neurophysiology")
             acceptable_units.extend(["recording_session", "subject"])
+        elif self._contains_any_phrase(text, epilepsy_tokens):
+            modalities.append("clinical_cohort")
+            acceptable_units.extend(["patient", "subject"])
 
-        if any(token in text for token in ["expression", "transcript", "rna-seq", "rnaseq", "single-cell", "microarray", "gene"]):
+        gene_expression_terms = ["gene expression", "transcript", "transcripts", "rna-seq", "rnaseq", "single-cell", "single cell", "microarray"]
+        if self._contains_any_phrase(text, gene_expression_terms) and not self._negates_any_phrase(text, gene_expression_terms):
             modalities.append("gene_expression")
             acceptable_units.extend(["sample", "cell"])
 
@@ -269,7 +319,15 @@ class SourceFamilyResolver:
         ]
         if not specific_modalities:
             return True
-        return bool(set(family.modalities).intersection(specific_modalities))
+        family_modalities = set(family.modalities)
+        compatibility_expansions = {
+            "clinical_cohort": {"clinical_cohort", "general_empirical", "tabular"},
+        }
+        for modality in specific_modalities:
+            acceptable_family_modalities = compatibility_expansions.get(modality, {modality})
+            if family_modalities.intersection(acceptable_family_modalities):
+                return True
+        return False
 
     def _family_priority_score(self, family: SourceFamilySpec, inferred_modalities: list[str], text: str) -> float:
         score = 0.0
@@ -282,6 +340,11 @@ class SourceFamilyResolver:
         score += family_type_boost.get(family.family_type, 0)
         score += sum(8 for modality in inferred_modalities if modality in family.modalities)
         score += sum(3 for keyword in family.search_keywords if keyword in text)
+        if any(token in text for token in ["prevalence", "incidence", "epidemiology", "cohort", "registry", "survey"]):
+            if "clinical_cohort" in family.modalities:
+                score += 12
+            if any(phrase in text for phrase in ["not recordings", "not recording", "not eeg", "not ieeg", "not ecog"]) and "neurophysiology" in family.modalities and "clinical_cohort" not in family.modalities:
+                score -= 10
         return score
 
     def _search_family(
@@ -467,8 +530,9 @@ class SourceFamilyResolver:
                 seen_ids.add(identifier)
                 version = (dandiset.get("most_recent_published_version") or {}) if isinstance(dandiset.get("most_recent_published_version"), dict) else {}
                 title = str(version.get("name") or dandiset.get("name") or identifier).strip()
+                description = str(version.get("description") or dandiset.get("description") or "").strip()
                 asset_count = int(version.get("asset_count") or 0)
-                haystack = " ".join([identifier, title, query]).lower()
+                haystack = " ".join([identifier, title, description]).lower()
                 match_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
                 if match_score <= 0:
                     continue
@@ -723,7 +787,21 @@ class SourceFamilyResolver:
                 seen_ids.add(work_id)
                 title = str(work.get("display_name") or work.get("title") or work_id).strip()
                 year = work.get("publication_year")
-                haystack = " ".join([title, str(year or ""), query]).lower()
+                abstract = ""
+                abstract_inverted_index = work.get("abstract_inverted_index")
+                if isinstance(abstract_inverted_index, dict):
+                    abstract_tokens = sorted(
+                        (
+                            (position, token)
+                            for token, positions in abstract_inverted_index.items()
+                            if isinstance(positions, list)
+                            for position in positions
+                            if isinstance(position, int)
+                        ),
+                        key=lambda item: item[0],
+                    )
+                    abstract = " ".join(token for _, token in abstract_tokens)
+                haystack = " ".join([title, abstract, str(year or "")]).lower()
                 match_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
                 if match_score <= 0:
                     continue
@@ -766,10 +844,24 @@ class SourceFamilyResolver:
         if "epilepsy" in text and any(token in text for token in ["pediatric", "child", "children", "adolescent"]):
             seed_queries.append("children epilepsy")
             seed_queries.append("pediatric epilepsy")
+        if "epilepsy" in text and any(token in text for token in ["prevalence", "incidence", "epidemiology", "cohort"]):
+            seed_queries.append("epilepsy prevalence")
+            seed_queries.append("epilepsy epidemiology dataset")
+            if any(token in text for token in ["pediatric", "child", "children", "adolescent"]):
+                seed_queries.append("pediatric epilepsy prevalence")
+                seed_queries.append("pediatric epilepsy cohort")
+                seed_queries.append("children with epilepsy dataset")
+                seed_queries.append("pediatric epilepsy registry")
+            if "refractory" in text:
+                seed_queries.append("refractory epilepsy children dataset")
         if "glioblastoma" in text or "gbm" in text:
             seed_queries.append("glioblastoma gene expression")
         if any(token in text for token in ["rns", "responsive neurostimulation"]):
             seed_queries.append("epilepsy neurostimulation")
+        if "autism" in text and any(token in text for token in ["prevalence", "incidence"]):
+            seed_queries.append("autism prevalence")
+            if any(token in text for token in ["professional", "workplace", "employment", "occupational"]):
+                seed_queries.append("autism employment prevalence")
         if any(token in text for token in ["sex differences", "gender"]):
             seed_queries.append("sex gender")
 
@@ -779,7 +871,7 @@ class SourceFamilyResolver:
                 continue
             seen.add(normalized)
             queries.append(normalized)
-            if len(queries) >= 6:
+            if len(queries) >= 8:
                 break
         return queries or ["public dataset"]
 
@@ -804,10 +896,453 @@ class SourceFamilyResolver:
             token for token in re.findall(r"[a-z0-9]{3,}", candidate_text.lower())
             if token not in stopwords
         }
-        score += len(query_terms.intersection(candidate_terms))
+        family_keyword_terms = {
+            token
+            for keyword in family_keywords
+            for token in re.findall(r"[a-z0-9]{3,}", keyword.lower())
+            if token not in stopwords
+        }
+        salient_terms = query_terms - family_keyword_terms
+        high_signal_stopwords = stopwords.union(
+            {
+                "prevalence", "incidence", "epidemiology", "cohort", "registry", "survey",
+                "children", "child", "pediatric", "adolescent", "adolescents", "young", "adult", "adults",
+                "community", "professional", "settings", "employment", "workplace", "occupational",
+                "recording", "recordings", "signal", "signals",
+                "responsive", "neurostimulation", "neurophysiology", "survival", "difference", "differences", "sex", "gender",
+            }
+        )
+        high_signal_terms = {token for token in salient_terms if token not in high_signal_stopwords}
+        matched_terms = query_terms.intersection(candidate_terms)
+        matched_salient_terms = salient_terms.intersection(candidate_terms)
+        matched_high_signal_terms = high_signal_terms.intersection(candidate_terms)
+        synonym_groups = [
+            {"prevalence", "incidence", "epidemiology", "cohort", "registry", "survey"},
+            {"recording", "recordings", "eeg", "ieeg", "ecog", "lfp", "signal"},
+        ]
+        cohort_terms = {"prevalence", "incidence", "epidemiology", "cohort", "registry", "survey", "population", "patients", "children"}
+        recording_terms = {"recording", "recordings", "eeg", "ieeg", "ecog", "lfp", "signal", "signals"}
+        gene_terms = {"gene", "genes", "genomic", "genomics", "expression", "transcript", "transcripts", "rna", "rnaseq", "microarray"}
+        condition_groups = [
+            {"epilepsy", "epileptic", "seizure", "seizures"},
+            {"autism", "asd"},
+            {"glioblastoma", "gbm"},
+            {"kidney", "renal"},
+            {"alzheimer", "alzheimers"},
+            {"parkinson", "parkinsons"},
+            {"diabetes", "diabetic"},
+        ]
+
+        score += len(matched_terms)
+        score += len(matched_salient_terms) * 1.75
+        score += len(matched_high_signal_terms) * 3.0
+        for group in synonym_groups:
+            if query_terms.intersection(group) and candidate_terms.intersection(group):
+                score += 2.5
+        if salient_terms and not matched_salient_terms:
+            score -= 2.5
+        elif salient_terms:
+            score -= max(0.0, (len(salient_terms) - len(matched_salient_terms)) * 0.15)
+        if high_signal_terms and not matched_high_signal_terms:
+            score -= 2.0
+        elif high_signal_terms:
+            score -= max(0.0, (len(high_signal_terms) - len(matched_high_signal_terms)) * 0.25)
         score += sum(2 for keyword in family_keywords if keyword in query_text and keyword in candidate_text)
         score += sum(1.5 for hint in dataset_hints if hint.lower() in candidate_text)
+        prevalence_focus = bool(query_terms.intersection({"prevalence", "incidence", "epidemiology", "cohort", "registry", "survey"}))
+        negates_recordings = self._negates_any_phrase(query_text, list(recording_terms))
+        negates_gene_terms = self._negates_any_phrase(
+            query_text,
+            ["gene expression", "transcript", "transcripts", "rna-seq", "rnaseq", "microarray", "gene", "genes"],
+        )
+        recording_focus = bool(query_terms.intersection(recording_terms)) and not negates_recordings
+        gene_focus = bool(query_terms.intersection(gene_terms)) and not negates_gene_terms
+        if prevalence_focus and candidate_terms.intersection(cohort_terms):
+            score += 4.0
+        if prevalence_focus and not recording_focus and candidate_terms.intersection(recording_terms):
+            score -= 8.0
+        if prevalence_focus and not gene_focus and candidate_terms.intersection(gene_terms):
+            score -= 7.0
+        if negates_recordings and candidate_terms.intersection(recording_terms):
+            score -= 12.0
+        if negates_gene_terms and candidate_terms.intersection(gene_terms):
+            score -= 12.0
+        for index, group in enumerate(condition_groups):
+            if not query_terms.intersection(group):
+                continue
+            if candidate_terms.intersection(group):
+                score += 6.0
+            elif any(candidate_terms.intersection(other_group) for group_index, other_group in enumerate(condition_groups) if group_index != index):
+                score -= 6.0
         return score
+
+    def _normalize_dataset_ids(self, dataset_ids: list[str] | None) -> list[str]:
+        if not dataset_ids:
+            return []
+        normalized: list[str] = []
+        seen: set[str] = set()
+        for dataset_id in dataset_ids:
+            value = str(dataset_id or "").strip()
+            if not value:
+                continue
+            lowered = value.lower()
+            if lowered in seen:
+                continue
+            seen.add(lowered)
+            normalized.append(value)
+        return normalized
+
+    def _lookup_explicit_candidates(
+        self,
+        *,
+        ranked_families: list[SourceFamilySpec],
+        dataset_ids: list[str],
+        text: str,
+        dataset_hints: list[str],
+    ) -> list[DatasetCandidate]:
+        if not dataset_ids:
+            return []
+
+        family_by_id = {family.id: family for family in self._registry.source_families()}
+        candidates: list[DatasetCandidate] = []
+        for dataset_id in dataset_ids:
+            candidate = None
+            lowered = dataset_id.lower()
+            if lowered.startswith("zenodo:"):
+                family = family_by_id.get("zenodo_open_research")
+                if family is not None:
+                    candidate = self._lookup_zenodo_candidate(
+                        family,
+                        record_id=dataset_id.split(":", 1)[1],
+                        text=text,
+                        dataset_hints=dataset_hints,
+                    )
+            elif lowered.startswith("figshare:"):
+                family = family_by_id.get("figshare_open_data")
+                if family is not None:
+                    candidate = self._lookup_figshare_candidate(
+                        family,
+                        article_id=dataset_id.split(":", 1)[1],
+                        text=text,
+                        dataset_hints=dataset_hints,
+                    )
+            elif lowered.startswith("https://openalex.org/") or re.fullmatch(r"w\d+", lowered):
+                family = family_by_id.get("openalex_literature")
+                if family is not None:
+                    candidate = self._lookup_openalex_candidate(
+                        family,
+                        work_id=dataset_id,
+                        text=text,
+                        dataset_hints=dataset_hints,
+                    )
+            elif re.fullmatch(r"gse\d+", lowered):
+                family = family_by_id.get("geo_functional_genomics")
+                if family is not None:
+                    candidate = self._lookup_geo_candidate(
+                        family,
+                        accession=dataset_id.upper(),
+                        text=text,
+                        dataset_hints=dataset_hints,
+                    )
+            elif re.fullmatch(r"\d{6}", dataset_id):
+                family = family_by_id.get("dandi_neurophysiology")
+                if family is not None:
+                    candidate = self._lookup_dandi_candidate(
+                        family,
+                        identifier=dataset_id,
+                        text=text,
+                        dataset_hints=dataset_hints,
+                    )
+            elif lowered.startswith("doi:"):
+                family = family_by_id.get("harvard_dataverse_open_data")
+                if family is not None:
+                    candidate = self._lookup_dataverse_candidate(
+                        family,
+                        persistent_id=dataset_id,
+                        text=text,
+                        dataset_hints=dataset_hints,
+                    )
+            if candidate is not None:
+                candidates.append(candidate)
+        return candidates
+
+    def _lookup_zenodo_candidate(
+        self,
+        family: SourceFamilySpec,
+        *,
+        record_id: str,
+        text: str,
+        dataset_hints: list[str],
+    ) -> DatasetCandidate | None:
+        payload = self._request_json(f"https://zenodo.org/api/records/{self._url_encode(record_id)}")
+        if not isinstance(payload, dict):
+            return None
+        metadata = payload.get("metadata") if isinstance(payload.get("metadata"), dict) else {}
+        title = str(metadata.get("title") or record_id).strip()
+        description = str(metadata.get("description") or "").strip()
+        access_right = str(metadata.get("access_right") or "").strip().lower()
+        data_files = [
+            str(((entry.get("links") or {}).get("self")) or "").strip()
+            for entry in (payload.get("files") or [])
+            if self._is_likely_data_file(str(entry.get("key") or ""), "")
+        ]
+        haystack = " ".join([record_id, title, description]).lower()
+        base_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+        return DatasetCandidate(
+            family_id=family.id,
+            family_label=family.label,
+            dataset_id=f"zenodo:{record_id}",
+            title=title,
+            summary=f"Zenodo record {record_id} | data files: {len(data_files)}",
+            access_url=str(payload.get("doi_url") or f"https://zenodo.org/records/{record_id}"),
+            primary_domain=family.trusted_domains[0],
+            trusted_domains=family.trusted_domains,
+            unit_of_analysis=family.unit_of_analysis,
+            modalities=family.modalities,
+            score=max(base_score, 0) + 100 + min(len(data_files), 20),
+            evidence_count=len(data_files),
+            qualifies_as_primary_data=access_right == "open" and len(data_files) >= (family.minimum_asset_count or 1),
+            provenance_note="Resolved directly from an explicit Zenodo dataset id.",
+            api_url=f"https://zenodo.org/api/records/{record_id}",
+            download_urls=data_files[:5],
+        )
+
+    def _lookup_figshare_candidate(
+        self,
+        family: SourceFamilySpec,
+        *,
+        article_id: str,
+        text: str,
+        dataset_hints: list[str],
+    ) -> DatasetCandidate | None:
+        payload = self._request_json(f"https://api.figshare.com/v2/articles/{self._url_encode(article_id)}")
+        if not isinstance(payload, dict):
+            return None
+        title = str(payload.get("title") or article_id).strip()
+        description = str(payload.get("description") or "").strip()
+        data_files = [
+            str(entry.get("download_url") or "").strip()
+            for entry in (payload.get("files") or [])
+            if self._is_likely_data_file(str(entry.get("name") or ""), str(entry.get("mimetype") or ""))
+        ]
+        haystack = " ".join([article_id, title, description]).lower()
+        base_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+        return DatasetCandidate(
+            family_id=family.id,
+            family_label=family.label,
+            dataset_id=f"figshare:{article_id}",
+            title=title,
+            summary=f"Figshare article {article_id} | data files: {len(data_files)}",
+            access_url=str(payload.get("figshare_url") or payload.get("url_public_html") or ""),
+            primary_domain=family.trusted_domains[0],
+            trusted_domains=family.trusted_domains,
+            unit_of_analysis=family.unit_of_analysis,
+            modalities=family.modalities,
+            score=max(base_score, 0) + 100 + min(len(data_files), 20),
+            evidence_count=len(data_files),
+            qualifies_as_primary_data=bool(payload.get("is_public")) and len(data_files) >= (family.minimum_asset_count or 1),
+            provenance_note="Resolved directly from an explicit Figshare dataset id.",
+            api_url=f"https://api.figshare.com/v2/articles/{article_id}",
+            download_urls=data_files[:5],
+        )
+
+    def _lookup_openalex_candidate(
+        self,
+        family: SourceFamilySpec,
+        *,
+        work_id: str,
+        text: str,
+        dataset_hints: list[str],
+    ) -> DatasetCandidate | None:
+        normalized_work_id = work_id if work_id.lower().startswith("https://openalex.org/") else f"https://openalex.org/{work_id.upper()}"
+        payload = self._request_json(normalized_work_id.replace("https://openalex.org/", "https://api.openalex.org/works/"))
+        if not isinstance(payload, dict):
+            return None
+        title = str(payload.get("display_name") or payload.get("title") or normalized_work_id).strip()
+        year = payload.get("publication_year")
+        haystack = " ".join([normalized_work_id, title, str(year or "")]).lower()
+        base_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+        return DatasetCandidate(
+            family_id=family.id,
+            family_label=family.label,
+            dataset_id=normalized_work_id,
+            title=title,
+            summary=f"OpenAlex work metadata | year: {year or 'unknown'}",
+            access_url=normalized_work_id,
+            primary_domain=family.trusted_domains[0],
+            trusted_domains=family.trusted_domains,
+            unit_of_analysis=family.unit_of_analysis,
+            modalities=family.modalities,
+            score=max(base_score, 0) + 100,
+            evidence_count=1,
+            qualifies_as_primary_data=False,
+            provenance_note="Resolved directly from an explicit OpenAlex work id.",
+            api_url=normalized_work_id.replace("https://openalex.org/", "https://api.openalex.org/works/"),
+        )
+
+    def _lookup_geo_candidate(
+        self,
+        family: SourceFamilySpec,
+        *,
+        accession: str,
+        text: str,
+        dataset_hints: list[str],
+    ) -> DatasetCandidate | None:
+        search_payload = self._request_json(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
+            f"?db=gds&retmode=json&retmax=1&term={self._url_encode(accession)}"
+        )
+        id_list = ((search_payload or {}).get("esearchresult") or {}).get("idlist") or []
+        if not id_list:
+            return None
+        summary_payload = self._request_json(
+            "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+            f"?db=gds&retmode=json&id={','.join(id_list[:1])}"
+        )
+        summary_result = (summary_payload or {}).get("result") or {}
+        summary = summary_result.get(str(id_list[0])) or {}
+        title = str(summary.get("title") or accession).strip()
+        description = str(summary.get("summary") or "").strip()
+        sample_count = len(summary.get("samples") or [])
+        haystack = " ".join([accession, title, description, str(summary.get("gdstype") or "")]).lower()
+        base_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+        return DatasetCandidate(
+            family_id=family.id,
+            family_label=family.label,
+            dataset_id=accession,
+            title=title,
+            summary=f"{str(summary.get('gdstype') or 'GEO series')} | samples: {sample_count}",
+            access_url=f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}",
+            primary_domain=family.trusted_domains[0],
+            trusted_domains=family.trusted_domains,
+            unit_of_analysis=family.unit_of_analysis,
+            modalities=family.modalities,
+            score=max(base_score, 0) + 100 + min(sample_count, 100) / 20,
+            evidence_count=sample_count,
+            qualifies_as_primary_data=sample_count >= (family.minimum_asset_count or 1),
+            provenance_note="Resolved directly from an explicit GEO accession.",
+            api_url=(
+                "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
+                f"?db=gds&retmode=json&id={id_list[0]}"
+            ),
+        )
+
+    def _lookup_dandi_candidate(
+        self,
+        family: SourceFamilySpec,
+        *,
+        identifier: str,
+        text: str,
+        dataset_hints: list[str],
+    ) -> DatasetCandidate | None:
+        payload = self._request_json(f"https://api.dandiarchive.org/api/dandisets/{self._url_encode(identifier)}/")
+        if not isinstance(payload, dict):
+            return None
+        version = payload.get("most_recent_published_version") if isinstance(payload.get("most_recent_published_version"), dict) else {}
+        title = str(version.get("name") or payload.get("name") or identifier).strip()
+        description = str(version.get("description") or payload.get("description") or "").strip()
+        asset_count = int(version.get("asset_count") or 0)
+        haystack = " ".join([identifier, title, description]).lower()
+        base_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+        return DatasetCandidate(
+            family_id=family.id,
+            family_label=family.label,
+            dataset_id=identifier,
+            title=title,
+            summary=f"DANDI dandiset {identifier} | assets: {asset_count}",
+            access_url=f"https://dandiarchive.org/dandiset/{identifier}",
+            primary_domain=family.trusted_domains[0],
+            trusted_domains=family.trusted_domains,
+            unit_of_analysis=family.unit_of_analysis,
+            modalities=family.modalities,
+            score=max(base_score, 0) + 100 + min(asset_count, 200) / 25,
+            evidence_count=asset_count,
+            qualifies_as_primary_data=asset_count >= (family.minimum_asset_count or 1),
+            provenance_note="Resolved directly from an explicit DANDI dataset id.",
+            api_url=f"https://api.dandiarchive.org/api/dandisets/{identifier}/",
+        )
+
+    def _lookup_dataverse_candidate(
+        self,
+        family: SourceFamilySpec,
+        *,
+        persistent_id: str,
+        text: str,
+        dataset_hints: list[str],
+    ) -> DatasetCandidate | None:
+        payload = self._request_json(
+            "https://dataverse.harvard.edu/api/datasets/:persistentId/"
+            f"?persistentId={self._url_encode(persistent_id)}"
+        )
+        latest_version = ((payload or {}).get("data") or {}).get("latestVersion") or {}
+        metadata_blocks = latest_version.get("metadataBlocks") or {}
+        citation_fields = ((metadata_blocks.get("citation") or {}).get("fields") or []) if isinstance(metadata_blocks, dict) else []
+        title = persistent_id
+        description = ""
+        for field in citation_fields:
+            field_name = str(field.get("typeName") or "").strip()
+            if field_name == "title":
+                title = str(field.get("value") or title).strip()
+            elif field_name == "dsDescription":
+                values = field.get("value") or []
+                if values:
+                    nested_fields = (values[0] or {}).get("dsDescriptionValue") if isinstance(values[0], dict) else None
+                    if isinstance(nested_fields, dict):
+                        description = str(nested_fields.get("value") or "").strip()
+        files = latest_version.get("files") or []
+        data_files = [
+            entry for entry in files
+            if not bool(entry.get("restricted"))
+            and self._is_likely_data_file(
+                str(((entry.get("dataFile") or {}).get("filename")) or entry.get("label") or ""),
+                str(((entry.get("dataFile") or {}).get("contentType")) or ""),
+            )
+        ]
+        haystack = " ".join([persistent_id, title, description]).lower()
+        base_score = self._text_match_score(text, haystack, family.search_keywords, dataset_hints)
+        download_urls = [
+            f"https://dataverse.harvard.edu/api/access/datafile/{(entry.get('dataFile') or {}).get('id')}"
+            for entry in data_files
+            if (entry.get("dataFile") or {}).get("id")
+        ][:5]
+        return DatasetCandidate(
+            family_id=family.id,
+            family_label=family.label,
+            dataset_id=persistent_id,
+            title=title,
+            summary=f"{description[:220]} | data files: {len(data_files)}",
+            access_url=f"https://dataverse.harvard.edu/dataset.xhtml?persistentId={persistent_id}",
+            primary_domain=family.trusted_domains[0],
+            trusted_domains=family.trusted_domains,
+            unit_of_analysis=family.unit_of_analysis,
+            modalities=family.modalities,
+            score=max(base_score, 0) + 100 + min(len(data_files), 50) / 5,
+            evidence_count=len(data_files),
+            qualifies_as_primary_data=len(data_files) >= (family.minimum_asset_count or 1),
+            provenance_note="Resolved directly from an explicit Harvard Dataverse dataset id.",
+            api_url=(
+                "https://dataverse.harvard.edu/api/datasets/:persistentId/"
+                f"?persistentId={self._url_encode(persistent_id)}"
+            ),
+            download_urls=download_urls,
+        )
+
+    def _contains_any_phrase(self, text: str, phrases: list[str]) -> bool:
+        lowered = text.lower()
+        return any(self._contains_phrase(lowered, phrase) for phrase in phrases)
+
+    def _contains_phrase(self, text: str, phrase: str) -> bool:
+        pattern = r"\b" + re.escape(phrase.lower()).replace(r"\ ", r"[-\s]+") + r"\b"
+        return re.search(pattern, text) is not None
+
+    def _negates_any_phrase(self, text: str, phrases: list[str]) -> bool:
+        lowered = text.lower()
+        for phrase in phrases:
+            phrase_pattern = re.escape(phrase.lower()).replace(r"\ ", r"[-\s]+")
+            pattern = rf"\b(?:not|without|rather than|instead of|exclude|excluding|avoid)\b[^.:\n]{{0,100}}\b{phrase_pattern}\b"
+            if re.search(pattern, lowered):
+                return True
+        return False
 
     def _request_json(
         self,

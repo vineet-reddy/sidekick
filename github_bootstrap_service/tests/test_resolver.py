@@ -123,6 +123,41 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolution.selected_candidate.family_id, "openalex_literature")
         self.assertFalse(resolution.selected_candidate.qualifies_as_primary_data)
 
+    def test_resolves_explicit_zenodo_dataset_id_before_fuzzy_search(self) -> None:
+        resolver = FakeResolver(
+            {
+                "zenodo.org/api/records/14676310": {
+                    "id": 14676310,
+                    "doi_url": "https://doi.org/10.5281/zenodo.14676310",
+                    "metadata": {
+                        "title": "Data for: Changes in the prevalence of autism spectrum disorder among fee-for-service Medicare beneficiaries, 2007-2018",
+                        "description": "Administrative prevalence dataset for autism.",
+                        "access_right": "open",
+                    },
+                    "files": [
+                        {
+                            "key": "autism-prevalence.zip",
+                            "links": {"self": "https://zenodo.org/api/records/14676310/files/autism-prevalence.zip/content"},
+                        }
+                    ],
+                },
+                "zenodo.org/api/records?q=": {"hits": {"hits": []}},
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="Autism prevalence follow-up",
+            theme="Use the already selected prevalence dataset",
+            notes=[{"title": "Autism", "content": "Use the explicit dataset that was selected upstream."}],
+            dataset_hints=[],
+            dataset_ids=["zenodo:14676310"],
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertIsNotNone(resolution.selected_candidate)
+        self.assertEqual(resolution.selected_candidate.dataset_id, "zenodo:14676310")
+        self.assertTrue(resolution.selected_candidate.title.startswith("Data for: Changes"))
+
     def test_falls_back_to_dataverse_for_niche_empirical_note(self) -> None:
         resolver = FakeResolver(
             {
@@ -163,10 +198,10 @@ class ResolverTests(unittest.TestCase):
         )
 
         resolution = resolver.resolve(
-            title="Sex differences in pediatric epilepsy responsive neurostimulation",
-            theme="Pediatric epilepsy neurophysiology",
-            notes=[{"title": "RNS", "content": "Need a small but real pediatric epilepsy dataset if available."}],
-            dataset_hints=[],
+            title="Children with epilepsy dataset",
+            theme="Children with epilepsy cohort",
+            notes=[{"title": "Epilepsy", "content": "Need real data on children with epilepsy."}],
+            dataset_hints=["children epilepsy"],
         )
 
         self.assertEqual(resolution.status, "resolved")
@@ -212,6 +247,160 @@ class ResolverTests(unittest.TestCase):
         zenodo_candidates = [candidate for candidate in resolution.candidates if candidate.family_id == "zenodo_open_research"]
         self.assertTrue(zenodo_candidates)
         self.assertFalse(zenodo_candidates[0].qualifies_as_primary_data)
+
+    def test_classifies_majorana_threshold_note_as_theoretical_commentary(self) -> None:
+        resolver = FakeResolver({})
+
+        resolution = resolver.resolve(
+            title="Fault-Tolerance Thresholds for Majorana Tetron Qubits",
+            theme="Majorana tetron threshold analysis",
+            notes=[
+                {
+                    "title": "Majorana thresholds",
+                    "content": "Need the Kitaev chain Hamiltonian, BdG formalism, braiding operators for Clifford gates, and a heavy math paper deriving the surface code threshold.",
+                }
+            ],
+            dataset_hints=[],
+        )
+
+        self.assertEqual(resolution.paper_mode, "theoretical_commentary")
+
+    def test_prefers_topic_relevant_dandi_match_over_generic_modality_match(self) -> None:
+        resolver = FakeResolver(
+            {
+                "api.dandiarchive.org/api/dandisets/": {
+                    "results": [
+                        {
+                            "identifier": "000932",
+                            "most_recent_published_version": {
+                                "name": "An electroencephalogram microdisplay to visualize neuronal activity on the brain surface",
+                                "asset_count": 238,
+                                "description": "General electrocorticography methods dataset.",
+                            },
+                        },
+                        {
+                            "identifier": "001044",
+                            "most_recent_published_version": {
+                                "name": "Dataset of long-term multi-site LFP activity with spontaneous chronic seizures recorded in temporal lobe epilepsy rats.",
+                                "asset_count": 162,
+                                "description": "Chronic epilepsy recordings with seizure annotations.",
+                            },
+                        },
+                    ]
+                }
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="Pediatric epilepsy prevalence",
+            theme="Need real pediatric epilepsy recordings, not simulation.",
+            notes=[{"title": "Epilepsy", "content": "Need real pediatric epilepsy recordings, not simulation."}],
+            dataset_hints=[],
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertIsNotNone(resolution.selected_candidate)
+        self.assertEqual(resolution.selected_candidate.dataset_id, "001044")
+
+    def test_epilepsy_prevalence_note_prefers_cohort_dataset_over_recording_dataset(self) -> None:
+        resolver = FakeResolver(
+            {
+                "api.dandiarchive.org/api/dandisets/": {
+                    "results": [
+                        {
+                            "identifier": "001044",
+                            "most_recent_published_version": {
+                                "name": "Dataset of long-term multi-site LFP activity with spontaneous chronic seizures recorded in temporal lobe epilepsy rats.",
+                                "asset_count": 162,
+                                "description": "Chronic epilepsy recordings with seizure annotations.",
+                            },
+                        }
+                    ]
+                },
+                "zenodo.org/api/records": {
+                    "hits": {
+                        "hits": [
+                            {
+                                "id": 5117823,
+                                "doi_url": "https://doi.org/10.5061/dryad.7sqv9s4s7",
+                                "metadata": {
+                                    "title": "Epidemiology of epilepsy in Nigeria: A community-based study from 3 sites",
+                                    "description": "Population prevalence and incidence tables for epilepsy.",
+                                    "access_right": "open",
+                                },
+                                "files": [
+                                    {
+                                        "key": "Epidemiology_Data_Incidence___Prevalence_2018_FINAL.xlsx",
+                                        "links": {"self": "https://zenodo.org/api/records/5117823/files/file.xlsx/content"},
+                                    }
+                                ],
+                            }
+                        ]
+                    }
+                },
+                "dataverse.harvard.edu/api/search": {
+                    "data": {
+                        "items": [
+                            {
+                                "name": "Magnetic Resonance Imaging (MRI) Analysis and Neurocognitive Assessment of Children and Young Adults with Chronic Kidney Disease (CKD) \"NiCK\" Study",
+                                "global_id": "doi:10.7910/DVN/E7TAHQ",
+                                "url": "https://doi.org/10.7910/DVN/E7TAHQ",
+                                "description": "Cross-sectional pediatric chronic kidney disease cohort study.",
+                                "subjects": ["Medicine, Health and Life Sciences"],
+                                "citation": "NiCK Study.",
+                            }
+                        ]
+                    }
+                },
+                "dataverse.harvard.edu/api/datasets/:persistentId/": {
+                    "data": {
+                        "latestVersion": {
+                            "files": [
+                                {
+                                    "restricted": False,
+                                    "label": "nick-study.csv",
+                                    "dataFile": {
+                                        "id": 11460373,
+                                        "filename": "nick-study.csv",
+                                        "contentType": "text/csv",
+                                    },
+                                }
+                            ]
+                        }
+                    }
+                },
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="Pediatric epilepsy prevalence",
+            theme="Need real pediatric epilepsy prevalence data, not recordings.",
+            notes=[{"title": "Epilepsy", "content": "Need real pediatric epilepsy prevalence data, not recordings."}],
+            dataset_hints=[],
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertIsNotNone(resolution.selected_candidate)
+        self.assertEqual(resolution.selected_candidate.dataset_id, "zenodo:5117823")
+
+    def test_negated_recording_and_gene_expression_terms_do_not_drive_modalities(self) -> None:
+        resolver = FakeResolver({})
+
+        resolution = resolver.resolve(
+            title="Epilepsy in pediatric Asian populations",
+            theme="Epidemiology",
+            notes=[
+                {
+                    "title": "Epilepsy prevalence",
+                    "content": "Estimate the prevalence of epilepsy in pediatric Asian populations using real cohort or registry data, not EEG recordings or gene-expression datasets.",
+                }
+            ],
+            dataset_hints=[],
+        )
+
+        self.assertIn("clinical_cohort", resolution.inferred_modalities)
+        self.assertNotIn("neurophysiology", resolution.inferred_modalities)
+        self.assertNotIn("gene_expression", resolution.inferred_modalities)
 
 
 if __name__ == "__main__":

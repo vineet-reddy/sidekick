@@ -32,6 +32,7 @@ from .manuscript import (
 )
 from .openai_client import OpenAIClient, OpenAIContainerFile
 from .pipeline_engine import PaperPipelineEngine, PipelineExecutionError
+from .resolver import SourceFamilyResolver
 
 
 def _json_dumps(payload: dict[str, Any]) -> bytes:
@@ -138,7 +139,11 @@ def _find_banned_phrases(text: str) -> list[str]:
     patterns = {
         "synthetic data": r"\bsynthetic\s+(?:data|dataset|results?|analysis)\b",
         "simulated data": r"\bsimulated\s+(?:data|dataset|results?|analysis)\b",
+        "simulation study": r"\bsimulation\s+study\b|\bsynthetic\s+benchmark\b",
         "mock data": r"\bmock\s+(?:data|dataset|results?)\b",
+        "proxy dataset": r"\bproxy\s+(?:data|dataset)\b|\bsurrogate\s+(?:data|dataset)\b",
+        "literature parameterization": r"\bliterature[-\s]parameteri[sz]ed\b|\bparameteri[sz]ed\s+from\s+literature\b",
+        "generated cohort": r"\bgenerated\s+(?:cohort|sample|dataset|population)\b",
         "placeholder": r"\bplaceholder\s+(?:data|dataset|results?|figure|table|text)\b",
         "demo mode": r"\bdemo(?:\s+mode)?\b",
         "draft language": r"\bthis draft\b|\(draft\)",
@@ -155,9 +160,7 @@ def _source_has_reproducible_receipt(source: dict[str, Any]) -> bool:
     return bool(
         accession_id
         or _is_http_url(download_url)
-        or api_endpoint
-        or (isinstance(api_query, dict) and bool(api_query))
-        or (isinstance(api_query, str) and api_query.strip())
+        or (api_endpoint and ((isinstance(api_query, dict) and bool(api_query)) or (isinstance(api_query, str) and api_query.strip())))
     )
 
 
@@ -337,6 +340,7 @@ class JobProcessor(threading.Thread):
         database: SidekickDatabase,
         github_client: GitHubClient,
         openai_client: OpenAIClient,
+        source_resolver: SourceFamilyResolver | None = None,
     ):
         super().__init__(daemon=True)
         self._config = config
@@ -348,6 +352,7 @@ class JobProcessor(threading.Thread):
             openai_client=openai_client,
             status_callback=self._record_pipeline_status,
             metrics_callback=self._record_response_metrics,
+            source_resolver=source_resolver,
         )
         self._stop_event = threading.Event()
 
@@ -407,7 +412,11 @@ class JobProcessor(threading.Thread):
 
         try:
             ledger = self._run_research_workspace(context)
-            validation = self._validate_ledger(context.job["id"], ledger)
+            validation = self._validate_ledger(
+                context.job["id"],
+                ledger,
+                request_payload=context.request_payload,
+            )
             bundle = self._write_bundle(context, ledger, validation)
             publication = self._publish_bundle(context, bundle)
             self._persist_artifacts(context.job["id"], bundle, publication)
@@ -477,8 +486,18 @@ class JobProcessor(threading.Thread):
     def _apply_downloaded_files_to_ledger(self, ledger: dict[str, Any], downloaded_files: list[DownloadedArtifactFile]) -> None:
         self._engine.apply_downloaded_files_to_ledger(ledger, downloaded_files)
 
-    def _validate_ledger(self, job_id: str, ledger: dict[str, Any]) -> dict[str, Any]:
-        return self._engine.validate_ledger(run_id=job_id, ledger=ledger)
+    def _validate_ledger(
+        self,
+        job_id: str,
+        ledger: dict[str, Any],
+        *,
+        request_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        return self._engine.validate_ledger(
+            run_id=job_id,
+            ledger=ledger,
+            request_payload=request_payload,
+        )
 
     def _write_bundle(self, context: JobContext, ledger: dict[str, Any], validation: dict[str, Any]) -> dict[str, Any]:
         return self._engine.write_bundle(
@@ -691,11 +710,13 @@ class BootstrapServiceHTTPServer(ThreadingHTTPServer):
         self.database = database
         self.github_client = github_client
         self.openai_client = openai_client
+        self.source_resolver = SourceFamilyResolver()
         self.job_processor = JobProcessor(
             config=config,
             database=database,
             github_client=github_client,
             openai_client=openai_client,
+            source_resolver=self.source_resolver,
         )
         self.job_processor.start()
 
@@ -876,6 +897,24 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                 "must_use_sources": payload.get("must_use_sources") or [],
                 "domain_guidance": str(payload.get("domain_guidance") or "").strip(),
             }
+            resolution = self.server.source_resolver.resolve(
+                title=title,
+                theme=theme,
+                notes=notes,
+                dataset_hints=request_payload["dataset_hints"],
+                dataset_ids=request_payload["dataset_ids"],
+            )
+            request_payload["resolution"] = resolution.as_dict()
+            if resolution.paper_mode == "empirical_dataset" and resolution.status != "resolved":
+                self._send_json(
+                    HTTPStatus.UNPROCESSABLE_ENTITY,
+                    {
+                        "error": "dataset_resolution_blocked",
+                        "message": resolution.blocking_reason or resolution.summary,
+                        "resolution": resolution.as_dict(),
+                    },
+                )
+                return
             job = self.server.database.create_paper_job(
                 install_session_id=install_session["id"],
                 github_connection_id=connection["id"],
@@ -927,31 +966,48 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
         return
 
     def _assess_notes(self, notes: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        note_groups: dict[str, list[dict[str, Any]]] = {}
+        clusters: list[dict[str, Any]] = []
         for note in notes:
             content = str(note.get("content") or "").strip()
             note_id = str(note.get("id") or "").strip()
             if not content or not note_id:
                 continue
-            tokens = re.findall(r"[a-zA-Z]{4,}", content.lower())
-            bucket = tokens[0] if tokens else "general"
-            note_groups.setdefault(bucket, []).append(note)
-
-        clusters: list[dict[str, Any]] = []
-        for grouped_notes in note_groups.values():
-            title = str(grouped_notes[0].get("title") or grouped_notes[0].get("content") or "").strip()
+            title = str(note.get("title") or content).strip()
             title = title[:80] if title else "Research paper"
+            resolution = self.server.source_resolver.resolve(
+                title=title,
+                theme=title,
+                notes=[{"id": note_id, "title": title, "content": content}],
+                dataset_hints=[],
+                dataset_ids=[],
+            )
+            readiness_mode = self._cluster_readiness_mode(resolution.as_dict())
+            selected_candidate = resolution.selected_candidate
+            dataset_ids = [selected_candidate.dataset_id] if selected_candidate else []
             clusters.append(
                 {
-                    "noteIDs": [str(note["id"]) for note in grouped_notes],
+                    "noteIDs": [note_id],
                     "theme": title,
                     "suggestedTitle": title,
-                    "dataset_ids": [],
-                    "readiness_mode": "trusted_ready",
-                    "is_ready": True,
+                    "dataset_ids": dataset_ids,
+                    "readiness_mode": readiness_mode,
+                    "is_ready": readiness_mode != "needs_data",
                 }
             )
         return clusters
+
+    def _cluster_readiness_mode(self, resolution: dict[str, Any]) -> str:
+        paper_mode = str(resolution.get("paper_mode") or "").strip()
+        status = str(resolution.get("status") or "").strip()
+        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else None
+        if status != "resolved":
+            return "needs_data"
+        if paper_mode == "empirical_dataset":
+            qualifies = bool(selected_candidate and selected_candidate.get("qualifies_as_primary_data"))
+            return "trusted_ready" if qualifies else "needs_data"
+        if paper_mode in {"literature_review", "bibliometric"}:
+            return "trusted_ready"
+        return "needs_data"
 
     def _handle_github_callback(self, parsed_url: Any) -> None:
         query = parse_qs(parsed_url.query)

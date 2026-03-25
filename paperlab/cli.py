@@ -19,6 +19,7 @@ from github_bootstrap_service.bootstrap_service.pipeline_engine import (
     read_json_file,
     write_json_file,
 )
+from github_bootstrap_service.bootstrap_service.resolver import SourceFamilyResolver
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = REPO_ROOT / "paperlab" / "runs"
@@ -54,6 +55,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_run_ref_argument(workspace_parser)
     workspace_parser.set_defaults(func=workspace_command)
 
+    resolve_parser = subparsers.add_parser("resolve", help="Resolve the primary dataset/source family for a payload.")
+    add_payload_arguments(resolve_parser)
+    resolve_parser.set_defaults(func=resolve_command)
+
     validate_parser = subparsers.add_parser("validate", help="Run or rerun the validation stage for a saved run.")
     add_run_ref_argument(validate_parser)
     validate_parser.set_defaults(func=validate_command)
@@ -83,6 +88,14 @@ def build_parser() -> argparse.ArgumentParser:
     latest_parser = subparsers.add_parser("latest", help="Print the latest local run directory.")
     latest_parser.set_defaults(func=latest_command)
 
+    runs_parser = subparsers.add_parser("runs", help="List recent local runs with approval and dataset status.")
+    runs_parser.add_argument("--limit", type=int, default=10, help="Maximum number of runs to print.")
+    runs_parser.set_defaults(func=runs_command)
+
+    app_state_parser = subparsers.add_parser("app-state", help="Inspect the Sidekick simulator SwiftData store.")
+    add_app_state_arguments(app_state_parser)
+    app_state_parser.set_defaults(func=app_state_command)
+
     return parser
 
 
@@ -92,6 +105,7 @@ def add_payload_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--theme", help="Theme for the run when not using --input.")
     parser.add_argument("--notes", help="Research prompt text.")
     parser.add_argument("--notes-file", help="File containing the research prompt text.")
+    parser.add_argument("--dataset-id", action="append", default=[], help="Explicit dataset id to preserve during resolution.")
     parser.add_argument("--domain-guidance", help="Optional domain guidance text.")
     parser.add_argument("--domain-guidance-file", help="File containing optional domain guidance text.")
     parser.add_argument("--must-use-sources", help="JSON file containing must-use materials.")
@@ -99,6 +113,20 @@ def add_payload_arguments(parser: argparse.ArgumentParser) -> None:
 
 def add_run_ref_argument(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("run_ref", help="Run id, absolute path, or `latest`.")
+
+
+def add_app_state_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "section",
+        nargs="?",
+        default="summary",
+        choices=["summary", "notes", "papers", "runs", "all"],
+        help="Which section to print.",
+    )
+    parser.add_argument("--bundle-id", default="com.vineet.Sidekick", help="App bundle ID. Defaults to Sidekick.")
+    parser.add_argument("--device", default="booted", help="Simulator device selector for simctl. Defaults to `booted`.")
+    parser.add_argument("--store-path", help="Use an explicit SwiftData store path instead of resolving via simctl.")
+    parser.add_argument("--json", action="store_true", help="Print JSON instead of the human-readable summary.")
 
 
 def run_command(args: argparse.Namespace) -> int:
@@ -126,6 +154,19 @@ def workspace_command(args: argparse.Namespace) -> int:
     return 0
 
 
+def resolve_command(args: argparse.Namespace) -> int:
+    request_payload = resolve_request_payload(args)
+    resolution = SourceFamilyResolver().resolve(
+        title=str(request_payload.get("title") or "").strip(),
+        theme=str(request_payload.get("theme") or "").strip(),
+        notes=normalize_cli_notes(request_payload.get("notes")),
+        dataset_hints=request_payload.get("dataset_hints") or [],
+        dataset_ids=request_payload.get("dataset_ids") or [],
+    )
+    print(json.dumps(resolution.as_dict(), indent=2, sort_keys=True))
+    return 0
+
+
 def validate_command(args: argparse.Namespace) -> int:
     run_directory = resolve_run_directory(args.run_ref)
     runtime = CLIRuntime(run_id=run_directory.name, run_directory=run_directory)
@@ -133,6 +174,7 @@ def validate_command(args: argparse.Namespace) -> int:
     validation = engine.validate_ledger(
         run_id=run_directory.name,
         ledger=read_json_file(run_directory / "ledger.json"),
+        request_payload=read_json_file(run_directory / "input.json"),
     )
     print(f"validation: {run_directory / 'validation.json'}")
     print(f"manuscript_kind: {validation.get('manuscript_kind')}")
@@ -186,6 +228,13 @@ def inspect_command(args: argparse.Namespace) -> int:
     if input_payload:
         print(f"title: {input_payload.get('title')}")
         print(f"theme: {input_payload.get('theme')}")
+        resolution = input_payload.get("resolution") if isinstance(input_payload.get("resolution"), dict) else {}
+        if resolution:
+            print(f"paper_mode: {resolution.get('paper_mode')}")
+            print(f"resolution: {resolution.get('status')}")
+            selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
+            if selected_candidate:
+                print(f"primary_dataset: {selected_candidate.get('dataset_id')}")
     if ledger:
         print(f"ledger results: {len(ledger.get('results') or [])}")
         print(f"ledger artifacts: {len(ledger.get('artifacts') or [])}")
@@ -193,6 +242,7 @@ def inspect_command(args: argparse.Namespace) -> int:
     if validation:
         print(f"manuscript_kind: {validation.get('manuscript_kind')}")
         print(f"approved_results: {len(validation.get('approved_results') or [])}")
+        print(f"missing_notes: {len(validation.get('missing_note_ids') or [])}")
         print(f"summary: {validation.get('summary')}")
         if validation.get("manuscript_kind") != "paper":
             print(build_validation_error_message(validation))
@@ -234,6 +284,64 @@ def latest_command(_: argparse.Namespace) -> int:
     return 0
 
 
+def runs_command(args: argparse.Namespace) -> int:
+    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    runs = sorted(
+        [path for path in RUNS_ROOT.iterdir() if path.is_dir()],
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[: max(1, args.limit)]
+
+    if not runs:
+        print("No local paperlab runs exist yet.")
+        return 0
+
+    print("run_id\tkind\tapproved\tmissing_notes\tpaper_mode\tresolution\tprimary_dataset\tlast_event")
+    for run_directory in runs:
+        input_payload = maybe_read_json(run_directory / "input.json")
+        validation = maybe_read_json(run_directory / "validation.json")
+        resolution = {}
+        if isinstance(input_payload.get("resolution"), dict):
+            resolution = input_payload["resolution"]
+        elif isinstance(validation.get("resolution"), dict):
+            resolution = validation["resolution"]
+        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
+        print(
+            "\t".join(
+                [
+                    run_directory.name,
+                    str(validation.get("manuscript_kind") or "-"),
+                    str(len(validation.get("approved_results") or [])),
+                    str(len(validation.get("missing_note_ids") or [])),
+                    str(resolution.get("paper_mode") or "-"),
+                    str(resolution.get("status") or "-"),
+                    str(selected_candidate.get("dataset_id") or "-"),
+                    last_event_summary(run_directory),
+                ]
+            )
+        )
+    return 0
+
+
+def app_state_command(args: argparse.Namespace) -> int:
+    command = [
+        sys.executable,
+        str((REPO_ROOT / "scripts" / "sidekick_state.py").resolve()),
+        args.section,
+        "--bundle-id",
+        str(args.bundle_id),
+        "--device",
+        str(args.device),
+    ]
+    if args.store_path:
+        command.extend(["--store-path", str(args.store_path)])
+    if args.json:
+        command.append("--json")
+
+    completed = subprocess.run(command, check=False)
+    return int(completed.returncode)
+
+
 def build_engine(*, runtime: "CLIRuntime", require_openai: bool = True) -> PaperPipelineEngine:
     config = build_local_config(require_openai=require_openai)
     return PaperPipelineEngine(
@@ -241,6 +349,7 @@ def build_engine(*, runtime: "CLIRuntime", require_openai: bool = True) -> Paper
         openai_client=OpenAIClient(config),
         status_callback=runtime.record_status,
         metrics_callback=runtime.record_metrics,
+        source_resolver=SourceFamilyResolver(),
     )
 
 
@@ -291,7 +400,7 @@ def resolve_request_payload(args: argparse.Namespace) -> dict[str, Any]:
         "title": title,
         "theme": theme,
         "notes": notes,
-        "dataset_ids": [],
+        "dataset_ids": [str(dataset_id).strip() for dataset_id in args.dataset_id if str(dataset_id).strip()],
         "dataset_hints": [],
         "must_use_sources": must_use_sources,
         "domain_guidance": domain_guidance,
@@ -366,6 +475,29 @@ def load_optional_text(inline_value: str | None, file_value: str | None) -> str:
     return ""
 
 
+def normalize_cli_notes(value: Any) -> list[dict[str, str]]:
+    if isinstance(value, list):
+        normalized: list[dict[str, str]] = []
+        for index, note in enumerate(value):
+            if not isinstance(note, dict):
+                continue
+            content = str(note.get("content") or "").strip()
+            if not content:
+                continue
+            normalized.append(
+                {
+                    "id": str(note.get("id") or f"note_{index + 1}").strip() or f"note_{index + 1}",
+                    "title": str(note.get("title") or derive_title(content)).strip() or derive_title(content),
+                    "content": content,
+                }
+            )
+        return normalized
+    if isinstance(value, str) and value.strip():
+        content = value.strip()
+        return [{"id": "note_1", "title": derive_title(content), "content": content}]
+    return []
+
+
 def derive_title(notes: str) -> str:
     for line in notes.splitlines():
         stripped = line.strip()
@@ -394,6 +526,28 @@ def first_existing(*paths: Path) -> Path | None:
         if path.exists():
             return path
     return None
+
+
+def last_event_summary(run_directory: Path) -> str:
+    path = run_directory / "events.jsonl"
+    if not path.exists():
+        return "-"
+    last_line = ""
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                last_line = line
+    if not last_line:
+        return "-"
+    try:
+        payload = json.loads(last_line)
+    except json.JSONDecodeError:
+        return "-"
+    stage = str(payload.get("stage") or "").strip()
+    message = str(payload.get("progress_message") or "").strip()
+    if stage and message:
+        return f"{stage}: {message}"
+    return message or stage or "-"
 
 
 class CLIRuntime:
