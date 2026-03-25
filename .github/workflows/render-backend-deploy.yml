@@ -1,0 +1,112 @@
+name: Render Backend Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "github_bootstrap_service/**"
+      - "render.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  deploy-backend:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+      RENDER_API_BASE: https://api.render.com/v1
+      RENDER_SERVICE_ID: srv-d70bar1r0fns73co8f9g
+      TARGET_COMMIT: ${{ github.sha }}
+    steps:
+      - name: Trigger or wait for backend deploy
+        shell: bash
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.request
+
+          api_key = (os.environ.get("RENDER_API_KEY") or "").strip()
+          service_id = (os.environ.get("RENDER_SERVICE_ID") or "").strip()
+          target_commit = (os.environ.get("TARGET_COMMIT") or "").strip()
+          api_base = (os.environ.get("RENDER_API_BASE") or "https://api.render.com/v1").rstrip("/")
+
+          if not api_key:
+              raise SystemExit("Missing RENDER_API_KEY secret.")
+          if not service_id:
+              raise SystemExit("Missing RENDER_SERVICE_ID.")
+          if not target_commit:
+              raise SystemExit("Missing TARGET_COMMIT.")
+
+          deploys_url = f"{api_base}/services/{service_id}/deploys"
+          success_states = {"live"}
+          failure_states = {"build_failed", "update_failed", "canceled", "failed"}
+          terminal_states = success_states | failure_states | {"deactivated"}
+
+          def request(method: str, url: str, *, payload: dict | None = None) -> object:
+              body = None
+              headers = {"Authorization": f"Bearer {api_key}"}
+              if payload is not None:
+                  body = json.dumps(payload).encode("utf-8")
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(url, data=body, headers=headers, method=method)
+              with urllib.request.urlopen(req, timeout=30) as response:
+                  return json.loads(response.read().decode("utf-8"))
+
+          def list_deploys() -> list[dict]:
+              payload = request("GET", deploys_url)
+              if not isinstance(payload, list):
+                  raise RuntimeError("Unexpected Render deploy payload.")
+              return [item for item in payload if isinstance(item, dict)]
+
+          def match_target_deploy(deploys: list[dict]) -> dict | None:
+              for deploy in deploys:
+                  commit = deploy.get("commit") if isinstance(deploy.get("commit"), dict) else {}
+                  commit_id = str(commit.get("id") or "").strip()
+                  if commit_id == target_commit or commit_id.startswith(target_commit):
+                      return deploy
+              return None
+
+          deploy = None
+          deadline = time.time() + 120
+          while time.time() < deadline:
+              deploy = match_target_deploy(list_deploys())
+              if deploy is not None:
+                  print(f"Render already sees commit {target_commit} as deploy {deploy.get('id')}.")
+                  break
+              time.sleep(10)
+
+          if deploy is None:
+              deploy = request("POST", deploys_url, payload={})
+              print(f"Triggered fallback Render deploy {deploy.get('id')} for commit {target_commit}.")
+
+          deploy_id = str(deploy.get("id") or "").strip()
+          if not deploy_id:
+              raise SystemExit("Render did not return a deploy id.")
+
+          poll_deadline = time.time() + 900
+          while time.time() < poll_deadline:
+              deploy = match_target_deploy(list_deploys())
+              if deploy is None:
+                  print("Target deploy not visible yet; retrying...")
+                  time.sleep(10)
+                  continue
+
+              status = str(deploy.get("status") or "").strip()
+              print(f"deploy={deploy.get('id')} status={status}")
+              if status in success_states:
+                  sys.exit(0)
+              if status in failure_states:
+                  raise SystemExit(f"Render deploy failed with status={status}")
+              if status in terminal_states:
+                  raise SystemExit(f"Render deploy ended in unexpected terminal status={status}")
+              time.sleep(10)
+
+          raise SystemExit("Timed out waiting for Render deploy to finish.")
+          PY
