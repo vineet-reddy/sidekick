@@ -473,6 +473,19 @@ final class OpenAIService: ObservableObject {
         method: String,
         body: [String: Any]? = nil
     ) async throws -> Response {
+        do {
+            return try await performRequestOnce(path: path, method: method, body: body)
+        } catch ServiceError.taskFailed(let message) where message == "invalid_session_token" {
+            _ = try await github.ensureDeviceSession(forceRefresh: true)
+            return try await performRequestOnce(path: path, method: method, body: body)
+        }
+    }
+
+    private func performRequestOnce<Response: Decodable>(
+        path: String,
+        method: String,
+        body: [String: Any]? = nil
+    ) async throws -> Response {
         _ = try await github.ensureDeviceSession()
         guard let baseURL = backendBaseURL else {
             throw ServiceError.backendNotConfigured

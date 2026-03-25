@@ -384,44 +384,38 @@ struct ContentView: View {
     @State private var selectedTab: AppTab = QAFlags.shouldOpenLatestPaper ? .papers : .notes
 
     var body: some View {
-        Group {
-            if github.isConnected {
-                TabView(selection: $selectedTab) {
-                    NavigationStack {
-                        NoteListView()
-                    }
-                    .tag(AppTab.notes)
-                    .tabItem {
-                        Label("Notes", systemImage: "square.and.pencil")
-                            .accessibilityIdentifier("tab.notes")
-                    }
-                    .accessibilityIdentifier("tab.notes")
-
-                    PaperListView()
-                        .tag(AppTab.papers)
-                        .tabItem {
-                            Label("Papers", systemImage: "doc.text.magnifyingglass")
-                                .accessibilityIdentifier("tab.papers")
-                        }
-                        .accessibilityIdentifier("tab.papers")
-
-                    NavigationStack {
-                        SettingsView()
-                    }
-                    .tag(AppTab.settings)
-                    .tabItem {
-                        Label("Settings", systemImage: "gearshape")
-                            .accessibilityIdentifier("tab.settings")
-                    }
-                    .accessibilityIdentifier("tab.settings")
-                }
-                .accessibilityIdentifier("app.tabView")
-                .overlay(alignment: .bottom) {
-                    statusDot
-                }
-            } else {
-                GitHubRequiredView()
+        TabView(selection: $selectedTab) {
+            NavigationStack {
+                NoteListView()
             }
+            .tag(AppTab.notes)
+            .tabItem {
+                Label("Notes", systemImage: "square.and.pencil")
+                    .accessibilityIdentifier("tab.notes")
+            }
+            .accessibilityIdentifier("tab.notes")
+
+            PaperListView()
+                .tag(AppTab.papers)
+                .tabItem {
+                    Label("Papers", systemImage: "doc.text.magnifyingglass")
+                        .accessibilityIdentifier("tab.papers")
+                }
+                .accessibilityIdentifier("tab.papers")
+
+            NavigationStack {
+                SettingsView()
+            }
+            .tag(AppTab.settings)
+            .tabItem {
+                Label("Settings", systemImage: "gearshape")
+                    .accessibilityIdentifier("tab.settings")
+            }
+            .accessibilityIdentifier("tab.settings")
+        }
+        .accessibilityIdentifier("app.tabView")
+        .overlay(alignment: .bottom) {
+            statusDot
         }
     }
 
