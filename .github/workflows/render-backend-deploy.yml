@@ -59,11 +59,19 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as response:
                   return json.loads(response.read().decode("utf-8"))
 
+          def normalize_deploy(item: object) -> dict | None:
+              if not isinstance(item, dict):
+                  return None
+              nested = item.get("deploy")
+              if isinstance(nested, dict):
+                  return nested
+              return item
+
           def list_deploys() -> list[dict]:
               payload = request("GET", deploys_url)
               if not isinstance(payload, list):
                   raise RuntimeError("Unexpected Render deploy payload.")
-              return [item for item in payload if isinstance(item, dict)]
+              return [deploy for item in payload if (deploy := normalize_deploy(item)) is not None]
 
           def match_target_deploy(deploys: list[dict]) -> dict | None:
               for deploy in deploys:
