@@ -168,6 +168,7 @@ struct NoteListView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .contentShape(Rectangle())
         .glassCard(padding: 14)
         .accessibilityElement(children: .combine)
         .accessibilityIdentifier("note.card.\(note.id.uuidString)")

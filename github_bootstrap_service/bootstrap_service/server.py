@@ -906,16 +906,6 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
                 dataset_ids=request_payload["dataset_ids"],
             )
             request_payload["resolution"] = resolution.as_dict()
-            if resolution.paper_mode == "empirical_dataset" and resolution.status != "resolved":
-                self._send_json(
-                    HTTPStatus.UNPROCESSABLE_ENTITY,
-                    {
-                        "error": "dataset_resolution_blocked",
-                        "message": resolution.blocking_reason or resolution.summary,
-                        "resolution": resolution.as_dict(),
-                    },
-                )
-                return
             job = self.server.database.create_paper_job(
                 install_session_id=install_session["id"],
                 github_connection_id=connection["id"],
@@ -1001,14 +991,14 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
         paper_mode = str(resolution.get("paper_mode") or "").strip()
         status = str(resolution.get("status") or "").strip()
         selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else None
-        if status != "resolved":
-            return "needs_data"
         if paper_mode == "empirical_dataset":
             qualifies = bool(selected_candidate and selected_candidate.get("qualifies_as_primary_data"))
-            return "trusted_ready" if qualifies else "needs_data"
+            if status == "resolved" and qualifies:
+                return "trusted_ready"
+            return "exploratory_ready"
         if paper_mode in {"literature_review", "bibliometric"}:
             return "trusted_ready"
-        return "needs_data"
+        return "exploratory_ready" if status != "blocked" else "needs_data"
 
     def _handle_github_callback(self, parsed_url: Any) -> None:
         query = parse_qs(parsed_url.query)

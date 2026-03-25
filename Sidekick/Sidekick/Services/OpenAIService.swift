@@ -339,23 +339,17 @@ final class OpenAIService: ObservableObject {
         theme: String,
         datasetIDs: [String]
     ) async throws -> ResearchRunPreparation {
-        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
-            datasetIDs: datasetIDs,
-            noteTexts: notes.map(\.content),
-            limit: 4
-        )
-        let passthroughDatasetIDs = datasetIDs.filter { datasetID in
-            !selectedDatasets.contains(where: { $0.id == datasetID })
-        }
-        let combinedDatasetIDs = selectedDatasets.map(\.id) + passthroughDatasetIDs
+        let combinedDatasetIDs = datasetIDs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
         let registryVersion = await trustedDatasets.registryVersion()
         let connected = github.isConnected
 
         return ResearchRunPreparation(
             selectedDatasetIDs: combinedDatasetIDs,
-            allowedDomains: TrustedDatasetRegistry.allowedDomains(for: selectedDatasets),
+            allowedDomains: [],
             registryVersion: registryVersion,
-            sourceSupportTier: selectedDatasets.isEmpty ? .experimental : .supported,
+            sourceSupportTier: combinedDatasetIDs.isEmpty ? .experimental : .supported,
             schedulingDisposition: connected ? .autoStart : .hold,
             initialStatusMessage: connected
                 ? "Research queued on Sidekick-hosted compute."
@@ -375,17 +369,10 @@ final class OpenAIService: ObservableObject {
         datasetIDs: [String]
     ) async throws -> PaperTaskSubmission {
         let registryVersion = await trustedDatasets.registryVersion()
-        let selectedDatasets = await trustedDatasets.taskDatasetSelection(
-            datasetIDs: datasetIDs,
-            noteTexts: notes.map(\.content),
-            limit: 4
-        )
-        let passthroughDatasetIDs = datasetIDs.filter { datasetID in
-            !selectedDatasets.contains(where: { $0.id == datasetID })
-        }
-        let combinedDatasetIDs = selectedDatasets.map(\.id) + passthroughDatasetIDs
-        let datasetHints = selectedDatasets.map { $0.taskLine() }
-        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: selectedDatasets)
+        let combinedDatasetIDs = datasetIDs
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        let allowedDomains: [String] = []
         let response: JobCreateResponse = try await performRequest(
             path: "api/papers",
             method: "POST",
@@ -393,7 +380,7 @@ final class OpenAIService: ObservableObject {
                 "title": title,
                 "theme": theme,
                 "dataset_ids": combinedDatasetIDs,
-                "dataset_hints": datasetHints,
+                "dataset_hints": [],
                 "allowed_domains": allowedDomains,
                 "notes": notes.map {
                     [
