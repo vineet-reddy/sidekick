@@ -402,6 +402,98 @@ class ResolverTests(unittest.TestCase):
         self.assertNotIn("neurophysiology", resolution.inferred_modalities)
         self.assertNotIn("gene_expression", resolution.inferred_modalities)
 
+    def test_cancer_survival_note_prefers_tcga_cohort_over_geo_expression_series(self) -> None:
+        resolver = FakeResolver(
+            {
+                "api.gdc.cancer.gov/projects": {
+                    "data": {
+                        "hits": [
+                            {
+                                "project_id": "TCGA-GBM",
+                                "name": "Glioblastoma Multiforme",
+                                "primary_site": ["Brain"],
+                                "disease_type": ["Glioblastoma"],
+                                "summary": {"case_count": 617, "file_count": 1200},
+                            }
+                        ]
+                    }
+                },
+                "eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi": {
+                    "esearchresult": {"idlist": ["200305349"]}
+                },
+                "eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi": {
+                    "result": {
+                        "uids": ["200305349"],
+                        "200305349": {
+                            "accession": "GSE305349",
+                            "title": "Epigenetic evolution of IDHwt glioblastomas",
+                            "summary": "Glioblastoma expression profiling series.",
+                            "gdstype": "Expression profiling by high throughput sequencing",
+                            "samples": [{"sample": 1}] * 24,
+                        },
+                    }
+                },
+                "cbioportal.org/api/studies": [],
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="GBM survival by sex and IDH status",
+            theme="glioblastoma survival",
+            notes=[{"title": "GBM", "content": "Need survival outcomes stratified by sex and IDH mutation status."}],
+            dataset_hints=[],
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertIsNotNone(resolution.selected_candidate)
+        self.assertEqual(resolution.selected_candidate.family_id, "gdc_cancer_genomics")
+        self.assertEqual(resolution.selected_candidate.dataset_id, "TCGA-GBM")
+
+    def test_cancer_mutation_note_accepts_public_cbioportal_study_as_primary_data(self) -> None:
+        resolver = FakeResolver(
+            {
+                "api.gdc.cancer.gov/projects": {"data": {"hits": []}},
+                "cbioportal.org/api/studies": [
+                    {
+                        "studyId": "brca_fuscc_2020",
+                        "name": "Triple-Negative Breast Cancer (FUSCC, Cell Research 2020)",
+                        "description": "Mutation landscape of triple-negative breast cancer including BRCA carriers.",
+                        "cancerTypeId": "brca",
+                        "allSampleCount": 1,
+                        "publicStudy": True,
+                        "readPermission": True,
+                    }
+                ],
+                "eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi": {
+                    "esearchresult": {"idlist": ["200113909"]}
+                },
+                "eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi": {
+                    "result": {
+                        "uids": ["200113909"],
+                        "200113909": {
+                            "accession": "GSE113909",
+                            "title": "Myoepithelial cell perturbations in BRCA mutation carriers",
+                            "summary": "Gene expression in BRCA mutation carriers.",
+                            "gdstype": "Expression profiling by high throughput sequencing",
+                            "samples": [{"sample": 1}] * 12,
+                        },
+                    }
+                },
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="BRCA mutation landscape in triple-negative breast cancer",
+            theme="somatic mutation landscape",
+            notes=[{"title": "TNBC", "content": "Need a mutation landscape for BRCA carriers vs non-carriers."}],
+            dataset_hints=[],
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertIsNotNone(resolution.selected_candidate)
+        self.assertEqual(resolution.selected_candidate.family_id, "cbioportal_cancer_studies")
+        self.assertTrue(resolution.selected_candidate.qualifies_as_primary_data)
+
 
 if __name__ == "__main__":
     unittest.main()

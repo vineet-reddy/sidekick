@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -166,6 +166,13 @@ class SourceFamilyResolver:
                 candidates.append(candidate)
                 seen_candidates.add(key)
 
+        candidates = [
+            replace(
+                candidate,
+                score=candidate.score + self._candidate_family_bias(candidate.family_id, text),
+            )
+            for candidate in candidates
+        ]
         candidates.sort(key=lambda candidate: candidate.score, reverse=True)
 
         if paper_mode == "empirical_dataset":
@@ -345,7 +352,54 @@ class SourceFamilyResolver:
                 score += 12
             if any(phrase in text for phrase in ["not recordings", "not recording", "not eeg", "not ieeg", "not ecog"]) and "neurophysiology" in family.modalities and "clinical_cohort" not in family.modalities:
                 score -= 10
+        expression_focus = self._contains_any_phrase(
+            text,
+            ["gene expression", "transcript", "transcripts", "rna-seq", "rnaseq", "microarray", "single-cell", "single cell", "deg", "degs"],
+        )
+        cohort_or_genomics_focus = self._contains_any_phrase(
+            text,
+            [
+                "survival", "overall survival", "progression-free survival", "prognosis", "stage at diagnosis",
+                "mutation", "mutational", "copy number", "copy-number", "fusion", "fusions",
+                "tumor mutational burden", "tmb", "co-occur", "cooccur", "somatic", "carrier", "carriers",
+            ],
+        )
+        if family.id in {"gdc_cancer_genomics", "cbioportal_cancer_studies"}:
+            if cohort_or_genomics_focus:
+                score += 18
+            if expression_focus and not cohort_or_genomics_focus:
+                score -= 8
+        if family.id == "geo_functional_genomics":
+            if expression_focus:
+                score += 18
+            if cohort_or_genomics_focus and not expression_focus:
+                score -= 18
         return score
+
+    def _candidate_family_bias(self, family_id: str, text: str) -> float:
+        expression_focus = self._contains_any_phrase(
+            text,
+            ["gene expression", "transcript", "transcripts", "rna-seq", "rnaseq", "microarray", "single-cell", "single cell", "deg", "degs"],
+        )
+        cohort_or_genomics_focus = self._contains_any_phrase(
+            text,
+            [
+                "survival", "overall survival", "progression-free survival", "prognosis", "stage at diagnosis",
+                "mutation", "mutational", "copy number", "copy-number", "fusion", "fusions",
+                "tumor mutational burden", "tmb", "co-occur", "cooccur", "somatic", "carrier", "carriers",
+            ],
+        )
+        if family_id in {"gdc_cancer_genomics", "cbioportal_cancer_studies"}:
+            if cohort_or_genomics_focus:
+                return 10.0
+            if expression_focus and not cohort_or_genomics_focus:
+                return -6.0
+        if family_id == "geo_functional_genomics":
+            if expression_focus:
+                return 10.0
+            if cohort_or_genomics_focus and not expression_focus:
+                return -10.0
+        return 0.0
 
     def _search_family(
         self,
@@ -435,7 +489,7 @@ class SourceFamilyResolver:
             sample_count = int(study.get("allSampleCount") or 0)
             if match_score <= 0:
                 continue
-            qualifies = sample_count >= (family.minimum_case_count or 1)
+            qualifies = bool(study.get("publicStudy", True) and study.get("readPermission", True))
             results.append(
                 DatasetCandidate(
                     family_id=family.id,
@@ -854,8 +908,6 @@ class SourceFamilyResolver:
                 seed_queries.append("pediatric epilepsy registry")
             if "refractory" in text:
                 seed_queries.append("refractory epilepsy children dataset")
-        if "glioblastoma" in text or "gbm" in text:
-            seed_queries.append("glioblastoma gene expression")
         if any(token in text for token in ["rns", "responsive neurostimulation"]):
             seed_queries.append("epilepsy neurostimulation")
         if "autism" in text and any(token in text for token in ["prevalence", "incidence"]):
