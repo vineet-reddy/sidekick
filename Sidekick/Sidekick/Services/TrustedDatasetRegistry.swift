@@ -299,7 +299,10 @@ actor TrustedDatasetRegistry {
             return Array(resolved.prefix(limit))
         }
 
-        return shortlist(noteTexts: noteTexts, limit: limit)
+        // For paper execution, an empty selection should stay empty.
+        // A generic shortlist here silently turns trusted registry cards into fake hard constraints
+        // even when dataset discovery should broaden to the open web.
+        return []
     }
 
     static func allowedDomains(for datasets: [TrustedDataset]) -> [String] {

@@ -537,6 +537,7 @@ Return strict JSON only with this exact shape:
 Rules:
 - Do original analytic work. Do not just summarize what others have found.
 - For empirical work, use the resolved primary dataset as the required substrate. Do not replace it with literature summaries, simulations, proxy datasets, or synthetic stand-ins.
+- Preferred domains are only starting points. They are not hard restrictions. If they do not yield the needed primary dataset or measurement source, widen discovery to the open web and document the concrete source you used.
 - Save every cited artifact as a real file in the container. Do not inline binary data or giant tables into JSON.
 - Reference each saved file exactly by the filename or path you created so it can be retrieved later.
 - Before returning, ensure every `artifacts[].path` value matches a real saved container file path or basename exactly. Rename files if needed.
@@ -555,7 +556,7 @@ Rules:
             "notes": request_payload["notes"],
             "dataset_ids": request_payload.get("dataset_ids") or [],
             "dataset_hints": request_payload.get("dataset_hints") or [],
-            "allowed_domains": request_payload.get("allowed_domains") or [],
+            "preferred_domains": request_payload.get("allowed_domains") or [],
             "domain_guidance": str(request_payload.get("domain_guidance") or "").strip(),
             "resolution": resolution,
             "must_use_sources": request_payload.get("must_use_sources") or [],
@@ -592,6 +593,15 @@ Rules:
         domain_guidance = str(request_payload.get("domain_guidance") or "").strip()
         if domain_guidance:
             input_prefix_lines.extend(["", "Scientist guidance:", domain_guidance])
+        preferred_domains = [str(domain).strip() for domain in request_payload.get("allowed_domains") or [] if str(domain).strip()]
+        if preferred_domains:
+            input_prefix_lines.extend(
+                [
+                    "",
+                    "Preferred discovery starting points (suggestions only, not hard limits):",
+                    "- " + ", ".join(preferred_domains),
+                ]
+            )
         if resolution:
             input_prefix_lines.extend(
                 [
