@@ -11,6 +11,8 @@ python3 -m paperlab.cli run --notes-file prompt.txt --title "My study"
 python3 -m paperlab.cli inspect latest
 python3 -m paperlab.cli render latest
 python3 -m paperlab.cli open latest --target pdf
+python3 -m paperlab.cli render-status
+python3 -m paperlab.cli render-status --wait --commit "$(git rev-parse HEAD)"
 ```
 
 Saved run artifacts live under `paperlab/runs/<run_id>/` and include:

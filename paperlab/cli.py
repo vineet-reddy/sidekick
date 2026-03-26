@@ -5,6 +5,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
@@ -24,6 +25,12 @@ from github_bootstrap_service.bootstrap_service.resolver import SourceFamilyReso
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = REPO_ROOT / "paperlab" / "runs"
 FIXTURES_ROOT = REPO_ROOT / "paperlab" / "fixtures"
+DEFAULT_RENDER_SERVICE_ID = os.getenv("SIDEKICK_RENDER_SERVICE_ID", "srv-d70bar1r0fns73co8f9g").strip() or "srv-d70bar1r0fns73co8f9g"
+DEFAULT_RENDER_SERVICE_NAME = os.getenv("SIDEKICK_RENDER_SERVICE_NAME", "sidekick").strip() or "sidekick"
+DEFAULT_RENDER_SERVICE_URL = os.getenv("SIDEKICK_RENDER_SERVICE_URL", "https://sidekick-ion1.onrender.com").strip() or "https://sidekick-ion1.onrender.com"
+RENDER_SUCCESS_STATES = {"live"}
+RENDER_FAILURE_STATES = {"build_failed", "update_failed", "canceled", "failed"}
+RENDER_TERMINAL_STATES = RENDER_SUCCESS_STATES | RENDER_FAILURE_STATES | {"deactivated"}
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -96,6 +103,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_app_state_arguments(app_state_parser)
     app_state_parser.set_defaults(func=app_state_command)
 
+    render_status_parser = subparsers.add_parser("render-status", help="Inspect or wait on Render backend deploy status.")
+    add_render_status_arguments(render_status_parser)
+    render_status_parser.set_defaults(func=render_status_command)
+
     return parser
 
 
@@ -126,6 +137,17 @@ def add_app_state_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--bundle-id", default="com.vineet.Sidekick", help="App bundle ID. Defaults to Sidekick.")
     parser.add_argument("--device", default="booted", help="Simulator device selector for simctl. Defaults to `booted`.")
     parser.add_argument("--store-path", help="Use an explicit SwiftData store path instead of resolving via simctl.")
+    parser.add_argument("--json", action="store_true", help="Print JSON instead of the human-readable summary.")
+
+
+def add_render_status_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--service-id", default=DEFAULT_RENDER_SERVICE_ID, help="Render service id. Defaults to the Sidekick backend.")
+    parser.add_argument("--service-name", default=DEFAULT_RENDER_SERVICE_NAME, help="Display name for the Render service.")
+    parser.add_argument("--service-url", default=DEFAULT_RENDER_SERVICE_URL, help="Display URL for the Render service.")
+    parser.add_argument("--commit", help="Commit sha or prefix to match against deploys.")
+    parser.add_argument("--wait", action="store_true", help="Poll until the matched deploy reaches a terminal state.")
+    parser.add_argument("--timeout-seconds", type=int, default=300, help="Maximum time to wait when --wait is set.")
+    parser.add_argument("--poll-seconds", type=int, default=5, help="Polling interval when --wait is set.")
     parser.add_argument("--json", action="store_true", help="Print JSON instead of the human-readable summary.")
 
 
@@ -342,6 +364,38 @@ def app_state_command(args: argparse.Namespace) -> int:
     return int(completed.returncode)
 
 
+def render_status_command(args: argparse.Namespace) -> int:
+    deadline = time.monotonic() + max(1, int(args.timeout_seconds))
+    while True:
+        deploys = fetch_render_deploys(args.service_id)
+        selected = select_render_deploy(deploys, args.commit)
+        payload = build_render_status_payload(
+            deploys=deploys,
+            selected_deploy=selected,
+            service_id=str(args.service_id),
+            service_name=str(args.service_name),
+            service_url=str(args.service_url),
+            commit_ref=str(args.commit or "").strip() or None,
+        )
+
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print_render_status(payload)
+
+        if not args.wait:
+            return 0
+        if render_wait_completed(payload, commit_ref=str(args.commit or "").strip() or None):
+            return render_wait_exit_code(payload, commit_ref=str(args.commit or "").strip() or None)
+        if time.monotonic() >= deadline:
+            if not args.json:
+                print(f"Timed out after {max(1, int(args.timeout_seconds))}s.")
+            return 1
+        if not args.json:
+            print(f"Polling again in {max(1, int(args.poll_seconds))}s...")
+        time.sleep(max(1, int(args.poll_seconds)))
+
+
 def build_engine(*, runtime: "CLIRuntime", require_openai: bool = True) -> PaperPipelineEngine:
     config = build_local_config(require_openai=require_openai)
     return PaperPipelineEngine(
@@ -548,6 +602,152 @@ def last_event_summary(run_directory: Path) -> str:
     if stage and message:
         return f"{stage}: {message}"
     return message or stage or "-"
+
+
+def fetch_render_deploys(service_id: str) -> list[dict[str, Any]]:
+    try:
+        completed = subprocess.run(
+            ["render", "deploys", "list", str(service_id), "--output", "json"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError as error:
+        raise FileNotFoundError("Render CLI is not installed or not on PATH.") from error
+    except subprocess.CalledProcessError as error:
+        stderr = (error.stderr or "").strip()
+        raise ValueError(stderr or f"Failed to query Render deploys for {service_id}.") from error
+
+    try:
+        payload = json.loads(completed.stdout or "[]")
+    except json.JSONDecodeError as error:
+        raise ValueError("Render CLI returned invalid JSON for deploy status.") from error
+    if not isinstance(payload, list):
+        raise ValueError("Render CLI returned an unexpected deploy payload.")
+    return [deploy for deploy in payload if isinstance(deploy, dict)]
+
+
+def select_render_deploy(deploys: list[dict[str, Any]], commit_ref: str | None) -> dict[str, Any] | None:
+    normalized_commit = (commit_ref or "").strip()
+    if not deploys:
+        return None
+    if not normalized_commit:
+        return deploys[0]
+    for deploy in deploys:
+        commit = deploy.get("commit") if isinstance(deploy.get("commit"), dict) else {}
+        commit_id = str(commit.get("id") or "").strip()
+        if commit_id == normalized_commit or commit_id.startswith(normalized_commit):
+            return deploy
+    return None
+
+
+def build_render_status_payload(
+    *,
+    deploys: list[dict[str, Any]],
+    selected_deploy: dict[str, Any] | None,
+    service_id: str,
+    service_name: str,
+    service_url: str,
+    commit_ref: str | None,
+) -> dict[str, Any]:
+    live_deploy = next((deploy for deploy in deploys if str(deploy.get("status") or "").strip() == "live"), None)
+    return {
+        "service": {
+            "id": service_id,
+            "name": service_name,
+            "url": service_url,
+        },
+        "commit_ref": commit_ref,
+        "matched": selected_deploy is not None,
+        "selected_deploy": summarize_render_deploy(selected_deploy),
+        "live_deploy": summarize_render_deploy(live_deploy),
+        "recent_deploys": [summarize_render_deploy(deploy) for deploy in deploys[:5]],
+    }
+
+
+def summarize_render_deploy(deploy: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not isinstance(deploy, dict):
+        return None
+    commit = deploy.get("commit") if isinstance(deploy.get("commit"), dict) else {}
+    return {
+        "id": str(deploy.get("id") or "").strip() or None,
+        "status": str(deploy.get("status") or "").strip() or None,
+        "trigger": str(deploy.get("trigger") or "").strip() or None,
+        "created_at": str(deploy.get("createdAt") or "").strip() or None,
+        "started_at": str(deploy.get("startedAt") or "").strip() or None,
+        "finished_at": str(deploy.get("finishedAt") or "").strip() or None,
+        "updated_at": str(deploy.get("updatedAt") or "").strip() or None,
+        "commit_id": str(commit.get("id") or "").strip() or None,
+        "commit_message": str(commit.get("message") or "").strip() or None,
+    }
+
+
+def print_render_status(payload: dict[str, Any]) -> None:
+    service = payload.get("service") if isinstance(payload.get("service"), dict) else {}
+    print(f"service: {service.get('name')} ({service.get('id')})")
+    print(f"url: {service.get('url')}")
+    commit_ref = payload.get("commit_ref")
+    if commit_ref:
+        print(f"commit_ref: {commit_ref}")
+
+    selected = payload.get("selected_deploy") if isinstance(payload.get("selected_deploy"), dict) else None
+    if selected:
+        print("selected:")
+        print(f"  id: {selected.get('id')}")
+        print(f"  status: {selected.get('status')}")
+        print(f"  commit: {selected.get('commit_id')}")
+        print(f"  message: {selected.get('commit_message')}")
+        print(f"  updated_at: {selected.get('updated_at')}")
+    elif commit_ref:
+        print("selected: no deploy matched that commit yet")
+    else:
+        print("selected: no deploys found")
+
+    live = payload.get("live_deploy") if isinstance(payload.get("live_deploy"), dict) else None
+    if live:
+        print("live:")
+        print(f"  id: {live.get('id')}")
+        print(f"  commit: {live.get('commit_id')}")
+        print(f"  message: {live.get('commit_message')}")
+        print(f"  updated_at: {live.get('updated_at')}")
+
+    recent = payload.get("recent_deploys") if isinstance(payload.get("recent_deploys"), list) else []
+    if recent:
+        print("recent:")
+        for deploy in recent:
+            if not isinstance(deploy, dict):
+                continue
+            print(
+                "  "
+                + " | ".join(
+                    [
+                        str(deploy.get("status") or "-"),
+                        str(deploy.get("id") or "-"),
+                        str(deploy.get("commit_id") or "-"),
+                        str(deploy.get("updated_at") or "-"),
+                    ]
+                )
+            )
+
+
+def render_wait_completed(payload: dict[str, Any], *, commit_ref: str | None) -> bool:
+    selected = payload.get("selected_deploy") if isinstance(payload.get("selected_deploy"), dict) else None
+    if commit_ref and selected is None:
+        return False
+    status = str((selected or {}).get("status") or "").strip()
+    if not status:
+        return False
+    return status in RENDER_TERMINAL_STATES
+
+
+def render_wait_exit_code(payload: dict[str, Any], *, commit_ref: str | None) -> int:
+    selected = payload.get("selected_deploy") if isinstance(payload.get("selected_deploy"), dict) else None
+    status = str((selected or {}).get("status") or "").strip()
+    if commit_ref and selected is None:
+        return 1
+    if status in RENDER_SUCCESS_STATES:
+        return 0
+    return 1
 
 
 class CLIRuntime:

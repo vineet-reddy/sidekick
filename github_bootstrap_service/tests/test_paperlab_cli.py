@@ -1,4 +1,6 @@
+import json
 import pathlib
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -138,6 +140,109 @@ class PaperlabCLITests(unittest.TestCase):
 
             self.assertEqual(exit_code, 0)
             self.assertTrue((run_dir / "paper.pdf").exists())
+
+    def test_render_status_prefers_commit_match(self) -> None:
+        deploys = [
+            {
+                "id": "dep-live",
+                "status": "live",
+                "updatedAt": "2026-03-25T08:00:00Z",
+                "commit": {"id": "abc123456789", "message": "new backend"},
+            },
+            {
+                "id": "dep-old",
+                "status": "deactivated",
+                "updatedAt": "2026-03-25T07:00:00Z",
+                "commit": {"id": "def987654321", "message": "old backend"},
+            },
+        ]
+
+        selected = cli.select_render_deploy(deploys, "def987")
+
+        self.assertIsNotNone(selected)
+        self.assertEqual(selected["id"], "dep-old")
+
+    def test_render_status_waits_for_commit_to_turn_live(self) -> None:
+        deploy_payload = json.dumps(
+            [
+                {
+                    "id": "dep-build",
+                    "status": "build_in_progress",
+                    "updatedAt": "2026-03-25T08:00:00Z",
+                    "commit": {"id": "abc123456789", "message": "new backend"},
+                }
+            ]
+        )
+        live_payload = json.dumps(
+            [
+                {
+                    "id": "dep-build",
+                    "status": "live",
+                    "updatedAt": "2026-03-25T08:03:00Z",
+                    "commit": {"id": "abc123456789", "message": "new backend"},
+                }
+            ]
+        )
+
+        responses = [
+            subprocess.CompletedProcess(args=["render"], returncode=0, stdout=deploy_payload, stderr=""),
+            subprocess.CompletedProcess(args=["render"], returncode=0, stdout=live_payload, stderr=""),
+        ]
+
+        with patch("paperlab.cli.subprocess.run", side_effect=responses), patch("paperlab.cli.time.sleep", return_value=None):
+            exit_code = cli.main(
+                [
+                    "render-status",
+                    "--service-id",
+                    "srv-test",
+                    "--service-name",
+                    "test-service",
+                    "--service-url",
+                    "https://example.com",
+                    "--commit",
+                    "abc123",
+                    "--wait",
+                    "--timeout-seconds",
+                    "30",
+                    "--poll-seconds",
+                    "1",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+
+    def test_render_status_returns_failure_for_failed_commit(self) -> None:
+        failed_payload = json.dumps(
+            [
+                {
+                    "id": "dep-failed",
+                    "status": "build_failed",
+                    "updatedAt": "2026-03-25T08:01:00Z",
+                    "commit": {"id": "abc123456789", "message": "broken backend"},
+                }
+            ]
+        )
+
+        with patch(
+            "paperlab.cli.subprocess.run",
+            return_value=subprocess.CompletedProcess(args=["render"], returncode=0, stdout=failed_payload, stderr=""),
+        ):
+            exit_code = cli.main(
+                [
+                    "render-status",
+                    "--service-id",
+                    "srv-test",
+                    "--service-name",
+                    "test-service",
+                    "--service-url",
+                    "https://example.com",
+                    "--commit",
+                    "abc123",
+                    "--wait",
+                ]
+            )
+
+        self.assertEqual(exit_code, 1)
 
 
 if __name__ == "__main__":
