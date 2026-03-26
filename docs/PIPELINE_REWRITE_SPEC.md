@@ -253,6 +253,193 @@ Push the following to the repo:
 
 ---
 
+## CLI Observability & Agent-Friendly Debugging
+
+### Context
+
+Coding agents running in a terminal are the ones building, operating, and debugging this pipeline. Every design decision in this section optimizes for that: the CLI must give a terminal-based agent (or a human) complete, real-time insight into what every stage is doing, what every LLM call is returning, and what went wrong when something fails. The feedback loop between "run the pipeline" and "understand what happened" must be as tight as possible.
+
+### Design Principles
+
+1. **The CLI is the primary interface.** There is no dashboard, no web UI. Everything — launching a run, inspecting progress, reading logs, replaying LLM calls — must be doable from a single terminal session via CLI commands.
+
+2. **Agents are first-class operators.** Assume the caller is a coding agent, not a human. That means: structured output by default (JSON), parseable exit codes, no interactive prompts, no color-code-only information. Human-readable formatting is a flag (`--pretty`), not the default.
+
+3. **Full observability at every granularity.** The CLI must support zooming from high-level ("which stage is running?") all the way down to low-level ("what tokens is the LLM streaming right now for this specific call?").
+
+### CLI Command Surface
+
+The following commands (or subcommands of a top-level CLI) must exist:
+
+#### Run & Status
+
+| Command | Description |
+|---------|-------------|
+| `sidekick run <note>` | Start a pipeline run. Returns a run ID immediately. |
+| `sidekick status <run-id>` | Show current stage, sub-step, elapsed time, and whether the run is healthy/stalled/failed. |
+| `sidekick status <run-id> --watch` | Continuously poll and stream status updates (like `tail -f` for pipeline state). |
+| `sidekick list` | List all runs (active, completed, failed) with their run IDs and current status. |
+| `sidekick cancel <run-id>` | Cancel a running pipeline. |
+
+#### Logs
+
+| Command | Description |
+|---------|-------------|
+| `sidekick logs <run-id>` | Dump all logs for a run (all stages, chronological). |
+| `sidekick logs <run-id> --stage <N>` | Filter logs to a specific stage (1, 2, 2.5, 3, 4). |
+| `sidekick logs <run-id> --level <level>` | Filter by log level: `debug`, `info`, `warn`, `error`. |
+| `sidekick logs <run-id> --follow` | Stream logs in real time as the run progresses. |
+| `sidekick logs <run-id> --since <timestamp>` | Show logs after a given timestamp. |
+| `sidekick logs <run-id> --tail <N>` | Show the last N log lines. |
+| `sidekick logs <run-id> --json` | Output logs as newline-delimited JSON (for agent consumption). |
+
+Logging toggle at runtime:
+
+| Command | Description |
+|---------|-------------|
+| `sidekick log-level <run-id> set debug` | Dynamically change the log verbosity of a running pipeline without restarting it. |
+| `sidekick log-level <run-id> get` | Show the current log level for a running pipeline. |
+
+#### LLM Call Inspection
+
+Every LLM API call made during the pipeline must be logged and inspectable after the fact. This is critical for debugging prompt issues, understanding model behavior, and iterating on the pipeline.
+
+| Command | Description |
+|---------|-------------|
+| `sidekick calls <run-id>` | List all LLM calls made during a run (stage, model, token count, latency, status). |
+| `sidekick calls <run-id> --stage <N>` | Filter to calls from a specific stage. |
+| `sidekick call <run-id> <call-id>` | Show full detail for a single LLM call: prompt, response, model, parameters, token usage, latency. |
+| `sidekick call <run-id> <call-id> --prompt` | Show only the prompt sent. |
+| `sidekick call <run-id> <call-id> --response` | Show only the response received. |
+
+#### LLM Streaming
+
+When an LLM call is in progress, the CLI must be able to stream the response tokens as they arrive. This is essential for agents that need to monitor long-running model calls (especially the data analyst and paper writer stages which use medium-thinking GPT 5.4).
+
+| Command | Description |
+|---------|-------------|
+| `sidekick stream <run-id>` | Attach to the currently active LLM call and stream its response tokens to stdout in real time. |
+| `sidekick stream <run-id> --stage <N>` | Attach to the active LLM call for a specific stage. |
+| `sidekick stream <run-id> --raw` | Stream raw delta tokens (for agent parsing) instead of assembled text. |
+
+Implementation note: The backend must use server-sent events (SSE) or a similar mechanism so that the CLI can consume streaming responses without polling. When calling the OpenAI API, always use `stream: true` and forward the stream to a local event bus that the CLI can tap into.
+
+#### Artifacts
+
+| Command | Description |
+|---------|-------------|
+| `sidekick artifacts <run-id>` | List all artifacts produced by a run (datasets, code files, figures, LaTeX, markdown summaries). |
+| `sidekick artifact <run-id> <artifact-id>` | Dump the contents of a specific artifact to stdout. |
+| `sidekick artifacts <run-id> --stage <N>` | Filter artifacts to a specific stage. |
+| `sidekick artifacts <run-id> --download <dir>` | Download all artifacts to a local directory. |
+
+#### Retry & Feedback Inspection
+
+Since Stage 2/2.5 has a feedback loop, the CLI must make the retry history fully transparent:
+
+| Command | Description |
+|---------|-------------|
+| `sidekick retries <run-id>` | Show retry history: how many attempts, what feedback was given at each iteration, what changed. |
+| `sidekick retries <run-id> --attempt <N>` | Show detail for a specific attempt (the validation feedback, the data analyst's output, pass/fail result). |
+
+### Logging Architecture
+
+#### What Gets Logged
+
+Every log entry must include:
+- **Timestamp** (ISO 8601, UTC)
+- **Run ID**
+- **Stage** (1, 2, 2.5, 3, 4)
+- **Agent** (e.g., `search-a`, `search-b`, `search-c`, `data-analyst`, `validation`, `paper-writer`, `github-push`)
+- **Level** (`debug`, `info`, `warn`, `error`)
+- **Message** (human-readable string)
+- **Structured metadata** (JSON blob with stage-specific context — e.g., model name, token count, call ID, artifact path, retry attempt number)
+
+#### Log Levels — What Goes Where
+
+| Level | Content |
+|-------|---------|
+| `error` | Pipeline failures, LLM API errors, hard stops, unrecoverable exceptions. |
+| `warn` | Validation gate failures (before retry), agent fallbacks (A/B fail → spawn C), rate limits, timeouts that were retried. |
+| `info` | Stage transitions, agent spawns, LLM calls initiated/completed (summary: model + tokens + latency), artifacts produced, dataset found, retry triggered. |
+| `debug` | Full LLM prompts and responses, raw API payloads, intermediate agent reasoning, compute sandbox commands executed, download progress. |
+
+Default log level for a run: `info`. Agents building the pipeline should set `debug` during development.
+
+#### Log Storage
+
+- Logs are written to a local log directory per run: `~/.sidekick/runs/<run-id>/logs/`
+- Each stage writes to its own log file: `stage-1.log`, `stage-2.log`, `stage-2.5.log`, `stage-3.log`, `stage-4.log`
+- A combined chronological log also exists: `combined.log`
+- All log files are newline-delimited JSON (one JSON object per line) so they're trivially parseable by agents
+- LLM call details (full prompts/responses) are stored separately: `~/.sidekick/runs/<run-id>/calls/<call-id>.json`
+
+#### Real-Time Log Streaming
+
+Logs must be streamable in real time, not just readable after the fact. Implementation:
+- Each stage writes logs to a file AND publishes them to a local event bus (Unix domain socket or named pipe)
+- `sidekick logs --follow` subscribes to this event bus
+- If no subscriber is attached, logs still persist to disk — no data loss
+
+### Structured Pipeline Events
+
+Beyond free-text logs, the pipeline must emit structured events at key moments. These are the "state machine transitions" that let an agent know exactly what's happening:
+
+```
+PIPELINE_STARTED        { run_id, note, timestamp }
+STAGE_STARTED           { run_id, stage, agent, model, timestamp }
+STAGE_COMPLETED         { run_id, stage, duration_ms, artifacts[], timestamp }
+STAGE_FAILED            { run_id, stage, reason, retries_remaining, timestamp }
+LLM_CALL_STARTED        { run_id, stage, call_id, model, prompt_tokens, timestamp }
+LLM_CALL_STREAMING      { run_id, stage, call_id, delta_token, timestamp }
+LLM_CALL_COMPLETED      { run_id, stage, call_id, response_tokens, total_tokens, latency_ms, timestamp }
+LLM_CALL_FAILED         { run_id, stage, call_id, error, timestamp }
+VALIDATION_PASSED       { run_id, attempt, timestamp }
+VALIDATION_FAILED       { run_id, attempt, feedback_message, retries_remaining, timestamp }
+RETRY_STARTED           { run_id, stage, attempt, feedback_from_previous, timestamp }
+ARTIFACT_PRODUCED       { run_id, stage, artifact_type, artifact_path, timestamp }
+PIPELINE_COMPLETED      { run_id, total_duration_ms, timestamp }
+PIPELINE_FAILED         { run_id, stage_failed_at, reason, timestamp }
+```
+
+These events are:
+1. Written to `~/.sidekick/runs/<run-id>/events.jsonl`
+2. Published to the same event bus as logs (so `--follow` captures them)
+3. Accessible via `sidekick events <run-id>` (with same filtering flags as `sidekick logs`)
+
+### Exit Codes
+
+The CLI must use meaningful exit codes so agents can branch on outcomes without parsing text:
+
+| Code | Meaning |
+|------|---------|
+| 0 | Pipeline completed successfully. |
+| 1 | Pipeline failed — no dataset found (Stage 1). |
+| 2 | Pipeline failed — validation gate exhausted retries (Stage 2.5). |
+| 3 | Pipeline failed — paper writing error (Stage 3). |
+| 4 | Pipeline failed — GitHub push error (Stage 4). |
+| 10 | Pipeline cancelled by user/agent. |
+| 20 | Internal error (unexpected crash, API auth failure, etc.). |
+
+### Configuration via CLI
+
+| Command | Description |
+|---------|-------------|
+| `sidekick config set log-level debug` | Set default log level for all future runs. |
+| `sidekick config set log-retention 30d` | Set how long run logs are retained before auto-cleanup. |
+| `sidekick config set stream-buffer-size 1000` | Configure how many streaming tokens to buffer before flushing. |
+| `sidekick config get <key>` | Read a config value. |
+| `sidekick config list` | List all config values. |
+
+### Design Notes
+
+- **No interactivity.** Every command runs and returns. No TUI, no curses, no "press enter to continue." Coding agents can't interact with prompts.
+- **Idempotent reads.** All `status`, `logs`, `calls`, `artifacts`, `retries`, and `events` commands are pure reads with no side effects. An agent can call them as often as it wants.
+- **Composability.** All commands that output data support `--json` for structured output. Agents can pipe CLI output into their own tooling.
+- **Offline-safe log access.** Once a run is complete, all its logs, events, calls, and artifacts are on local disk. An agent can inspect a run's full history without any backend connectivity.
+
+---
+
 ## Key Principles
 
 1. **Simplicity over cleverness.** This pipeline should be simple and linear. The only parallelism is in Stage 1 (Agents A and B searching simultaneously). The only loop is between Stage 2 and 2.5 (data analyst retries based on validation feedback). Everything else is sequential handoff.
@@ -266,6 +453,10 @@ Push the following to the repo:
 5. **Figure interpretations in markdown, not vision.** Every figure must have a plain-text markdown description so that the paper writer agent never needs to "look at" an image. This keeps things simple and reliable.
 
 6. **Always output the simplest possible implementation first.** Do not over-engineer. Get the linear pipeline working, then optimize.
+
+7. **The CLI is the cockpit.** Coding agents running in a terminal are the primary operators of this pipeline. Every pipeline state transition, every LLM call, every artifact, and every failure must be observable through CLI commands with structured JSON output. If an agent can't figure out what happened from the CLI alone, the observability is insufficient.
+
+8. **Logging is not an afterthought.** Logs, structured events, and LLM call tracing are first-class features, not debug aids bolted on later. They ship with v1 of the pipeline, not v2.
 
 ---
 
