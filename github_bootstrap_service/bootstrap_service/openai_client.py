@@ -90,7 +90,7 @@ class OpenAIClient:
         if tools:
             payload["tools"] = tools
 
-        if on_delta is not None or on_event is not None:
+        if (on_delta is not None or on_event is not None) and not use_code_interpreter:
             return self._generate_streaming_response(
                 payload=payload,
                 timeout_seconds=timeout_seconds,

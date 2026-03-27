@@ -20,6 +20,46 @@ def _config() -> BootstrapServiceConfig:
 
 
 class OpenAIClientTests(unittest.TestCase):
+    def test_code_interpreter_calls_use_background_polling_even_with_callbacks(self) -> None:
+        class StubOpenAIClient(OpenAIClient):
+            def __init__(self) -> None:
+                super().__init__(_config())
+                self.requests: list[tuple[str, str]] = []
+
+            def _generate_streaming_response(self, **_: object) -> OpenAIResponseResult:
+                raise AssertionError("streaming path should not be used for code-interpreter calls")
+
+            def _request_json(self, method: str, path: str, body: dict[str, object] | None) -> dict[str, object]:
+                self.requests.append((method, path))
+                if (method, path) == ("POST", "/responses"):
+                    return {
+                        "id": "resp_123",
+                        "status": "queued",
+                    }
+                if (method, path) == ("GET", "/responses/resp_123"):
+                    return {
+                        "id": "resp_123",
+                        "status": "completed",
+                        "output_text": "{\"ok\": true}",
+                        "usage": {"input_tokens": 11, "output_tokens": 7},
+                    }
+                raise AssertionError(f"Unexpected request: {(method, path)}")
+
+        client = StubOpenAIClient()
+        result = client.generate_json(
+            instructions="Return JSON.",
+            input_text="{}",
+            use_code_interpreter=True,
+            use_web_search=False,
+            timeout_seconds=11,
+            on_delta=lambda _: None,
+            on_event=lambda _: None,
+        )
+
+        self.assertEqual(result.response_id, "resp_123")
+        self.assertEqual(result.output_text, "{\"ok\": true}")
+        self.assertEqual(client.requests, [("POST", "/responses"), ("GET", "/responses/resp_123")])
+
     def test_extracts_container_file_citations_from_output_annotations(self) -> None:
         client = OpenAIClient(_config())
         text = '{"artifacts":[{"path":"artifacts/table_1.csv"}]}'
