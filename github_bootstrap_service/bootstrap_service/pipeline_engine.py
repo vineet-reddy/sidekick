@@ -504,6 +504,12 @@ Rules:
     def _persist_resolved_stage_one_search(self, *, run_id: str, search: dict[str, Any]) -> None:
         store = self._run_store(run_id)
         store.set_stage(stage="1", agent="resolver", model="resolver")
+        self._emit_status(
+            run_id,
+            stage="1",
+            progress_message="resolver selected the dataset from the trusted source resolver.",
+            status="running",
+        )
         write_json_file(self.run_directory(run_id) / "stage1.json", search)
         store.record_artifact(
             stage="1",
@@ -1257,6 +1263,12 @@ Rules:
                 "timeout_seconds": timeout_seconds,
                 "reasoning_effort": reasoning_effort,
             },
+        )
+        self._emit_status(
+            run_id,
+            stage=stage,
+            progress_message=f"{agent} started.",
+            status="running",
         )
         started_ms = store.elapsed_ms()
         try:
