@@ -158,6 +158,51 @@ class ResolverTests(unittest.TestCase):
         self.assertEqual(resolution.selected_candidate.dataset_id, "zenodo:14676310")
         self.assertTrue(resolution.selected_candidate.title.startswith("Data for: Changes"))
 
+    def test_explicit_dataset_id_short_circuits_family_search(self) -> None:
+        class StrictExplicitResolver(FakeResolver):
+            def _request_json(
+                self,
+                url: str,
+                *,
+                method: str = "GET",
+                body: dict[str, Any] | None = None,
+            ) -> Any:
+                if "zenodo.org/api/records?q=" in url:
+                    raise AssertionError("fuzzy Zenodo search should not run when dataset_ids are explicit")
+                return super()._request_json(url, method=method, body=body)
+
+        resolver = StrictExplicitResolver(
+            {
+                "zenodo.org/api/records/14676310": {
+                    "id": 14676310,
+                    "doi_url": "https://doi.org/10.5281/zenodo.14676310",
+                    "metadata": {
+                        "title": "Data for: Changes in the prevalence of autism spectrum disorder among fee-for-service Medicare beneficiaries, 2007-2018",
+                        "description": "Administrative prevalence dataset for autism.",
+                        "access_right": "open",
+                    },
+                    "files": [
+                        {
+                            "key": "autism-prevalence.zip",
+                            "links": {"self": "https://zenodo.org/api/records/14676310/files/autism-prevalence.zip/content"},
+                        }
+                    ],
+                }
+            }
+        )
+
+        resolution = resolver.resolve(
+            title="Autism prevalence follow-up",
+            theme="Use the already selected prevalence dataset",
+            notes=[{"title": "Autism", "content": "Use the explicit dataset that was selected upstream."}],
+            dataset_hints=[],
+            dataset_ids=["zenodo:14676310"],
+        )
+
+        self.assertEqual(resolution.status, "resolved")
+        self.assertIsNotNone(resolution.selected_candidate)
+        self.assertEqual(resolution.selected_candidate.dataset_id, "zenodo:14676310")
+
     def test_falls_back_to_dataverse_for_niche_empirical_note(self) -> None:
         resolver = FakeResolver(
             {

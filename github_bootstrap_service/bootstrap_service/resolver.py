@@ -157,6 +157,15 @@ class SourceFamilyResolver:
             text=text,
             dataset_hints=dataset_hints,
         )
+        if candidates:
+            return self._resolution_from_candidates(
+                paper_mode=paper_mode,
+                inferred_modalities=inferred_modalities,
+                acceptable_units=acceptable_units,
+                forbidden_primary_family_ids=mode_spec.forbidden_primary_family_ids,
+                candidates=candidates,
+                skip_family_bias=True,
+            )
         seen_candidates = {(candidate.family_id, candidate.dataset_id) for candidate in candidates}
         for family in ranked_families[:10]:
             for candidate in self._search_family(family, text, dataset_hints):
@@ -173,20 +182,39 @@ class SourceFamilyResolver:
             )
             for candidate in candidates
         ]
-        candidates.sort(key=lambda candidate: candidate.score, reverse=True)
+        return self._resolution_from_candidates(
+            paper_mode=paper_mode,
+            inferred_modalities=inferred_modalities,
+            acceptable_units=acceptable_units,
+            forbidden_primary_family_ids=mode_spec.forbidden_primary_family_ids,
+            candidates=candidates,
+        )
+
+    def _resolution_from_candidates(
+        self,
+        *,
+        paper_mode: str,
+        inferred_modalities: list[str],
+        acceptable_units: list[str],
+        forbidden_primary_family_ids: list[str],
+        candidates: list[DatasetCandidate],
+        skip_family_bias: bool = False,
+    ) -> ResolutionBundle:
+        ranked_candidates = candidates if skip_family_bias else list(candidates)
+        ranked_candidates.sort(key=lambda candidate: candidate.score, reverse=True)
 
         if paper_mode == "empirical_dataset":
-            candidates = [
-                candidate for candidate in candidates
-                if candidate.family_id not in mode_spec.forbidden_primary_family_ids
+            ranked_candidates = [
+                candidate for candidate in ranked_candidates
+                if candidate.family_id not in forbidden_primary_family_ids
             ]
-            qualifying = [candidate for candidate in candidates if candidate.qualifies_as_primary_data]
+            qualifying = [candidate for candidate in ranked_candidates if candidate.qualifies_as_primary_data]
             if not qualifying:
                 return ResolutionBundle(
                     paper_mode=paper_mode,
                     inferred_modalities=inferred_modalities,
                     acceptable_units=acceptable_units,
-                    incompatible_primary_family_ids=mode_spec.forbidden_primary_family_ids,
+                    incompatible_primary_family_ids=forbidden_primary_family_ids,
                     status="blocked",
                     summary="No qualifying open empirical dataset was resolved from the trusted source families.",
                     blocking_reason=(
@@ -194,28 +222,28 @@ class SourceFamilyResolver:
                         "The run should block before manuscript writing rather than invent synthetic evidence."
                     ),
                     selected_candidate=None,
-                    candidates=candidates[:8],
+                    candidates=ranked_candidates[:8],
                 )
             selected = qualifying[0]
             return ResolutionBundle(
                 paper_mode=paper_mode,
                 inferred_modalities=inferred_modalities,
                 acceptable_units=acceptable_units,
-                incompatible_primary_family_ids=mode_spec.forbidden_primary_family_ids,
+                incompatible_primary_family_ids=forbidden_primary_family_ids,
                 status="resolved",
                 summary=f"Selected {selected.title} from {selected.family_label} as the primary empirical source.",
                 blocking_reason=None,
                 selected_candidate=selected,
-                candidates=candidates[:8],
+                candidates=ranked_candidates[:8],
             )
 
-        selected = candidates[0] if candidates else None
+        selected = ranked_candidates[0] if ranked_candidates else None
         if selected is None:
             return ResolutionBundle(
                 paper_mode=paper_mode,
                 inferred_modalities=inferred_modalities,
                 acceptable_units=acceptable_units,
-                incompatible_primary_family_ids=mode_spec.forbidden_primary_family_ids,
+                incompatible_primary_family_ids=forbidden_primary_family_ids,
                 status="blocked",
                 summary="No compatible source family could be resolved for this note.",
                 blocking_reason="No compatible source family could be resolved for this note.",
@@ -227,12 +255,12 @@ class SourceFamilyResolver:
             paper_mode=paper_mode,
             inferred_modalities=inferred_modalities,
             acceptable_units=acceptable_units,
-            incompatible_primary_family_ids=mode_spec.forbidden_primary_family_ids,
+            incompatible_primary_family_ids=forbidden_primary_family_ids,
             status="resolved",
             summary=f"Selected {selected.title} from {selected.family_label}.",
             blocking_reason=None,
             selected_candidate=selected,
-            candidates=candidates[:8],
+            candidates=ranked_candidates[:8],
         )
 
     def _classify_paper_mode(self, text: str) -> str:
