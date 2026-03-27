@@ -1,6 +1,7 @@
 import pathlib
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -177,6 +178,30 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertEqual([file.file_id for file in files], ["cfile_1", "cfile_2"])
         self.assertEqual(files[0].filename, "table_1.csv")
         self.assertEqual(files[1].mime_type, "image/png")
+
+    def test_request_retries_transient_get_connection_reset(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: bytes) -> None:
+                self._payload = payload
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        client = OpenAIClient(_config())
+
+        with patch("bootstrap_service.openai_client.urlopen", side_effect=[ConnectionResetError(104, "Connection reset by peer"), FakeResponse(b'{"ok": true}')]), patch(
+            "bootstrap_service.openai_client.time.sleep",
+            return_value=None,
+        ):
+            payload = client._request_json("GET", "/responses/resp_123", None)
+
+        self.assertEqual(payload, {"ok": True})
 
 
 if __name__ == "__main__":

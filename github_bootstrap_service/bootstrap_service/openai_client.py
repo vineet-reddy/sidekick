@@ -49,6 +49,8 @@ class OpenAIResponseResult:
 class OpenAIClient:
     def __init__(self, config: BootstrapServiceConfig):
         self._config = config
+        self._transient_get_retry_count = 4
+        self._transient_retry_delay_seconds = 1.5
 
     def generate_json(
         self,
@@ -383,15 +385,36 @@ class OpenAIClient:
             data = json.dumps(body).encode("utf-8")
 
         request = Request(url=url, data=data, headers=headers, method=method)
-
-        try:
-            with urlopen(request, timeout=60) as response:
-                payload = response.read()
-        except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise OpenAIClientError(f"OpenAI request failed with HTTP {error.code}: {detail}") from error
-        except URLError as error:
-            raise OpenAIClientError(f"OpenAI request failed: {error.reason}") from error
+        attempts = self._transient_get_retry_count if method.upper() == "GET" else 1
+        last_error: Exception | None = None
+        payload: bytes | None = None
+        for attempt in range(1, attempts + 1):
+            try:
+                with urlopen(request, timeout=60) as response:
+                    payload = response.read()
+                last_error = None
+                break
+            except HTTPError as error:
+                if method.upper() == "GET" and self._is_retryable_http_error(error) and attempt < attempts:
+                    last_error = error
+                    time.sleep(self._transient_retry_delay_seconds * attempt)
+                    continue
+                detail = error.read().decode("utf-8", errors="replace")
+                raise OpenAIClientError(f"OpenAI request failed with HTTP {error.code}: {detail}") from error
+            except URLError as error:
+                if method.upper() == "GET" and attempt < attempts:
+                    last_error = error
+                    time.sleep(self._transient_retry_delay_seconds * attempt)
+                    continue
+                raise OpenAIClientError(f"OpenAI request failed: {error.reason}") from error
+            except (ConnectionResetError, TimeoutError, OSError) as error:
+                if method.upper() == "GET" and attempt < attempts:
+                    last_error = error
+                    time.sleep(self._transient_retry_delay_seconds * attempt)
+                    continue
+                raise OpenAIClientError(f"OpenAI request failed: {error}") from error
+        if payload is None:
+            raise OpenAIClientError(f"OpenAI request failed: {last_error or 'unknown error'}")
 
         if not expect_json:
             return payload
@@ -403,6 +426,9 @@ class OpenAIClient:
         except json.JSONDecodeError as error:
             raise OpenAIClientError("OpenAI returned invalid JSON.") from error
         return decoded
+
+    def _is_retryable_http_error(self, error: HTTPError) -> bool:
+        return int(getattr(error, "code", 0) or 0) in {408, 409, 429, 500, 502, 503, 504}
 
     def _output_text(self, payload: dict[str, Any]) -> str:
         direct_text = payload.get("output_text")
