@@ -122,7 +122,8 @@ Download the dataset, run experiments, and produce reproducible code and figures
 ### Access Requirements
 - Compute sandbox: **YES** (this is critical — needs a backend compute/storage box)
   - Note: The GPT 5.4 API already supports this via a specific function call or parameter that provisions a compute storage box. Use whatever is already in the codebase for this.
-- Internet access: **YES** (so it can research what experiments have already been done and avoid redundant/random experiments)
+- Internet access: **YES for profiling/planning, optional for execution**
+  - The heavy execution substep should not wander back into open-ended web research unless the execution plan explicitly requires it.
 
 ### Generic Research Protocol
 Stage 2 must use a bounded handoff workflow, similar to how frontier coding models handle large code changes:
@@ -134,7 +135,7 @@ Stage 2 must use a bounded handoff workflow, similar to how frontier coding mode
 This is a workflow constraint, not a science constraint. The protocol is generic; the experiments remain dataset-specific and question-specific.
 
 ### Behavior
-Stage 2 consists of three generic substeps inside the same stage:
+Stage 2 consists of four generic substeps inside the same stage:
 
 #### Stage 2A — Dataset Profiler
 1. Download the dataset (or a relevant subset if the dataset is very large) onto the compute box.
@@ -171,16 +172,36 @@ Important:
 1. Re-acquire the dataset or subset if needed inside the compute sandbox.
 2. Execute the selected experiments.
 3. Save real reproducible artifacts.
-4. Produce:
+4. Produce a bounded execution handoff rather than a full paper ledger:
    - **Executable code** for all experiments (must be reproducible)
    - **Figures** (charts, plots, visualizations)
    - **Figure summaries in plain markdown** — for each figure, write a text description of what the figure shows. This is important: downstream agents should NOT need to use vision/image capabilities to understand the results. The markdown descriptions are the source of truth.
    - findings / limitations / provenance
+   - saved artifact paths
+
+This execution call should stay focused on doing the work and writing files, not on packaging the entire final ledger shape.
 
 If an experiment fails:
 - say so explicitly
 - pivot once to another reasonable experiment on the same dataset
 - do not fabricate success
+
+#### Stage 2D — Research Packager
+1. Read the execution handoff from Stage 2C.
+2. Read the actual workspace file inventory.
+3. Assemble the bounded ledger consumed by Stage 3.
+
+Output:
+- normalized artifact manifest
+- source list
+- figure summaries
+- results ledger
+- short code summary
+
+Important:
+- The packager does not do new science.
+- The packager does not invent files that are not present in the workspace.
+- This substep exists to keep the heavy compute run small and the handoff deterministic.
 
 ### Output (handed off to Stage 3)
 - All experiment code
@@ -194,9 +215,12 @@ The determinism comes from the handoff protocol, not from hardcoded experiment r
 Stage 2 should pass structured state via bounded files rather than one giant fragile blob:
 - `stage2_profile.json`
 - `stage2_plan.json`
+- `stage2_execution.json`
 - `ledger.json`
 
 The backend should be tolerant to structured-output formatting quirks. Perfect JSON is ideal, but a Python-dict-style structured object is an acceptable fallback when needed. The goal is robust handoff, not serialization purism.
+
+The design principle is the same one frontier coding models follow for large diffs: the system should pass bounded work products between steps instead of asking one giant call to both do the work and serialize the entire final output perfectly.
 
 ---
 
@@ -417,7 +441,7 @@ Every log entry must include:
 - **Timestamp** (ISO 8601, UTC)
 - **Run ID**
 - **Stage** (1, 2, 2.5, 3, 4)
-- **Agent** (e.g., `search-a`, `search-b`, `search-c`, `dataset-profiler`, `experiment-planner`, `data-analyst`, `validation`, `paper-writer`, `github-push`)
+- **Agent** (e.g., `search-a`, `search-b`, `search-c`, `dataset-profiler`, `experiment-planner`, `data-analyst`, `research-packager`, `validation`, `paper-writer`, `github-push`)
 - **Level** (`debug`, `info`, `warn`, `error`)
 - **Message** (human-readable string)
 - **Structured metadata** (JSON blob with stage-specific context — e.g., model name, token count, call ID, artifact path, retry attempt number)

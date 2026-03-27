@@ -81,6 +81,32 @@ class FakeOpenAIClient:
             output_text="""
 {
   "research_question": "What prevalence estimate is visible in the saved table?",
+  "execution_summary": "We downloaded the public CSV, cleaned the extracted values, computed the descriptive prevalence estimate in Python, saved the analysis table, and checked the resulting artifact before recording the result.",
+  "completed_experiments": ["Loaded the CSV, extracted the prevalence estimate, and saved the resulting table artifact."],
+  "failed_experiments": [],
+  "findings": ["The saved analysis table reports a prevalence estimate of 0.18 in the retrieved slice."],
+  "limitations": ["Only one public source file was available in this run."],
+  "saved_artifact_paths": ["artifacts/table_1.csv", "analysis/run_analysis.py"],
+  "sources": [
+    {
+      "source_id": "source_1",
+      "label": "Public CSV",
+      "download_url": "https://example.org/data/table_1.csv"
+    }
+  ],
+  "figure_summaries": [],
+  "packaging_notes": "A short Python script downloads the CSV, extracts the prevalence row, and saves the artifact table."
+}
+""".strip(),
+            usage=OpenAIUsage(input_tokens=100, output_tokens=120),
+            payload={"output": [{"type": "message", "content": []}], "status": "completed"},
+        )
+        self.packager_result = OpenAIResponseResult(
+            response_id="resp_packager",
+            output_text="""
+{
+  "title": "Example prevalence study",
+  "research_question": "What prevalence estimate is visible in the saved table?",
   "experiment_summary": "We downloaded the public CSV, cleaned the extracted values, computed the descriptive prevalence estimate in Python, saved the analysis table, and checked the resulting artifact before recording the result. This run was executed directly in the workspace using the retrieved source file rather than summarizing prior literature.",
   "experiments": ["Loaded the CSV, extracted the prevalence estimate, and saved the resulting table artifact."],
   "findings": ["The saved analysis table reports a prevalence estimate of 0.18 in the retrieved slice."],
@@ -114,7 +140,7 @@ class FakeOpenAIClient:
   "code_summary": "A short Python script downloads the CSV, extracts the prevalence row, and saves the artifact table."
 }
 """.strip(),
-            usage=OpenAIUsage(input_tokens=100, output_tokens=200),
+            usage=OpenAIUsage(input_tokens=60, output_tokens=140),
             payload={"output": [{"type": "message", "content": []}], "status": "completed"},
         )
         self.writer_result = OpenAIResponseResult(
@@ -139,6 +165,7 @@ class FakeOpenAIClient:
             self.profiler_result,
             self.planner_result,
             self.executor_result,
+            self.packager_result,
             self.writer_result,
         ]
 
@@ -264,7 +291,7 @@ class PipelineEngineTests(unittest.TestCase):
             self.assertEqual(outputs["validation"]["manuscript_kind"], "paper")
             self.assertEqual(outputs["bundle"]["pdf"]["ok"], True)
             self.assertGreaterEqual(len(statuses), 3)
-            self.assertGreaterEqual(len(metrics), 4)
+            self.assertGreaterEqual(len(metrics), 5)
 
     def test_workspace_blocks_when_empirical_resolution_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

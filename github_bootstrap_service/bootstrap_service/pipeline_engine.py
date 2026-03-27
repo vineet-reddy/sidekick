@@ -262,6 +262,19 @@ def _normalize_figure_summary(entry: Any, index: int) -> dict[str, Any]:
     }
 
 
+def classify_artifact_kind(path: str) -> str:
+    suffix = Path(path).suffix.lower()
+    if suffix in {".py", ".r", ".jl", ".ipynb", ".sh"}:
+        return "code"
+    if suffix in {".png", ".jpg", ".jpeg", ".svg", ".pdf"}:
+        return "figure"
+    if suffix in {".csv", ".tsv", ".xlsx", ".parquet"}:
+        return "table"
+    if suffix in {".json", ".txt", ".md", ".log"}:
+        return "log"
+    return "artifact"
+
+
 def source_matches_resolution_source(source: dict[str, Any], selected_candidate: dict[str, Any]) -> bool:
     dataset_id = str(selected_candidate.get("dataset_id") or "").strip().lower()
     access_url = str(selected_candidate.get("access_url") or "").strip().lower()
@@ -702,30 +715,55 @@ Rules:
             analyst_input=analyst_input,
         )
         response = response_payload.pop("_response")
+        container_ids = self._openai_client.extract_container_ids(response)
+        container_files = self._workspace_file_inventory(container_ids=container_ids)
+        store.set_stage(stage="2", agent="research-packager", model=self._config.openai_writer_model)
+        packaging_input = {
+            "title": request_payload.get("title"),
+            "theme": request_payload.get("theme"),
+            "research_question": search.get("research_question"),
+            "dataset": search.get("dataset"),
+            "dataset_profile": profile,
+            "execution_plan": plan,
+            "execution_handoff": response_payload,
+            "workspace_files": container_files,
+            "attempt": attempt,
+        }
+        packaged = self._run_research_packager(
+            run_id=run_id,
+            packager_input=packaging_input,
+        )
         ledger = {
-            "title": str(request_payload.get("title") or "Research paper"),
-            "research_question": str(response_payload.get("research_question") or search.get("research_question") or "").strip(),
+            "title": str(packaged.get("title") or request_payload.get("title") or "Research paper"),
+            "research_question": str(packaged.get("research_question") or response_payload.get("research_question") or search.get("research_question") or "").strip(),
             "dataset": search.get("dataset") or {},
             "dataset_profile": profile,
             "execution_plan": plan,
-            "experiment_summary": str(response_payload.get("experiment_summary") or "").strip(),
-            "experiments": normalize_text_list(response_payload.get("experiments")),
-            "findings": normalize_text_list(response_payload.get("findings")),
-            "limitations": normalize_text_list(response_payload.get("limitations")),
-            "code_summary": str(response_payload.get("code_summary") or "").strip(),
-            "sources": [_normalize_source(entry, index) for index, entry in enumerate(response_payload.get("sources") or [])],
-            "artifacts": [_normalize_artifact(entry, index) for index, entry in enumerate(response_payload.get("artifacts") or [])],
+            "execution_handoff": response_payload,
+            "experiment_summary": str(packaged.get("experiment_summary") or response_payload.get("execution_summary") or "").strip(),
+            "experiments": normalize_text_list(packaged.get("experiments") or response_payload.get("completed_experiments")),
+            "findings": normalize_text_list(packaged.get("findings") or response_payload.get("findings")),
+            "limitations": normalize_text_list(packaged.get("limitations") or response_payload.get("limitations")),
+            "code_summary": str(packaged.get("code_summary") or response_payload.get("packaging_notes") or "").strip(),
+            "sources": [_normalize_source(entry, index) for index, entry in enumerate(packaged.get("sources") or response_payload.get("sources") or [])],
+            "artifacts": [_normalize_artifact(entry, index) for index, entry in enumerate(packaged.get("artifacts") or [])],
             "figure_summaries": [
-                _normalize_figure_summary(entry, index) for index, entry in enumerate(response_payload.get("figure_summaries") or [])
+                _normalize_figure_summary(entry, index) for index, entry in enumerate(packaged.get("figure_summaries") or response_payload.get("figure_summaries") or [])
             ],
-            "results": response_payload.get("results") or [],
+            "results": packaged.get("results") or [],
             "search": search,
             "attempt": attempt,
         }
+        if not ledger["artifacts"]:
+            ledger["artifacts"] = self._synthesize_artifacts_from_workspace(
+                workspace_files=container_files,
+                saved_artifact_paths=normalize_text_list(response_payload.get("saved_artifact_paths")),
+                source_ids=[source.get("source_id") for source in ledger["sources"] if isinstance(source, dict) and str(source.get("source_id") or "").strip()],
+            )
         downloaded_files = self.materialize_workspace_files(
             run_id=run_id,
             ledger=ledger,
-            container_ids=self._openai_client.extract_container_ids(response),
+            container_ids=container_ids,
         )
         self.apply_downloaded_files_to_ledger(ledger, downloaded_files)
         if not ledger["sources"]:
@@ -744,6 +782,18 @@ Rules:
             )
         if not ledger["dataset"]:
             ledger["dataset"] = profile.get("dataset") or search.get("dataset") or {}
+        if not ledger["results"]:
+            fallback_artifact_ids = [entry.get("artifact_id") for entry in ledger.get("artifacts", []) if entry.get("artifact_id")]
+            ledger["results"] = [
+                {
+                    "result_id": f"finding_{index + 1}",
+                    "text": finding,
+                    "artifact_ids": fallback_artifact_ids,
+                    "note_ids": [],
+                }
+                for index, finding in enumerate(ledger.get("findings") or [])
+                if str(finding).strip()
+            ]
         self._ensure_artifact_metadata(ledger)
         write_json_file(self.run_directory(run_id) / "ledger.json", ledger)
         for artifact in ledger.get("artifacts", []):
@@ -759,7 +809,14 @@ Rules:
                 path=path,
                 description=str(artifact.get("description") or "").strip(),
             )
-        store.complete_stage(stage="2", agent="data-analyst", artifacts=[artifact.get("path") for artifact in ledger.get("artifacts", []) if artifact.get("path")])
+        store.record_artifact(
+            stage="2",
+            artifact_id="ledger",
+            artifact_type="ledger",
+            path="ledger.json",
+            description="Packaged Stage 2 ledger for downstream writing.",
+        )
+        store.complete_stage(stage="2", agent="research-packager", artifacts=["ledger.json"])
         return ledger
 
     def _run_dataset_profiler(self, *, run_id: str, profiler_input: dict[str, Any]) -> dict[str, Any]:
@@ -924,6 +981,99 @@ Use the dataset profile and execution plan to run the most relevant experiments 
 Return a structured object as JSON. If needed, a Python dict literal is acceptable, but do not return prose outside the object.
 {
   "research_question": "string",
+  "execution_summary": "string",
+  "completed_experiments": ["string"],
+  "failed_experiments": ["string"],
+  "findings": ["string"],
+  "limitations": ["string"],
+  "saved_artifact_paths": ["analysis/run_analysis.py"],
+  "sources": [
+    {
+      "source_id": "source_1",
+      "label": "string",
+      "landing_page_url": "string",
+      "download_url": "string",
+      "accession_id": "string",
+      "api_endpoint": "string",
+      "api_query": "string or object",
+      "notes": "string"
+    }
+  ],
+  "figure_summaries": [
+    {
+      "path": "figures/figure_1.png",
+      "title": "Figure 1",
+      "summary_markdown": "plain markdown description of what the figure shows"
+    }
+  ],
+  "packaging_notes": "string"
+}
+Rules:
+- Re-download the dataset or subset if needed; do not assume prior compute state exists.
+- Execute the selected experiments first.
+- Save executable code files, generated figures, and key tables as real files.
+- Save a concise narrative handoff file named analysis_summary.md in the workspace.
+- Figure summaries are mandatory for any figure you generate.
+- If a selected experiment fails, say so honestly and pivot once on the same dataset.
+- Do not swap in a different substrate.
+- Do not attempt to return a full publication ledger here; return only the execution handoff.
+"""
+        result = self._run_model_json(
+            run_id=run_id,
+            stage="2",
+            agent="data-analyst",
+            model=self._config.openai_workspace_model,
+            instructions=instructions,
+            input_text=json.dumps(analyst_input, sort_keys=True),
+            use_code_interpreter=True,
+            use_web_search=False,
+            timeout_seconds=self._config.backend_max_job_runtime_seconds,
+            reasoning_effort="medium",
+        )
+        response = result.get("_response")
+        normalized = {
+            "research_question": str(result.get("research_question") or analyst_input.get("research_question") or "").strip(),
+            "execution_summary": str(result.get("execution_summary") or "").strip(),
+            "completed_experiments": normalize_text_list(result.get("completed_experiments")),
+            "failed_experiments": normalize_text_list(result.get("failed_experiments")),
+            "findings": normalize_text_list(result.get("findings")),
+            "limitations": normalize_text_list(result.get("limitations")),
+            "saved_artifact_paths": normalize_text_list(result.get("saved_artifact_paths")),
+            "sources": [_normalize_source(entry, index) for index, entry in enumerate(result.get("sources") or [])],
+            "figure_summaries": [
+                {
+                    "artifact_id": str(entry.get("artifact_id") or entry.get("path") or f"artifact_{index + 1}").strip() or f"artifact_{index + 1}",
+                    "path": sanitize_relative_path(str(entry.get("path") or "").strip(), fallback=f"artifacts/figure_{index + 1}.png"),
+                    "title": str(entry.get("title") or f"Figure {index + 1}").strip() or f"Figure {index + 1}",
+                    "summary_markdown": str(entry.get("summary_markdown") or entry.get("summary") or "").strip(),
+                }
+                for index, entry in enumerate(result.get("figure_summaries") or [])
+                if isinstance(entry, dict)
+            ],
+            "packaging_notes": str(result.get("packaging_notes") or "").strip(),
+        }
+        path = "stage2_execution.json"
+        write_json_file(self.run_directory(run_id) / path, normalized)
+        self._run_store(run_id).record_artifact(
+            stage="2",
+            artifact_id="stage2_execution",
+            artifact_type="handoff",
+            path=path,
+            description="Execution handoff produced by the Stage 2 analyst.",
+        )
+        self._run_store(run_id).complete_stage(stage="2", agent="data-analyst", artifacts=[path])
+        if response is not None:
+            normalized["_response"] = response
+        return normalized
+
+    def _run_research_packager(self, *, run_id: str, packager_input: dict[str, Any]) -> dict[str, Any]:
+        instructions = """
+You are Sidekick's research packager.
+Convert the execution handoff and workspace file inventory into the structured ledger used by the writer.
+Return a structured object as JSON. If needed, a Python dict literal is acceptable, but do not return prose outside the object.
+{
+  "title": "string",
+  "research_question": "string",
   "experiment_summary": "string",
   "experiments": ["string"],
   "findings": ["string"],
@@ -968,25 +1118,79 @@ Return a structured object as JSON. If needed, a Python dict literal is acceptab
   "code_summary": "string"
 }
 Rules:
-- Re-download the dataset or subset if needed; do not assume prior compute state exists.
-- Execute the selected experiments first.
-- Save executable code files, generated figures, and key tables as real files.
-- Figure summaries are mandatory and are the source of truth for the writer.
-- If a selected experiment fails, say so honestly and pivot once on the same dataset.
-- Do not swap in a different substrate.
+- Use the provided workspace_files inventory as the source of truth for artifact paths.
+- Do not invent files that are not present in workspace_files.
+- Keep the ledger anchored to the provided dataset and execution handoff.
+- If no explicit artifact mapping is obvious, attach the most relevant saved files to the findings conservatively.
 """
-        return self._run_model_json(
+        packaged = self._run_model_json(
             run_id=run_id,
             stage="2",
-            agent="data-analyst",
-            model=self._config.openai_workspace_model,
+            agent="research-packager",
+            model=self._config.openai_writer_model,
             instructions=instructions,
-            input_text=json.dumps(analyst_input, sort_keys=True),
-            use_code_interpreter=True,
-            use_web_search=True,
-            timeout_seconds=self._config.backend_max_job_runtime_seconds,
-            reasoning_effort="medium",
+            input_text=json.dumps(packager_input, sort_keys=True),
+            use_code_interpreter=False,
+            use_web_search=False,
+            timeout_seconds=600,
+            reasoning_effort="low",
         )
+        packaged.pop("_response", None)
+        return packaged
+
+    def _workspace_file_inventory(self, *, container_ids: list[str]) -> list[dict[str, Any]]:
+        inventory: list[dict[str, Any]] = []
+        seen: set[tuple[str, str]] = set()
+        for container_id in container_ids:
+            for container_file in self._openai_client.list_container_files(container_id=container_id):
+                key = (container_file.container_id, container_file.file_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                normalized_path = sanitize_relative_path(
+                    container_file.path or container_file.filename or f"artifacts/{container_file.file_id}",
+                    fallback=f"artifacts/{container_file.file_id}",
+                )
+                inventory.append(
+                    {
+                        "container_id": container_file.container_id,
+                        "file_id": container_file.file_id,
+                        "path": normalized_path,
+                        "filename": Path(normalized_path).name,
+                        "mime_type": container_file.mime_type or guess_mime_type(normalized_path),
+                        "kind": classify_artifact_kind(normalized_path),
+                    }
+                )
+        return inventory
+
+    def _synthesize_artifacts_from_workspace(
+        self,
+        *,
+        workspace_files: list[dict[str, Any]],
+        saved_artifact_paths: list[str],
+        source_ids: list[str],
+    ) -> list[dict[str, Any]]:
+        prioritized_paths = {sanitize_relative_path(path, fallback=path) for path in saved_artifact_paths if str(path).strip()}
+        selected_files = [
+            entry for entry in workspace_files
+            if prioritized_paths and sanitize_relative_path(str(entry.get("path") or ""), fallback="") in prioritized_paths
+        ]
+        if not selected_files:
+            selected_files = workspace_files
+        artifacts: list[dict[str, Any]] = []
+        for index, entry in enumerate(selected_files):
+            path = sanitize_relative_path(str(entry.get("path") or ""), fallback=f"artifacts/generated_{index + 1}")
+            artifacts.append(
+                {
+                    "artifact_id": f"artifact_{index + 1}",
+                    "path": path,
+                    "kind": str(entry.get("kind") or classify_artifact_kind(path)).strip() or "artifact",
+                    "mime_type": str(entry.get("mime_type") or guess_mime_type(path)).strip(),
+                    "description": f"Workspace artifact saved at {path}.",
+                    "source_ids": list(source_ids),
+                }
+            )
+        return artifacts
 
     def materialize_workspace_files(
         self,
@@ -1497,9 +1701,10 @@ Rules:
         )
         seen_response_id = ""
         seen_status = ""
+        last_heartbeat_ms = 0
 
         def _handle_event(event: dict[str, Any]) -> None:
-            nonlocal seen_response_id, seen_status
+            nonlocal seen_response_id, seen_status, last_heartbeat_ms
             store.append_call_delta(handle, "", raw_event=event)
             response = event.get("response") if isinstance(event.get("response"), dict) else None
             response_id = str(
@@ -1516,6 +1721,10 @@ Rules:
             if status_value and status_value not in {"completed", "failed", "cancelled", "incomplete", "expired"} and status_value != seen_status:
                 seen_status = status_value
                 should_emit = True
+            elapsed_ms = store.elapsed_ms()
+            if response_id and status_value in {"queued", "in_progress"} and elapsed_ms - last_heartbeat_ms >= 30000:
+                should_emit = True
+                last_heartbeat_ms = elapsed_ms
             if not should_emit:
                 return
             progress_message = f"{agent} {status_value.replace('_', ' ')}." if status_value else f"{agent} started."
