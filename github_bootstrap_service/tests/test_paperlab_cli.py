@@ -87,6 +87,134 @@ def _fake_compile(job_directory: pathlib.Path, *, tex_filename: str) -> dict[str
 
 
 class PaperlabCLITests(unittest.TestCase):
+    def test_hosted_session_command_persists_backend_session(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        saved_payloads: list[dict[str, object]] = []
+
+        with patch("paperlab.cli.load_sidekick_config", return_value={}), patch(
+            "paperlab.cli.save_sidekick_config",
+            side_effect=lambda payload, config_path=None: saved_payloads.append(dict(payload)),
+        ), patch(
+            "paperlab.cli.urlopen",
+            return_value=FakeResponse(
+                {
+                    "install_session_id": "install_123",
+                    "session_token": "token_123",
+                    "github_connection": None,
+                }
+            ),
+        ):
+            exit_code = cli.main(["hosted", "session", "--backend-url", "https://example.com", "--device-id", "device_123"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(saved_payloads)
+        config_payload = saved_payloads[-1]
+        self.assertEqual(config_payload["hosted_backend_url"], "https://example.com")
+        self.assertEqual(config_payload["hosted_device_id"], "device_123")
+        self.assertEqual(config_payload["hosted_session_token"], "token_123")
+
+    def test_hosted_submit_command_posts_expected_payload(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        captured: dict[str, object] = {}
+
+        def fake_urlopen(request, timeout=60):
+            captured["url"] = request.full_url
+            captured["headers"] = dict(request.header_items())
+            captured["body"] = json.loads((request.data or b"{}").decode("utf-8"))
+            return FakeResponse({"job_id": "job_123"})
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            notes_file = pathlib.Path(tempdir) / "note.txt"
+            notes_file.write_text("Run the circadian analysis.", encoding="utf-8")
+            with patch("paperlab.cli.urlopen", side_effect=fake_urlopen):
+                exit_code = cli.main(
+                    [
+                        "hosted",
+                        "submit",
+                        "--backend-url",
+                        "https://example.com",
+                        "--session-token",
+                        "token_123",
+                        "--title",
+                        "Circadian study",
+                        "--notes-file",
+                        str(notes_file),
+                        "--dataset-id",
+                        "GSE76369",
+                        "--dataset-hint",
+                        "GSE76369",
+                    ]
+                )
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(captured["url"], "https://example.com/api/papers")
+        self.assertEqual(captured["body"]["title"], "Circadian study")
+        self.assertEqual(captured["body"]["dataset_ids"], ["GSE76369"])
+        self.assertEqual(captured["body"]["dataset_hints"], ["GSE76369"])
+
+    def test_hosted_status_watch_returns_success_for_completed_job(self) -> None:
+        class FakeResponse:
+            def __init__(self, payload: dict[str, object]) -> None:
+                self._payload = json.dumps(payload).encode("utf-8")
+
+            def __enter__(self) -> "FakeResponse":
+                return self
+
+            def __exit__(self, exc_type, exc, tb) -> bool:
+                return False
+
+            def read(self) -> bytes:
+                return self._payload
+
+        responses = [
+            FakeResponse({"job_id": "job_123", "status": "running", "stage": "2", "progress_message": "data-analyst in progress.", "metrics": {}}),
+            FakeResponse({"job_id": "job_123", "status": "completed", "stage": "4", "progress_message": "Paper bundle published to GitHub and ready for download.", "metrics": {}}),
+        ]
+
+        with patch("paperlab.cli.urlopen", side_effect=responses), patch("paperlab.cli.time.sleep", return_value=None):
+            exit_code = cli.main(
+                [
+                    "hosted",
+                    "status",
+                    "job_123",
+                    "--backend-url",
+                    "https://example.com",
+                    "--session-token",
+                    "token_123",
+                    "--watch",
+                    "--poll-seconds",
+                    "1",
+                    "--timeout-seconds",
+                    "5",
+                ]
+            )
+
+        self.assertEqual(exit_code, 0)
+
     def test_run_command_creates_local_run_directory(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = pathlib.Path(tempdir)

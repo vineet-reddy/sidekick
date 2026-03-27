@@ -6,9 +6,13 @@ import os
 import subprocess
 import sys
 import time
+import webbrowser
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode
+from urllib.request import Request, urlopen
 
 from github_bootstrap_service.bootstrap_service.config import BootstrapServiceConfig
 from github_bootstrap_service.bootstrap_service.openai_client import OpenAIClient
@@ -169,6 +173,62 @@ def build_parser() -> argparse.ArgumentParser:
     config_get.set_defaults(func=config_get_command)
     config_list = config_subparsers.add_parser("list")
     config_list.set_defaults(func=config_list_command)
+
+    hosted_parser = subparsers.add_parser("hosted", help="Interact with the hosted backend pipeline.")
+    hosted_subparsers = hosted_parser.add_subparsers(dest="action", required=True)
+
+    hosted_session = hosted_subparsers.add_parser("session", help="Create or refresh a hosted install session.")
+    hosted_session.add_argument("--backend-url")
+    hosted_session.add_argument("--device-id")
+    hosted_session.add_argument("--json", action="store_true")
+    hosted_session.set_defaults(func=hosted_session_command)
+
+    hosted_connect = hosted_subparsers.add_parser("connect", help="Start GitHub connect for the hosted backend.")
+    hosted_connect.add_argument("--backend-url")
+    hosted_connect.add_argument("--session-token")
+    hosted_connect.add_argument("--open", action="store_true", help="Open the GitHub OAuth URL in the default browser.")
+    hosted_connect.add_argument("--json", action="store_true")
+    hosted_connect.set_defaults(func=hosted_connect_command)
+
+    hosted_connect_status = hosted_subparsers.add_parser("connect-status", help="Inspect a hosted GitHub connect session.")
+    hosted_connect_status.add_argument("connect_session_id")
+    hosted_connect_status.add_argument("--backend-url")
+    hosted_connect_status.add_argument("--session-token")
+    hosted_connect_status.add_argument("--watch", action="store_true")
+    hosted_connect_status.add_argument("--poll-seconds", type=int, default=2)
+    hosted_connect_status.add_argument("--timeout-seconds", type=int, default=300)
+    hosted_connect_status.add_argument("--json", action="store_true")
+    hosted_connect_status.set_defaults(func=hosted_connect_status_command)
+
+    hosted_submit = hosted_subparsers.add_parser("submit", help="Submit a hosted paper job.")
+    hosted_submit.add_argument("note", nargs="?", help="Research note text.")
+    hosted_submit.add_argument("--notes-file", help="Read the note text from a file.")
+    hosted_submit.add_argument("--title", required=True, help="Paper title.")
+    hosted_submit.add_argument("--theme", help="Paper theme; defaults to title.")
+    hosted_submit.add_argument("--backend-url")
+    hosted_submit.add_argument("--session-token")
+    hosted_submit.add_argument("--dataset-id", action="append", dest="dataset_ids", default=[])
+    hosted_submit.add_argument("--dataset-hint", action="append", dest="dataset_hints", default=[])
+    hosted_submit.add_argument("--domain-guidance", default="")
+    hosted_submit.add_argument("--json", action="store_true")
+    hosted_submit.set_defaults(func=hosted_submit_command)
+
+    hosted_status = hosted_subparsers.add_parser("status", help="Inspect a hosted paper job.")
+    hosted_status.add_argument("job_id")
+    hosted_status.add_argument("--backend-url")
+    hosted_status.add_argument("--session-token")
+    hosted_status.add_argument("--watch", action="store_true")
+    hosted_status.add_argument("--poll-seconds", type=int, default=5)
+    hosted_status.add_argument("--timeout-seconds", type=int, default=3600)
+    hosted_status.add_argument("--json", action="store_true")
+    hosted_status.set_defaults(func=hosted_status_command)
+
+    hosted_artifacts = hosted_subparsers.add_parser("artifacts", help="Fetch hosted bundle artifacts for a completed job.")
+    hosted_artifacts.add_argument("job_id")
+    hosted_artifacts.add_argument("--backend-url")
+    hosted_artifacts.add_argument("--session-token")
+    hosted_artifacts.add_argument("--json", action="store_true")
+    hosted_artifacts.set_defaults(func=hosted_artifacts_command)
 
     return parser
 
@@ -501,6 +561,150 @@ def config_list_command(_: argparse.Namespace) -> int:
     return 0
 
 
+def hosted_session_command(args: argparse.Namespace) -> int:
+    backend_url = resolve_hosted_backend_url(args.backend_url)
+    device_id = resolve_hosted_device_id(args.device_id)
+    payload = hosted_request_json(
+        "POST",
+        backend_url,
+        "/api/device/session",
+        body={"device_id": device_id},
+    )
+    save_hosted_config(
+        backend_url=backend_url,
+        device_id=device_id,
+        session_token=str(payload.get("session_token") or "").strip() or None,
+        install_session_id=str(payload.get("install_session_id") or "").strip() or None,
+    )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"backend_url: {backend_url}")
+        print(f"device_id: {device_id}")
+        print(f"install_session_id: {payload.get('install_session_id')}")
+        print(f"session_token: {payload.get('session_token')}")
+        connection = payload.get("github_connection") if isinstance(payload.get("github_connection"), dict) else None
+        print(f"github_connected: {'yes' if connection else 'no'}")
+    return 0
+
+
+def hosted_connect_command(args: argparse.Namespace) -> int:
+    backend_url = resolve_hosted_backend_url(args.backend_url)
+    session_token = resolve_hosted_session_token(args.session_token)
+    payload = hosted_request_json(
+        "POST",
+        backend_url,
+        "/api/github/connect/start",
+        session_token=session_token,
+    )
+    if args.open:
+        webbrowser.open(str(payload.get("browser_url") or ""))
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"session_id: {payload.get('session_id')}")
+        print(f"status: {payload.get('status')}")
+        print(f"browser_url: {payload.get('browser_url')}")
+    return 0
+
+
+def hosted_connect_status_command(args: argparse.Namespace) -> int:
+    backend_url = resolve_hosted_backend_url(args.backend_url)
+    session_token = resolve_hosted_session_token(args.session_token)
+    deadline = time.monotonic() + max(1, int(args.timeout_seconds))
+    while True:
+        payload = hosted_request_json(
+            "GET",
+            backend_url,
+            f"/api/github/connect/sessions/{args.connect_session_id}",
+            session_token=session_token,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            connection = payload.get("connection") if isinstance(payload.get("connection"), dict) else None
+            print(f"session_id: {payload.get('session_id')}")
+            print(f"status: {payload.get('status')}")
+            print(f"repo: {(connection or {}).get('repo_full_name') or '-'}")
+            print(f"updated_at: {payload.get('updated_at')}")
+        if not args.watch:
+            return 0
+        if str(payload.get("status") or "").strip() in {"completed", "failed"}:
+            return 0 if payload.get("connection") else 1
+        if time.monotonic() >= deadline:
+            return 1
+        time.sleep(max(1, int(args.poll_seconds)))
+
+
+def hosted_submit_command(args: argparse.Namespace) -> int:
+    backend_url = resolve_hosted_backend_url(args.backend_url)
+    session_token = resolve_hosted_session_token(args.session_token)
+    note = resolve_note_text(args.note, args.notes_file)
+    if not note:
+        raise ValueError("Provide a note argument or --notes-file.")
+    title = str(args.title or "").strip()
+    theme = str(args.theme or title).strip() or title
+    payload = hosted_request_json(
+        "POST",
+        backend_url,
+        "/api/papers",
+        session_token=session_token,
+        body={
+            "title": title,
+            "theme": theme,
+            "notes": [{"id": "note_1", "title": title, "content": note}],
+            "dataset_ids": list(args.dataset_ids or []),
+            "dataset_hints": list(args.dataset_hints or []),
+            "domain_guidance": str(args.domain_guidance or "").strip(),
+        },
+    )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(str(payload.get("job_id") or ""))
+    return 0
+
+
+def hosted_status_command(args: argparse.Namespace) -> int:
+    backend_url = resolve_hosted_backend_url(args.backend_url)
+    session_token = resolve_hosted_session_token(args.session_token)
+    deadline = time.monotonic() + max(1, int(args.timeout_seconds))
+    while True:
+        payload = hosted_request_json(
+            "GET",
+            backend_url,
+            f"/api/papers/{args.job_id}",
+            session_token=session_token,
+        )
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print_hosted_job_payload(payload)
+        if not args.watch:
+            return 0
+        if str(payload.get("status") or "").strip() in {"completed", "failed", "cancelled"}:
+            return 0 if str(payload.get("status") or "").strip() == "completed" else 1
+        if time.monotonic() >= deadline:
+            return 1
+        time.sleep(max(1, int(args.poll_seconds)))
+
+
+def hosted_artifacts_command(args: argparse.Namespace) -> int:
+    backend_url = resolve_hosted_backend_url(args.backend_url)
+    session_token = resolve_hosted_session_token(args.session_token)
+    payload = hosted_request_json(
+        "GET",
+        backend_url,
+        f"/api/papers/{args.job_id}/artifacts",
+        session_token=session_token,
+    )
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
 def render_status_command(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + max(1, int(args.timeout_seconds))
     while True:
@@ -761,6 +965,106 @@ def print_render_status(payload: dict[str, Any]) -> None:
     live = payload.get("live_deploy") if isinstance(payload.get("live_deploy"), dict) else None
     if live:
         print(f"live: {live.get('status')} {live.get('id')} {live.get('commit_id')}")
+
+
+def resolve_hosted_backend_url(value: str | None) -> str:
+    if value and str(value).strip():
+        return str(value).strip().rstrip("/")
+    config = load_sidekick_config()
+    configured = str(config.get("hosted_backend_url") or "").strip()
+    if configured:
+        return configured.rstrip("/")
+    env_value = str(os.getenv("SIDEKICK_BACKEND_BASE_URL", "")).strip()
+    if env_value:
+        return env_value.rstrip("/")
+    raise ValueError("Missing hosted backend URL. Use --backend-url or set config hosted_backend_url.")
+
+
+def resolve_hosted_device_id(value: str | None) -> str:
+    if value and str(value).strip():
+        return str(value).strip()
+    config = load_sidekick_config()
+    configured = str(config.get("hosted_device_id") or "").strip()
+    if configured:
+        return configured
+    generated = f"sidekick-cli-{generate_run_id('device')}"
+    save_hosted_config(device_id=generated)
+    return generated
+
+
+def resolve_hosted_session_token(value: str | None) -> str:
+    if value and str(value).strip():
+        return str(value).strip()
+    config = load_sidekick_config()
+    configured = str(config.get("hosted_session_token") or "").strip()
+    if configured:
+        return configured
+    raise ValueError("Missing hosted session token. Run `sidekick hosted session` first or pass --session-token.")
+
+
+def save_hosted_config(
+    *,
+    backend_url: str | None = None,
+    device_id: str | None = None,
+    session_token: str | None = None,
+    install_session_id: str | None = None,
+) -> None:
+    payload = load_sidekick_config()
+    if backend_url is not None:
+        payload["hosted_backend_url"] = backend_url
+    if device_id is not None:
+        payload["hosted_device_id"] = device_id
+    if session_token is not None:
+        payload["hosted_session_token"] = session_token
+    if install_session_id is not None:
+        payload["hosted_install_session_id"] = install_session_id
+    save_sidekick_config(payload)
+
+
+def hosted_request_json(
+    method: str,
+    backend_url: str,
+    path: str,
+    *,
+    session_token: str | None = None,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    url = f"{backend_url.rstrip('/')}{path}"
+    headers = {"Content-Type": "application/json"} if body is not None else {}
+    if session_token:
+        headers["Authorization"] = f"Bearer {session_token}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    request = Request(url=url, data=data, headers=headers, method=method.upper())
+    try:
+        with urlopen(request, timeout=60) as response:
+            raw_payload = response.read()
+    except HTTPError as error:
+        detail = error.read().decode("utf-8", errors="replace")
+        raise ValueError(f"Hosted request failed with HTTP {error.code}: {detail}") from error
+    except URLError as error:
+        raise ValueError(f"Hosted request failed: {error.reason}") from error
+
+    if not raw_payload:
+        return {}
+    decoded = json.loads(raw_payload.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("Hosted backend returned an unexpected payload.")
+    return decoded
+
+
+def print_hosted_job_payload(payload: dict[str, Any]) -> None:
+    print(f"job_id: {payload.get('job_id')}")
+    print(f"status: {payload.get('status')}")
+    print(f"stage: {payload.get('stage')}")
+    print(f"message: {payload.get('progress_message')}")
+    print(f"openai_response_id: {payload.get('openai_response_id')}")
+    print(f"updated_at: {payload.get('updated_at')}")
+    print(f"repo_path: {payload.get('repo_path')}")
+    metrics = payload.get("metrics") if isinstance(payload.get("metrics"), dict) else {}
+    if metrics:
+        print(f"model: {metrics.get('model')}")
+        print(f"tokens: in={metrics.get('input_tokens')} out={metrics.get('output_tokens')}")
+        print(f"estimated_cost_usd: {metrics.get('estimated_cost_usd')}")
 
 
 def render_wait_completed(payload: dict[str, Any], *, commit_ref: str | None) -> bool:
