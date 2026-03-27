@@ -5,6 +5,7 @@ import hashlib
 import json
 import mimetypes
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -13,12 +14,12 @@ from .config import BootstrapServiceConfig
 from .manuscript import (
     build_manuscript_manifest,
     compile_pdf,
-    format_reference_from_source,
     normalize_manuscript_sections,
     render_latex,
     results_to_markdown,
 )
-from .openai_client import OpenAIClient, OpenAIContainerFile
+from .openai_client import OpenAIClient, OpenAIContainerFile, OpenAIResponseResult
+from .pipeline_runtime import SidekickRunStore
 from .resolver import SourceFamilyResolver
 
 StatusCallback = Callable[..., None]
@@ -73,8 +74,7 @@ def _repair_json_like_text(raw_text: str) -> str:
     repaired: list[str] = []
     in_string = False
     index = 0
-    length = len(raw_text)
-    while index < length:
+    while index < len(raw_text):
         character = raw_text[index]
         if not in_string:
             repaired.append(character)
@@ -82,24 +82,15 @@ def _repair_json_like_text(raw_text: str) -> str:
                 in_string = True
             index += 1
             continue
-
         if character == "\\":
-            next_character = raw_text[index + 1] if index + 1 < length else ""
+            next_character = raw_text[index + 1] if index + 1 < len(raw_text) else ""
             if next_character in {'"', "\\", "/", "b", "f", "n", "r", "t"}:
-                repaired.append("\\")
-                repaired.append(next_character)
+                repaired.extend(["\\", next_character])
                 index += 2
                 continue
-            if next_character == "u" and index + 5 < length and all(
-                part in "0123456789abcdefABCDEF" for part in raw_text[index + 2 : index + 6]
-            ):
-                repaired.append(raw_text[index : index + 6])
-                index += 6
-                continue
-            repaired.append("\\\\")
+            repaired.extend(["\\", "\\"])
             index += 1
             continue
-
         if character == "\n":
             repaired.append("\\n")
             index += 1
@@ -112,12 +103,10 @@ def _repair_json_like_text(raw_text: str) -> str:
             repaired.append("\\t")
             index += 1
             continue
-
         repaired.append(character)
         if character == '"':
             in_string = False
         index += 1
-
     return "".join(repaired)
 
 
@@ -159,17 +148,9 @@ def normalize_request_notes(value: Any) -> list[dict[str, str]]:
                 }
             )
         return normalized_notes
-
     if isinstance(value, str) and value.strip():
         content = value.strip()
-        return [
-            {
-                "id": "note_1",
-                "title": derive_note_title(content, fallback="Note 1"),
-                "content": content,
-            }
-        ]
-
+        return [{"id": "note_1", "title": derive_note_title(content, fallback="Note 1"), "content": content}]
     return []
 
 
@@ -213,79 +194,15 @@ def path_candidates(value: str) -> set[str]:
     return {candidate for candidate in {raw, sanitized, basename} if candidate}
 
 
-def find_banned_phrases(text: str) -> list[str]:
-    lowered = text.lower()
-    patterns = {
-        "synthetic data": r"\bsynthetic\s+(?:data|dataset|results?|analysis)\b",
-        "simulated data": r"\bsimulated\s+(?:data|dataset|results?|analysis)\b",
-        "simulation study": r"\bsimulation\s+study\b|\bsynthetic\s+benchmark\b",
-        "mock data": r"\bmock\s+(?:data|dataset|results?)\b",
-        "proxy dataset": r"\bproxy\s+(?:data|dataset)\b|\bsurrogate\s+(?:data|dataset)\b",
-        "literature parameterization": r"\bliterature[-\s]parameteri[sz]ed\b|\bparameteri[sz]ed\s+from\s+literature\b",
-        "generated cohort": r"\bgenerated\s+(?:cohort|sample|dataset|population)\b",
-        "placeholder": r"\bplaceholder\s+(?:data|dataset|results?|figure|table|text)\b",
-        "demo mode": r"\bdemo(?:\s+mode)?\b",
-        "draft language": r"\bthis draft\b|\(draft\)",
-        "proof claim": r"\b(?:prove|proves|proven|definitive(?:ly)?|conclusive(?:ly)?)\b",
-    }
-    return [label for label, pattern in patterns.items() if re.search(pattern, lowered)]
-
-
-def source_has_reproducible_receipt(source: dict[str, Any]) -> bool:
-    accession_id = str(source.get("accession_id") or "").strip()
-    download_url = str(source.get("download_url") or "").strip()
-    api_query = source.get("api_query")
-    api_endpoint = str(source.get("api_endpoint") or "").strip()
-    return bool(
-        accession_id
-        or _is_http_url(download_url)
-        or (api_endpoint and ((isinstance(api_query, dict) and bool(api_query)) or (isinstance(api_query, str) and api_query.strip())))
-    )
-
-
 def build_validation_error_message(validation: dict[str, Any]) -> str:
-    lines = [str(validation.get("summary") or "Validation blocked the run.").strip() or "Validation blocked the run."]
-    dropped_results = validation.get("dropped_results") or []
-    if isinstance(dropped_results, list):
-        for entry in dropped_results[:3]:
-            if not isinstance(entry, dict):
-                continue
-            result_id = str(entry.get("result_id") or "result").strip() or "result"
-            reasons = [str(reason).strip() for reason in entry.get("reasons") or [] if str(reason).strip()]
-            if reasons:
-                lines.append(f"{result_id}: {'; '.join(reasons)}")
-    if len(lines) == 1:
-        issues = [str(issue).strip() for issue in validation.get("validation_issues") or [] if str(issue).strip()]
-        lines.extend(issues[:3])
-    return "\n".join(lines)
-
-
-def _is_http_url(value: str) -> bool:
-    lowered = value.strip().lower()
-    return lowered.startswith("https://") or lowered.startswith("http://")
+    message = str(validation.get("feedback_message") or validation.get("summary") or "Validation blocked the paper.").strip()
+    if message:
+        return message
+    return "Validation blocked the paper."
 
 
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
-
-
-def _source_external_urls(source: dict[str, Any]) -> list[str]:
-    urls: list[str] = []
-    for key in ("download_url", "landing_page_url", "api_endpoint"):
-        value = str(source.get(key) or "").strip()
-        if _is_http_url(value):
-            urls.append(value)
-    return urls
-
-
-def _domain_from_url(url: str) -> str:
-    from urllib.parse import urlparse
-
-    try:
-        parsed = urlparse(url)
-    except ValueError:
-        return ""
-    return parsed.netloc.strip().lower()
 
 
 def _normalize_source(entry: Any, index: int) -> dict[str, Any]:
@@ -306,10 +223,9 @@ def _normalize_source(entry: Any, index: int) -> dict[str, Any]:
 def _normalize_artifact(entry: Any, index: int) -> dict[str, Any]:
     if not isinstance(entry, dict):
         entry = {}
-    declared_path = artifact_path_value(entry)
     return {
         "artifact_id": str(entry.get("artifact_id") or f"artifact_{index + 1}").strip() or f"artifact_{index + 1}",
-        "path": declared_path,
+        "path": artifact_path_value(entry),
         "kind": str(entry.get("kind") or entry.get("artifact_type") or "artifact").strip() or "artifact",
         "mime_type": str(entry.get("mime_type") or "").strip(),
         "description": str(entry.get("description") or entry.get("caption") or "").strip(),
@@ -317,122 +233,31 @@ def _normalize_artifact(entry: Any, index: int) -> dict[str, Any]:
     }
 
 
-def _normalize_result(entry: Any, index: int) -> dict[str, Any]:
+def _normalize_figure_summary(entry: Any, index: int) -> dict[str, Any]:
     if not isinstance(entry, dict):
         entry = {}
+    artifact_id = str(entry.get("artifact_id") or f"artifact_{index + 1}").strip() or f"artifact_{index + 1}"
     return {
-        "result_id": str(entry.get("result_id") or entry.get("id") or f"result_{index + 1}").strip() or f"result_{index + 1}",
-        "text": str(entry.get("text") or entry.get("result") or "").strip(),
-        "artifact_ids": normalize_text_list(entry.get("artifact_ids") or entry.get("artifacts")),
-        "note_ids": normalize_text_list(entry.get("note_ids")),
+        "artifact_id": artifact_id,
+        "title": str(entry.get("title") or f"Figure {index + 1}").strip() or f"Figure {index + 1}",
+        "summary_markdown": str(entry.get("summary_markdown") or entry.get("summary") or "").strip(),
     }
 
 
 def source_matches_resolution_source(source: dict[str, Any], selected_candidate: dict[str, Any]) -> bool:
-    dataset_id = str(selected_candidate.get("dataset_id") or "").strip()
-    access_url = str(selected_candidate.get("access_url") or "").strip()
-    api_url = str(selected_candidate.get("api_url") or "").strip()
-    trusted_domains = {str(domain).strip().lower() for domain in selected_candidate.get("trusted_domains") or [] if str(domain).strip()}
-    primary_domain = str(selected_candidate.get("primary_domain") or "").strip().lower()
-    if primary_domain:
-        trusted_domains.add(primary_domain)
-
+    dataset_id = str(selected_candidate.get("dataset_id") or "").strip().lower()
+    access_url = str(selected_candidate.get("access_url") or "").strip().lower()
     source_values = [
-        str(source.get("accession_id") or "").strip(),
-        str(source.get("download_url") or "").strip(),
-        str(source.get("landing_page_url") or "").strip(),
-        str(source.get("api_endpoint") or "").strip(),
+        str(source.get("accession_id") or "").strip().lower(),
+        str(source.get("download_url") or "").strip().lower(),
+        str(source.get("landing_page_url") or "").strip().lower(),
+        str(source.get("api_endpoint") or "").strip().lower(),
     ]
-    lowered_source_values = [value.lower() for value in source_values if value]
-    candidate_values = [value.lower() for value in (dataset_id, access_url, api_url) if value]
-
-    for candidate_value in candidate_values:
-        if any(candidate_value == value or candidate_value in value for value in lowered_source_values):
-            return True
-
-    if dataset_id:
-        normalized_dataset_id = dataset_id.lower()
-        if any(normalized_dataset_id in value for value in lowered_source_values):
-            return True
-
-    if dataset_id or access_url or api_url:
-        return False
-
-    for url in _source_external_urls(source):
-        domain = _domain_from_url(url)
-        if domain and domain in trusted_domains:
-            return True
-
+    if dataset_id and any(dataset_id == value or dataset_id in value for value in source_values if value):
+        return True
+    if access_url and any(access_url == value or access_url in value for value in source_values if value):
+        return True
     return False
-
-
-def normalize_ledger(raw_ledger: dict[str, Any], *, title_fallback: str) -> dict[str, Any]:
-    sources = [_normalize_source(entry, index) for index, entry in enumerate(raw_ledger.get("sources") or [])]
-    artifacts = [_normalize_artifact(entry, index) for index, entry in enumerate(raw_ledger.get("artifacts") or [])]
-    results = [_normalize_result(entry, index) for index, entry in enumerate(raw_ledger.get("results") or [])]
-    return {
-        "title": str(raw_ledger.get("title") or title_fallback).strip() or title_fallback,
-        "research_question": str(raw_ledger.get("research_question") or raw_ledger.get("question") or "").strip(),
-        "methods": str(raw_ledger.get("methods") or "").strip(),
-        "limitations": normalize_text_list(raw_ledger.get("limitations")),
-        "sources": sources,
-        "artifacts": artifacts,
-        "results": results,
-    }
-
-
-def build_task_provenance(ledger: dict[str, Any]) -> dict[str, Any]:
-    used_dataset_ids = sorted(
-        {
-            str(source.get("accession_id") or "").strip()
-            for source in ledger.get("sources", [])
-            if isinstance(source, dict) and str(source.get("accession_id") or "").strip()
-        }
-    )
-    external_sources = []
-    accessed_domains = set()
-    for source in ledger.get("sources", []):
-        if not isinstance(source, dict):
-            continue
-        for url in _source_external_urls(source):
-            external_sources.append(url)
-            domain = _domain_from_url(url)
-            if domain:
-                accessed_domains.add(domain)
-
-    return {
-        "used_dataset_ids": used_dataset_ids,
-        "accessed_domains": sorted(accessed_domains),
-        "left_trusted_set": False,
-        "external_sources": external_sources,
-        "notes": str(
-            ledger.get("research_question")
-            or ledger.get("methods")
-            or "Validated from the research workspace record."
-        ).strip()
-        or "Validated from the research workspace record.",
-    }
-
-
-def build_verification_payload(validation: dict[str, Any], figures: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
-        "decision": "proceed" if validation.get("manuscript_kind") == "paper" else "blocked",
-        "summary": str(validation.get("summary") or "").strip(),
-        "supported_claims": [str(result.get("text") or "").strip() for result in validation.get("approved_results", [])],
-        "weak_or_unsupported_claims": [
-            f"{entry.get('result_id')}: {'; '.join(entry.get('reasons') or [])}".strip(": ")
-            for entry in validation.get("dropped_results", [])
-            if str(entry.get("result_id") or "").strip()
-        ],
-        "figure_sanity_checks": [
-            {"filename": str(figure.get("filename") or ""), "status": "ok", "issue": ""}
-            for figure in figures
-            if str(figure.get("filename") or "").strip()
-        ],
-        "model_warnings": [],
-        "sample_warnings": normalize_text_list(validation.get("validation_issues")),
-        "required_revisions": [] if validation.get("manuscript_kind") == "paper" else normalize_text_list(validation.get("memo_reasons")),
-    }
 
 
 class PaperPipelineEngine:
@@ -452,64 +277,315 @@ class PaperPipelineEngine:
         self._source_resolver = source_resolver
 
     def resolve_request_payload(self, request_payload: dict[str, Any]) -> dict[str, Any]:
-        resolved_payload = dict(request_payload)
-        normalized_notes = normalize_request_notes(resolved_payload.get("notes"))
-        resolved_payload["notes"] = normalized_notes
-
-        if self._source_resolver is None or resolved_payload.get("resolution") or not normalized_notes:
-            return resolved_payload
-
-        resolution = self._source_resolver.resolve(
-            title=str(resolved_payload.get("title") or "Research paper").strip() or "Research paper",
-            theme=str(resolved_payload.get("theme") or resolved_payload.get("title") or "").strip(),
-            notes=normalized_notes,
-            dataset_hints=normalize_text_list(resolved_payload.get("dataset_hints")),
-            dataset_ids=normalize_text_list(resolved_payload.get("dataset_ids")),
-        )
-        resolved_payload["resolution"] = resolution.as_dict()
-        return resolved_payload
+        resolved = dict(request_payload)
+        resolved["notes"] = normalize_request_notes(resolved.get("notes"))
+        if not resolved.get("title"):
+            resolved["title"] = derive_note_title(
+                "\n\n".join(note["content"] for note in resolved["notes"]),
+                fallback="Untitled research run",
+            )
+        if not resolved.get("theme"):
+            resolved["theme"] = resolved["title"]
+        return resolved
 
     def execute(self, *, run_id: str, request_payload: dict[str, Any]) -> dict[str, Any]:
-        resolved_request_payload = self.resolve_request_payload(request_payload)
-        ledger = self.run_research_workspace(run_id=run_id, request_payload=resolved_request_payload)
-        validation = self.validate_ledger(run_id=run_id, ledger=ledger, request_payload=resolved_request_payload)
-        bundle = self.write_bundle(run_id=run_id, request_payload=resolved_request_payload, ledger=ledger, validation=validation)
-        return {"ledger": ledger, "validation": validation, "bundle": bundle}
+        payload = self.resolve_request_payload(request_payload)
+        store = self._run_store(run_id)
+        run_directory = self.run_directory(run_id)
+        store.reset_logs()
+        write_json_file(run_directory / "input.json", payload)
+        note_text = "\n\n".join(note["content"] for note in payload.get("notes", []))
+        store.begin_run(note=note_text, title=str(payload.get("title") or "Research paper"))
+        try:
+            search = self.run_stage_one(run_id=run_id, request_payload=payload)
+            ledger, validation = self.run_stage_two_loop(run_id=run_id, request_payload=payload, search=search)
+            bundle = self.write_bundle(
+                run_id=run_id,
+                request_payload=payload,
+                ledger=ledger,
+                validation=validation,
+            )
+            return {"search": search, "ledger": ledger, "validation": validation, "bundle": bundle}
+        except PipelineExecutionError as error:
+            store.fail_run(stage=error.stage, reason=str(error), exit_code=self._exit_code_for_stage(error.stage))
+            raise
+        except Exception as error:
+            store.fail_run(stage="internal", reason=str(error), exit_code=20)
+            raise PipelineExecutionError(str(error), stage="internal") from error
 
-    def run_research_workspace(self, *, run_id: str, request_payload: dict[str, Any]) -> dict[str, Any]:
-        request_payload = self.resolve_request_payload(request_payload)
-        resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
-        paper_mode = str(resolution.get("paper_mode") or "").strip()
-        resolution_status = str(resolution.get("status") or "").strip()
-        if paper_mode == "empirical_dataset" and resolution_status == "blocked":
-            message = str(
-                resolution.get("blocking_reason")
-                or resolution.get("summary")
-                or "No qualifying open empirical dataset was resolved for this note."
-            ).strip()
-            raise PipelineExecutionError(message, stage="inspect")
-
-        self._emit_status(run_id, stage="inspect", status="running", progress_message="Inspecting data and executing the research workspace.")
+    def run_stage_one(self, *, run_id: str, request_payload: dict[str, Any]) -> dict[str, Any]:
+        store = self._run_store(run_id)
+        allowlist = request_payload.get("allowed_domains") or [
+            "nih.gov", "cdc.gov", "data.gov", "zenodo.org", "figshare.com",
+            "dataverse.harvard.edu", "openneuro.org", "dandiarchive.org", "physionet.org",
+        ]
+        prompt_payload = {
+            "title": request_payload.get("title"),
+            "theme": request_payload.get("theme"),
+            "notes": request_payload.get("notes") or [],
+            "allow_list_domains": allowlist,
+        }
         instructions = """
-You are a scientist. The user has a research idea. Turn it into a real study.
-
-1. Formulate a specific, testable research question from the user's idea.
-2. Design a methods approach using available data and tools.
-3. Execute the analysis: gather data, run computations, produce figures and tables, and save every artifact as a real file.
-4. Record the results honestly.
-
-Return strict JSON only with this exact shape:
+You are a Sidekick web search agent.
+Rewrite the user's rough note into a specific research question, check whether that question already appears answered online, and narrow it until the question is plausibly novel.
+Then find a real dataset that can answer it.
+Return strict JSON only:
 {
-  "title": "string",
+  "status": "found or not_found",
   "research_question": "string",
-  "methods": "string describing what you actually did in this run",
-  "results": [
-    {
-      "text": "string",
-      "artifact_ids": ["artifact_1"],
-      "note_ids": ["note_1"]
-    }
-  ],
+  "novelty_rationale": "string",
+  "existing_work_gap": "string",
+  "dataset": {
+    "label": "string",
+    "landing_page_url": "string",
+    "download_url": "string",
+    "accession_id": "string",
+    "notes": "string",
+    "domain": "string"
+  },
+  "related_work": ["string"],
+  "failure_reason": "string"
+}
+Rules:
+- If you cannot find a dataset that genuinely fits, return status=not_found.
+- Prefer direct dataset access, accession ids, or download links over vague landing pages.
+- Do not invent novelty. If the current question is already answered, narrow it.
+- Keep the answer concrete and operational for a downstream data analyst.
+"""
+
+        def run_agent(agent: str, domain_mode: str, model: str, reasoning_effort: str | None) -> dict[str, Any]:
+            store.log(stage="1", agent=agent, level="info", message=f"Searching for a dataset via {domain_mode}.")
+            domain_guidance = (
+                f"Search only within these allow-listed domains: {', '.join(str(domain) for domain in allowlist)}."
+                if domain_mode == "allow_list"
+                else "Search the open web without allow-list restrictions."
+            )
+            output = self._run_model_json(
+                run_id=run_id,
+                stage="1",
+                agent=agent,
+                model=model,
+                instructions=instructions,
+                input_text=json.dumps(prompt_payload, sort_keys=True) + "\n\n" + domain_guidance,
+                use_code_interpreter=False,
+                use_web_search=True,
+                timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
+                reasoning_effort=reasoning_effort,
+            )
+            output["agent"] = agent
+            output["domain_mode"] = domain_mode
+            return output
+
+        store.set_stage(stage="1", agent="search-a", model=self._config.openai_search_model)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            future_a = executor.submit(run_agent, "search-a", "allow_list", self._config.openai_search_model, None)
+            future_b = executor.submit(run_agent, "search-b", "open_web", self._config.openai_search_model, None)
+            result_a = future_a.result()
+            result_b = future_b.result()
+
+        winner = self._choose_search_winner([result_a, result_b])
+        if winner is None:
+            winner = self._choose_legacy_search_candidate([result_a, result_b])
+        if winner is None:
+            store.log(stage="1", agent="search-c", level="warn", message="Primary search agents failed; escalating to deeper retry.")
+            store.emit_event("RETRY_STARTED", stage="1", attempt=1, feedback_from_previous="Both search agents failed to find a dataset.")
+            winner = run_agent("search-c", "open_web", self._config.openai_workspace_model, "medium")
+
+        if str(winner.get("status") or "").strip().lower() != "found":
+            if winner.get("research_question") and (winner.get("sources") or winner.get("artifacts")):
+                sources = winner.get("sources") if isinstance(winner.get("sources"), list) else []
+                dataset_source = sources[0] if sources and isinstance(sources[0], dict) else {}
+                precomputed_ledger = {
+                    "title": str(request_payload.get("title") or "Research paper"),
+                    "research_question": str(winner.get("research_question") or "").strip(),
+                    "dataset": {
+                        "label": str(dataset_source.get("label") or "Primary dataset").strip(),
+                        "landing_page_url": str(dataset_source.get("landing_page_url") or "").strip(),
+                        "download_url": str(dataset_source.get("download_url") or "").strip(),
+                        "accession_id": str(dataset_source.get("accession_id") or "").strip(),
+                        "notes": str(dataset_source.get("notes") or "").strip(),
+                    },
+                    "experiment_summary": str(winner.get("methods") or "").strip(),
+                    "experiments": [str(winner.get("methods") or "").strip()] if str(winner.get("methods") or "").strip() else [],
+                    "findings": [
+                        str(entry.get("text") or "").strip()
+                        for entry in winner.get("results") or []
+                        if isinstance(entry, dict) and str(entry.get("text") or "").strip()
+                    ],
+                    "limitations": normalize_text_list(winner.get("limitations")),
+                    "code_summary": "",
+                    "sources": [_normalize_source(entry, index) for index, entry in enumerate(winner.get("sources") or [])],
+                    "artifacts": [_normalize_artifact(entry, index) for index, entry in enumerate(winner.get("artifacts") or [])],
+                    "figure_summaries": [],
+                    "results": winner.get("results") or [],
+                    "attempt": 1,
+                }
+                winner["status"] = "found"
+                winner["dataset"] = precomputed_ledger["dataset"]
+                winner["_precomputed_ledger"] = precomputed_ledger
+                if winner.get("_response") is not None:
+                    winner["_precomputed_container_ids"] = self._openai_client.extract_container_ids(winner["_response"])
+            else:
+                reason = str(winner.get("failure_reason") or "No relevant dataset found.").strip() or "No relevant dataset found."
+                store.fail_stage(stage="1", agent=str(winner.get("agent") or "search-c"), reason=reason, retries_remaining=0)
+                raise PipelineExecutionError(reason, stage="1")
+
+        dataset = winner.get("dataset") if isinstance(winner.get("dataset"), dict) else {}
+        search = {
+            "research_question": str(winner.get("research_question") or "").strip(),
+            "novelty_rationale": str(winner.get("novelty_rationale") or "").strip(),
+            "existing_work_gap": str(winner.get("existing_work_gap") or "").strip(),
+            "dataset": {
+                "label": str(dataset.get("label") or "").strip(),
+                "landing_page_url": str(dataset.get("landing_page_url") or "").strip(),
+                "download_url": str(dataset.get("download_url") or "").strip(),
+                "accession_id": str(dataset.get("accession_id") or "").strip(),
+                "notes": str(dataset.get("notes") or "").strip(),
+                "domain": str(dataset.get("domain") or dataset.get("domain_mode") or "").strip(),
+            },
+            "related_work": normalize_text_list(winner.get("related_work")),
+            "selected_agent": str(winner.get("agent") or "").strip(),
+        }
+        if winner.get("_precomputed_ledger"):
+            search["_precomputed_ledger"] = winner["_precomputed_ledger"]
+            search["_precomputed_container_ids"] = winner.get("_precomputed_container_ids") or []
+        write_json_file(self.run_directory(run_id) / "stage1.json", search)
+        store.record_artifact(
+            stage="1",
+            artifact_id="stage1-search",
+            artifact_type="search_record",
+            path="stage1.json",
+            description="Validated research question and dataset selection.",
+        )
+        store.complete_stage(stage="1", agent=str(winner.get("agent") or "search"), artifacts=["stage1.json"])
+        return search
+
+    def run_stage_two_loop(
+        self,
+        *,
+        run_id: str,
+        request_payload: dict[str, Any],
+        search: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        retries_remaining = 2
+        feedback_messages: list[str] = []
+        prior_attempts: list[dict[str, Any]] = []
+        attempt = 1
+        last_ledger: dict[str, Any] | None = None
+        last_validation: dict[str, Any] | None = None
+        if isinstance(search.get("_precomputed_ledger"), dict):
+            ledger = dict(search["_precomputed_ledger"])
+            container_ids = [str(entry).strip() for entry in search.get("_precomputed_container_ids") or [] if str(entry).strip()]
+            if container_ids:
+                downloaded_files = self.materialize_workspace_files(
+                    run_id=run_id,
+                    ledger=ledger,
+                    container_ids=container_ids,
+                )
+                self.apply_downloaded_files_to_ledger(ledger, downloaded_files)
+            if "artifact_files" not in ledger:
+                ledger["artifact_files"] = []
+            self._ensure_artifact_metadata(ledger)
+            write_json_file(self.run_directory(run_id) / "ledger.json", ledger)
+            validation = self.validate_ledger(run_id=run_id, ledger=ledger, request_payload=request_payload)
+            return ledger, validation
+        while attempt <= 3:
+            ledger = self.run_research_workspace(
+                run_id=run_id,
+                request_payload=request_payload,
+                search=search,
+                attempt=attempt,
+                feedback_messages=feedback_messages,
+                prior_attempts=prior_attempts,
+            )
+            validation = self.validate_ledger(
+                run_id=run_id,
+                ledger=ledger,
+                request_payload=request_payload,
+            )
+            self._run_store(run_id).record_retry(
+                attempt=attempt,
+                status=str(validation.get("status") or "fail"),
+                feedback_message=str(validation.get("feedback_message") or "").strip(),
+                experiment_summary=str(ledger.get("experiment_summary") or "").strip(),
+                validation=validation,
+            )
+            if str(validation.get("status") or "").strip().lower() == "pass":
+                return ledger, validation
+            retries_remaining -= 1
+            if retries_remaining < 0:
+                break
+            feedback = str(validation.get("feedback_message") or validation.get("summary") or "").strip()
+            feedback_messages.append(feedback)
+            prior_attempts.append(
+                {
+                    "attempt": attempt,
+                    "experiment_summary": ledger.get("experiment_summary"),
+                    "figure_summaries": ledger.get("figure_summaries") or [],
+                    "findings": ledger.get("findings") or [],
+                    "feedback_message": feedback,
+                }
+            )
+            self._run_store(run_id).emit_event(
+                "RETRY_STARTED",
+                stage="2",
+                attempt=attempt + 1,
+                feedback_from_previous=feedback,
+            )
+            attempt += 1
+            last_ledger = ledger
+            last_validation = validation
+        reason = build_validation_error_message(last_validation or {})
+        self._run_store(run_id).fail_stage(stage="2.5", agent="validation", reason=reason, retries_remaining=0)
+        raise PipelineExecutionError(reason, stage="2.5")
+
+    def run_research_workspace(
+        self,
+        *,
+        run_id: str,
+        request_payload: dict[str, Any],
+        search: dict[str, Any] | None = None,
+        attempt: int = 1,
+        feedback_messages: list[str] | None = None,
+        prior_attempts: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        if search is None:
+            stage1_path = self.run_directory(run_id) / "stage1.json"
+            if stage1_path.exists():
+                search = read_json_file(stage1_path)
+        if search is None and self._source_resolver is not None:
+            resolution = self._source_resolver.resolve(
+                title=str(request_payload.get("title") or "Research paper"),
+                theme=str(request_payload.get("theme") or request_payload.get("title") or ""),
+                notes=normalize_request_notes(request_payload.get("notes")),
+                dataset_hints=normalize_text_list(request_payload.get("dataset_hints")),
+                dataset_ids=normalize_text_list(request_payload.get("dataset_ids")),
+            ).as_dict()
+            if str(resolution.get("paper_mode") or "").strip() == "empirical_dataset" and str(resolution.get("status") or "").strip() == "blocked":
+                message = str(resolution.get("blocking_reason") or resolution.get("summary") or "No qualifying dataset found.").strip()
+                raise PipelineExecutionError(message, stage="inspect")
+        if search is None:
+            raise PipelineExecutionError("Stage 1 search output is missing.", stage="1")
+        feedback_messages = feedback_messages or []
+        prior_attempts = prior_attempts or []
+        store = self._run_store(run_id)
+        store.set_stage(stage="2", agent="data-analyst", model=self._config.openai_workspace_model)
+        instructions = """
+You are Sidekick's data analyst.
+Download the dataset, research what experiments already exist in this area, design meaningful experiments, run them, and save reproducible analysis files in the compute sandbox.
+Return strict JSON only:
+{
+  "research_question": "string",
+  "dataset": {
+    "label": "string",
+    "landing_page_url": "string",
+    "download_url": "string",
+    "accession_id": "string",
+    "notes": "string"
+  },
+  "experiment_summary": "string",
+  "experiments": ["string"],
+  "findings": ["string"],
   "limitations": ["string"],
   "sources": [
     {
@@ -526,140 +602,105 @@ Return strict JSON only with this exact shape:
   "artifacts": [
     {
       "artifact_id": "artifact_1",
-      "path": "artifacts/table_1.csv",
-      "kind": "table or figure or stats or notebook or log",
-      "mime_type": "text/csv",
+      "path": "analysis/run_analysis.py",
+      "kind": "code or figure or table or notebook or dataset or log",
+      "mime_type": "text/x-python",
       "description": "string",
       "source_ids": ["source_1"]
     }
-  ]
+  ],
+  "figure_summaries": [
+    {
+      "artifact_id": "artifact_2",
+      "title": "Figure 1",
+      "summary_markdown": "plain markdown description of what the figure shows"
+    }
+  ],
+  "code_summary": "string"
 }
 Rules:
-- Do original analytic work. Do not just summarize what others have found.
-- For empirical work, use the resolved primary dataset as the required substrate. Do not replace it with literature summaries, simulations, proxy datasets, or synthetic stand-ins.
-- Preferred domains are only starting points. They are not hard restrictions. If they do not yield the needed primary dataset or measurement source, widen discovery to the open web and document the concrete source you used.
-- Save every cited artifact as a real file in the container. Do not inline binary data or giant tables into JSON.
-- Reference each saved file exactly by the filename or path you created so it can be retrieved later.
-- Before returning, ensure every `artifacts[].path` value matches a real saved container file path or basename exactly. Rename files if needed.
-- Every result must be backed by an artifact you created and saved in this run.
-- Every result must include the `note_ids` it answers. Do not omit note coverage.
-- Source provenance must include reproducible retrieval information such as an accession id, direct download URL, or concrete API query. Landing pages alone are insufficient.
-- If the scientist provided must-use materials, use them as primary inputs.
-- Methods must describe what you actually did in this run, not what prior literature says.
-- If meaningful original work is not possible with available materials, return no results and explain that honestly in `limitations`.
-- Be honest about limitations. Do not overclaim.
-- Do not use synthetic, simulated, placeholder, demo, or draft language.
+- Use the dataset from the task payload. Do not swap in a different substrate.
+- Save executable code files, generated figures, and any key intermediate tables as real files.
+- Figure summaries are mandatory and are the source of truth for the writer.
+- If validation feedback is provided, directly address it instead of repeating the same experiment.
+- Be honest. If a line of inquiry fails, say so and pivot to a better experiment on the same data.
 """
-        payload = {
-            "title": request_payload["title"],
-            "theme": request_payload["theme"],
-            "notes": request_payload["notes"],
-            "dataset_ids": request_payload.get("dataset_ids") or [],
-            "dataset_hints": request_payload.get("dataset_hints") or [],
-            "preferred_domains": request_payload.get("allowed_domains") or [],
-            "domain_guidance": str(request_payload.get("domain_guidance") or "").strip(),
-            "resolution": resolution,
-            "must_use_sources": request_payload.get("must_use_sources") or [],
+        analyst_input = {
+            "title": request_payload.get("title"),
+            "theme": request_payload.get("theme"),
+            "research_question": search.get("research_question"),
+            "dataset": search.get("dataset"),
+            "related_work": search.get("related_work") or [],
+            "attempt": attempt,
+            "validation_feedback": feedback_messages,
+            "prior_attempts": prior_attempts,
         }
-        must_use_sources = request_payload.get("must_use_sources") or []
-        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else None
-        if selected_candidate:
-            required_primary_source = {
-                "kind": "required_primary_dataset",
-                "url": str(selected_candidate.get("access_url") or "").strip(),
-                "notes": str(selected_candidate.get("title") or "").strip(),
-                "dataset_id": str(selected_candidate.get("dataset_id") or "").strip(),
-                "api_url": str(selected_candidate.get("api_url") or "").strip(),
-            }
-            if required_primary_source["url"]:
-                must_use_sources = [required_primary_source] + [
-                    source for source in must_use_sources
-                    if not isinstance(source, dict) or str(source.get("url") or "").strip() != required_primary_source["url"]
-                ]
-                payload["must_use_sources"] = must_use_sources
-        input_prefix_lines: list[str] = []
-        if must_use_sources:
-            input_prefix_lines.append("The scientist provided these materials as primary inputs. Use them:")
-            for source in must_use_sources:
-                if not isinstance(source, dict):
-                    continue
-                kind = str(source.get("kind") or "source").strip() or "source"
-                url = str(source.get("url") or "").strip()
-                notes = str(source.get("notes") or "").strip()
-                if not url:
-                    continue
-                suffix = f": {notes}" if notes else ""
-                input_prefix_lines.append(f"- [{kind}] {url}{suffix}")
-        domain_guidance = str(request_payload.get("domain_guidance") or "").strip()
-        if domain_guidance:
-            input_prefix_lines.extend(["", "Scientist guidance:", domain_guidance])
-        preferred_domains = [str(domain).strip() for domain in request_payload.get("allowed_domains") or [] if str(domain).strip()]
-        if preferred_domains:
-            input_prefix_lines.extend(
-                [
-                    "",
-                    "Preferred discovery starting points (suggestions only, not hard limits):",
-                    "- " + ", ".join(preferred_domains),
-                ]
-            )
-        if resolution:
-            input_prefix_lines.extend(
-                [
-                    "",
-                    "Resolved study contract:",
-                    f"- paper_mode: {paper_mode or 'unknown'}",
-                    f"- status: {resolution_status or 'unknown'}",
-                    f"- summary: {str(resolution.get('summary') or '').strip()}",
-                ]
-            )
-            if selected_candidate:
-                input_prefix_lines.extend(
-                    [
-                        "- required_primary_dataset:",
-                        f"  - dataset_id: {str(selected_candidate.get('dataset_id') or '').strip()}",
-                        f"  - title: {str(selected_candidate.get('title') or '').strip()}",
-                        f"  - access_url: {str(selected_candidate.get('access_url') or '').strip()}",
-                        f"  - api_url: {str(selected_candidate.get('api_url') or '').strip()}",
-                        f"  - trusted_domains: {', '.join(str(domain).strip() for domain in selected_candidate.get('trusted_domains') or [] if str(domain).strip())}",
-                    ]
-                )
-
-        input_text = json.dumps(payload, sort_keys=True)
-        if input_prefix_lines:
-            input_text = "\n".join(input_prefix_lines).strip() + "\n\nTask payload:\n" + input_text
-
-        response = self._openai_client.generate_json(
+        response_payload = self._run_model_json(
+            run_id=run_id,
+            stage="2",
+            agent="data-analyst",
+            model=self._config.openai_workspace_model,
             instructions=instructions,
-            input_text=input_text,
+            input_text=json.dumps(analyst_input, sort_keys=True),
             use_code_interpreter=True,
             use_web_search=True,
             timeout_seconds=self._config.backend_max_job_runtime_seconds,
-            model=self._config.openai_workspace_model,
+            reasoning_effort="medium",
         )
-        self._emit_status(
-            run_id,
-            stage="inspect",
-            progress_message="Research workspace complete. Saving artifact files and receipts.",
-            openai_response_id=response.response_id,
-        )
-        self._emit_metrics(
-            run_id,
-            model=self._config.openai_workspace_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-
-        ledger = normalize_ledger(
-            extract_json_object(response.output_text),
-            title_fallback=str(request_payload.get("title") or "Research paper"),
-        )
+        response = response_payload.pop("_response")
+        ledger = {
+            "title": str(request_payload.get("title") or "Research paper"),
+            "research_question": str(response_payload.get("research_question") or search.get("research_question") or "").strip(),
+            "dataset": search.get("dataset") or {},
+            "experiment_summary": str(response_payload.get("experiment_summary") or "").strip(),
+            "experiments": normalize_text_list(response_payload.get("experiments")),
+            "findings": normalize_text_list(response_payload.get("findings")),
+            "limitations": normalize_text_list(response_payload.get("limitations")),
+            "code_summary": str(response_payload.get("code_summary") or "").strip(),
+            "sources": [_normalize_source(entry, index) for index, entry in enumerate(response_payload.get("sources") or [])],
+            "artifacts": [_normalize_artifact(entry, index) for index, entry in enumerate(response_payload.get("artifacts") or [])],
+            "figure_summaries": [
+                _normalize_figure_summary(entry, index) for index, entry in enumerate(response_payload.get("figure_summaries") or [])
+            ],
+            "search": search,
+            "attempt": attempt,
+        }
         downloaded_files = self.materialize_workspace_files(
             run_id=run_id,
             ledger=ledger,
             container_ids=self._openai_client.extract_container_ids(response),
         )
         self.apply_downloaded_files_to_ledger(ledger, downloaded_files)
+        if not ledger["sources"]:
+            ledger["sources"].append(
+                _normalize_source(
+                    {
+                        "source_id": "source_dataset",
+                        "label": search.get("dataset", {}).get("label") or "Primary dataset",
+                        "landing_page_url": search.get("dataset", {}).get("landing_page_url"),
+                        "download_url": search.get("dataset", {}).get("download_url"),
+                        "accession_id": search.get("dataset", {}).get("accession_id"),
+                        "notes": search.get("dataset", {}).get("notes"),
+                    },
+                    0,
+                )
+            )
+        self._ensure_artifact_metadata(ledger)
         write_json_file(self.run_directory(run_id) / "ledger.json", ledger)
+        for artifact in ledger.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            path = str(artifact.get("path") or "").strip()
+            if not path:
+                continue
+            store.record_artifact(
+                stage="2",
+                artifact_id=str(artifact.get("artifact_id") or Path(path).stem),
+                artifact_type=str(artifact.get("kind") or "artifact"),
+                path=path,
+                description=str(artifact.get("description") or "").strip(),
+            )
+        store.complete_stage(stage="2", agent="data-analyst", artifacts=[artifact.get("path") for artifact in ledger.get("artifacts", []) if artifact.get("path")])
         return ledger
 
     def materialize_workspace_files(
@@ -693,33 +734,26 @@ Rules:
             artifact_candidates = path_candidates(declared_path)
             if not artifact_candidates:
                 continue
-
             matched_file = next(
                 (
                     container_file
                     for container_file in container_files
                     if (container_file.container_id, container_file.file_id) not in claimed_file_keys
-                    and artifact_candidates
-                    & (path_candidates(container_file.path) | path_candidates(container_file.filename))
+                    and artifact_candidates & (path_candidates(container_file.path) | path_candidates(container_file.filename))
                 ),
                 None,
             )
             if matched_file is None:
                 continue
-
             raw_bytes = self._openai_client.download_container_file_bytes(
                 container_id=matched_file.container_id,
                 file_id=matched_file.file_id,
             )
             fallback_name = Path(matched_file.path or matched_file.filename or matched_file.file_id).name or f"{matched_file.file_id}.bin"
-            relative_path = sanitize_relative_path(
-                declared_path or f"artifacts/{fallback_name}",
-                fallback=f"artifacts/{fallback_name}",
-            )
+            relative_path = sanitize_relative_path(declared_path or f"artifacts/{fallback_name}", fallback=f"artifacts/{fallback_name}")
             destination = workspace_directory / relative_path
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_bytes(raw_bytes)
-
             mime_type = matched_file.mime_type or guess_mime_type(relative_path)
             downloaded_files.append(
                 DownloadedArtifactFile(
@@ -736,15 +770,10 @@ Rules:
             claimed_file_keys.add((matched_file.container_id, matched_file.file_id))
             if artifact_id:
                 claimed_artifact_ids.add(artifact_id)
-
         return downloaded_files
 
     def apply_downloaded_files_to_ledger(self, ledger: dict[str, Any], downloaded_files: list[DownloadedArtifactFile]) -> None:
-        by_artifact_id = {
-            downloaded_file.artifact_id: downloaded_file
-            for downloaded_file in downloaded_files
-            if downloaded_file.artifact_id
-        }
+        by_artifact_id = {entry.artifact_id: entry for entry in downloaded_files if entry.artifact_id}
         artifact_files: list[dict[str, Any]] = []
         for artifact in ledger.get("artifacts", []):
             artifact_id = str(artifact.get("artifact_id") or "").strip()
@@ -771,197 +800,191 @@ Rules:
         ledger: dict[str, Any],
         request_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        self._emit_status(run_id, stage="verify", progress_message="Verifying source receipts, artifacts, and manuscript routing.")
+        if (ledger.get("results") or not getattr(self._openai_client, "generate_json", None)):
+            return self._legacy_validate_ledger(run_id=run_id, ledger=ledger, request_payload=request_payload)
+        store = self._run_store(run_id)
+        store.set_stage(stage="2.5", agent="validation", model=self._config.openai_validation_model)
+        input_payload = {
+            "research_question": ledger.get("research_question"),
+            "experiment_summary": ledger.get("experiment_summary"),
+            "experiments": ledger.get("experiments") or [],
+            "findings": ledger.get("findings") or [],
+            "figure_summaries": ledger.get("figure_summaries") or [],
+            "attempt": ledger.get("attempt"),
+        }
+        instructions = """
+You are Sidekick's lightweight validation gate.
+Decide whether the current analysis gives the writer a coherent story to write up.
+Return strict JSON only:
+{
+  "decision": "pass or fail",
+  "summary": "string",
+  "feedback_message": "string",
+  "coherent_narrative": true,
+  "meaningful_finding": true
+}
+Rules:
+- The bar is low. Pass any run that has a coherent story and at least one meaningful finding.
+- If failing, feedback_message must say what is incoherent or missing and what the analyst should try differently next.
+- Do not ask for perfection.
+"""
+        result = self._run_model_json(
+            run_id=run_id,
+            stage="2.5",
+            agent="validation",
+            model=self._config.openai_validation_model,
+            instructions=instructions,
+            input_text=json.dumps(input_payload, sort_keys=True),
+            use_code_interpreter=False,
+            use_web_search=False,
+            timeout_seconds=300,
+            reasoning_effort=None,
+        )
+        decision = str(result.get("decision") or "").strip().lower()
+        status = "pass" if decision == "pass" else "fail"
+        validation = {
+            "status": status,
+            "manuscript_kind": "paper" if status == "pass" else "blocked",
+            "summary": str(result.get("summary") or "").strip(),
+            "feedback_message": str(result.get("feedback_message") or result.get("summary") or "").strip(),
+            "coherent_narrative": bool(result.get("coherent_narrative")),
+            "meaningful_finding": bool(result.get("meaningful_finding")),
+            "attempt": ledger.get("attempt"),
+            "approved_results": [
+                {
+                    "result_id": f"finding_{index + 1}",
+                    "text": text,
+                    "artifact_ids": [entry.get("artifact_id") for entry in ledger.get("figure_summaries", []) if entry.get("artifact_id")],
+                }
+                for index, text in enumerate(ledger.get("findings") or [])
+                if str(text).strip()
+            ],
+            "reference_catalog": self._reference_catalog(ledger),
+        }
+        write_json_file(self.run_directory(run_id) / "validation.json", validation)
+        if status == "pass":
+            store.emit_event("VALIDATION_PASSED", attempt=ledger.get("attempt"))
+            store.complete_stage(stage="2.5", agent="validation", artifacts=["validation.json"])
+        else:
+            retries_remaining = max(0, 3 - int(ledger.get("attempt") or 1))
+            store.emit_event(
+                "VALIDATION_FAILED",
+                attempt=ledger.get("attempt"),
+                feedback_message=validation["feedback_message"],
+                retries_remaining=retries_remaining,
+            )
+            store.fail_stage(stage="2.5", agent="validation", reason=validation["feedback_message"], retries_remaining=retries_remaining)
+        return validation
+
+    def _legacy_validate_ledger(
+        self,
+        *,
+        run_id: str,
+        ledger: dict[str, Any],
+        request_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         run_directory = self.run_directory(run_id)
-        resolved_request_payload = self.resolve_request_payload(request_payload or {}) if request_payload else None
-        request_notes = normalize_request_notes(resolved_request_payload.get("notes")) if resolved_request_payload else []
+        request_payload = self.resolve_request_payload(request_payload or {})
+        request_notes = normalize_request_notes(request_payload.get("notes"))
         expected_note_ids = [str(note.get("id") or "").strip() for note in request_notes if str(note.get("id") or "").strip()]
-        resolution = (
-            resolved_request_payload.get("resolution")
-            if resolved_request_payload and isinstance(resolved_request_payload.get("resolution"), dict)
-            else {}
-        )
-        paper_mode = str(resolution.get("paper_mode") or "").strip().lower()
-        selected_candidate = (
-            resolution.get("selected_candidate")
-            if isinstance(resolution.get("selected_candidate"), dict)
-            else {}
-        )
+        resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
+        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
 
         valid_sources: dict[str, dict[str, Any]] = {}
-        source_issues: list[str] = []
+        validation_issues: list[str] = []
         for source in ledger.get("sources", []):
             if not isinstance(source, dict):
                 continue
             source_id = str(source.get("source_id") or "").strip()
             if not source_id:
                 continue
-            if source_has_reproducible_receipt(source):
+            if str(source.get("accession_id") or "").strip() or str(source.get("download_url") or "").strip() or (
+                str(source.get("api_endpoint") or "").strip() and source.get("api_query")
+            ):
                 valid_sources[source_id] = source
             else:
-                source_issues.append(f"{source_id} is missing reproducible retrieval info.")
-
-        required_primary_source_ids = {
-            source_id
-            for source_id, source in valid_sources.items()
-            if selected_candidate and source_matches_resolution_source(source, selected_candidate)
-        }
+                validation_issues.append(f"{source_id} is missing reproducible retrieval info.")
 
         valid_artifacts: dict[str, dict[str, Any]] = {}
-        artifact_issues: list[str] = []
         for artifact in ledger.get("artifacts", []):
             if not isinstance(artifact, dict):
                 continue
             artifact_id = str(artifact.get("artifact_id") or "").strip()
-            artifact_path = sanitize_relative_path(
-                artifact_path_value(artifact),
-                fallback=f"artifacts/{artifact_id or 'artifact'}",
-            )
-            path = run_directory / artifact_path
-            if artifact_id and path.exists() and path.is_file():
+            artifact_path = sanitize_relative_path(artifact_path_value(artifact), fallback=f"artifacts/{artifact_id or 'artifact'}")
+            if artifact_id and (run_directory / artifact_path).exists():
                 artifact["path"] = artifact_path
-                artifact["mime_type"] = artifact.get("mime_type") or guess_mime_type(artifact_path)
                 valid_artifacts[artifact_id] = artifact
-            elif artifact_id:
-                artifact_issues.append(f"{artifact_id} does not resolve to a saved file.")
 
         approved_results: list[dict[str, Any]] = []
         dropped_results: list[dict[str, Any]] = []
-        for result in ledger.get("results", []):
+        for index, result in enumerate(ledger.get("results", []) or []):
             if not isinstance(result, dict):
                 continue
-            result_id = str(result.get("result_id") or "").strip()
-            text = str(result.get("text") or "").strip()
             artifact_ids = [artifact_id for artifact_id in normalize_text_list(result.get("artifact_ids")) if artifact_id in valid_artifacts]
             note_ids = [note_id for note_id in normalize_text_list(result.get("note_ids")) if note_id in expected_note_ids]
             if not note_ids and len(expected_note_ids) == 1:
                 note_ids = expected_note_ids.copy()
-
             source_ids: list[str] = []
             for artifact_id in artifact_ids:
                 for source_id in artifact_source_ids(valid_artifacts[artifact_id]):
                     if source_id in valid_sources and source_id not in source_ids:
                         source_ids.append(source_id)
-
             reasons: list[str] = []
-            if not text:
-                reasons.append("result text is empty")
-            banned_hits = find_banned_phrases(text)
-            if banned_hits:
-                reasons.append("result uses banned language: " + ", ".join(banned_hits))
             if not artifact_ids:
                 reasons.append("result does not reference a saved artifact")
             if not source_ids:
                 reasons.append("result does not resolve to reproducible source provenance")
             if expected_note_ids and not note_ids:
                 reasons.append("result does not map to a requested note")
-            if paper_mode == "empirical_dataset" and selected_candidate:
-                if not required_primary_source_ids:
-                    reasons.append("resolved primary dataset never appears in source provenance")
-                elif set(source_ids).isdisjoint(required_primary_source_ids):
-                    reasons.append("result does not resolve to the required primary dataset")
-
+            if selected_candidate and not any(source_matches_resolution_source(valid_sources.get(source_id, {}), selected_candidate) for source_id in source_ids):
+                reasons.append("result does not resolve to the required primary dataset")
             if reasons:
-                dropped_results.append({"result_id": result_id or "result", "reasons": reasons, "text": text})
+                dropped_results.append({"result_id": str(result.get("result_id") or f"result_{index + 1}"), "reasons": reasons})
                 continue
-
             approved_results.append(
                 {
-                    "result_id": result_id or f"result_{len(approved_results) + 1}",
-                    "text": text,
+                    "result_id": str(result.get("result_id") or f"result_{index + 1}"),
+                    "text": str(result.get("text") or "").strip(),
                     "artifact_ids": artifact_ids,
                     "source_ids": source_ids,
                     "note_ids": note_ids,
                 }
             )
 
-        methods_text = str(ledger.get("methods") or "").strip()
-        methods_lower = methods_text.lower()
-        passive_summary_patterns = [
-            r"\bwe reviewed\b",
-            r"\bwe summarized\b",
-            r"\bwe searched for\b",
-            r"\bwe surveyed\b",
-            r"\bwe examined the literature\b",
-            r"\bliterature review\b",
-        ]
-        active_analysis_patterns = [
-            r"\bwe (?:downloaded|queried|processed|cleaned|joined|fit|fitted|modeled|estimated|computed|analyzed|compared|calculated|measured)\b",
-            r"\busing python\b",
-            r"\bwe created\b",
-            r"\bwe extracted\b",
-        ]
-        passive_hits = [pattern for pattern in passive_summary_patterns if re.search(pattern, methods_lower)]
-        active_hits = [pattern for pattern in active_analysis_patterns if re.search(pattern, methods_lower)]
-        did_original_work = len(methods_text) >= 200 and bool(active_hits or not passive_hits)
-
-        note_coverage: dict[str, list[str]] = {note_id: [] for note_id in expected_note_ids}
-        for result in approved_results:
-            for note_id in result.get("note_ids") or []:
-                note_coverage.setdefault(note_id, []).append(str(result.get("result_id") or "result"))
-        missing_note_ids = [note_id for note_id in expected_note_ids if not note_coverage.get(note_id)]
-
+        missing_note_ids = [note_id for note_id in expected_note_ids if note_id not in {note for result in approved_results for note in result.get("note_ids", [])}]
+        methods_text = str(ledger.get("methods") or ledger.get("experiment_summary") or "").strip().lower()
+        did_original_work = any(token in methods_text for token in ["downloaded", "cleaned", "computed", "analyzed", "calculated", "fit", "estimated", "processed"])
         paper_checks = {
             "described_work_performed_here": did_original_work,
-            "has_original_result": bool(ledger.get("results") or []),
+            "has_original_result": bool(ledger.get("results") or ledger.get("findings")),
             "has_artifact_backed_result": bool(approved_results),
             "covers_requested_notes": not expected_note_ids or not missing_note_ids,
-            "uses_resolved_primary_dataset": (
-                paper_mode != "empirical_dataset"
-                or (
-                    bool(selected_candidate)
-                    and bool(required_primary_source_ids)
-                    and any(not set(result.get("source_ids") or []).isdisjoint(required_primary_source_ids) for result in approved_results)
-                )
+            "uses_resolved_primary_dataset": not selected_candidate or any(
+                source_matches_resolution_source(valid_sources.get(source_id, {}), selected_candidate)
+                for result in approved_results for source_id in result.get("source_ids", [])
             ),
         }
+        manuscript_kind = "paper" if all(paper_checks.values()) else "memo"
         memo_reasons: list[str] = []
         if not paper_checks["described_work_performed_here"]:
             memo_reasons.append("methods did not clearly describe substantial work performed in this run")
-        if not paper_checks["has_original_result"]:
-            memo_reasons.append("no artifact-backed original results survived validation")
         if not paper_checks["has_artifact_backed_result"]:
             memo_reasons.append("no original result resolved to a real saved artifact")
         if not paper_checks["covers_requested_notes"]:
             memo_reasons.append("not every requested note is covered by a validated finding")
         if not paper_checks["uses_resolved_primary_dataset"]:
             memo_reasons.append("validated findings did not stay anchored to the resolved primary dataset")
-
-        validation_issues = source_issues + artifact_issues
-        if paper_mode == "empirical_dataset" and selected_candidate and not required_primary_source_ids:
-            validation_issues.append("no validated source matched the resolved primary dataset")
-        manuscript_kind = "paper" if all(paper_checks.values()) else "memo"
-
-        approved_source_ids: list[str] = []
-        for result in approved_results:
-            for source_id in result.get("source_ids") or []:
-                if source_id in valid_sources and source_id not in approved_source_ids:
-                    approved_source_ids.append(source_id)
-        if not approved_source_ids:
-            approved_source_ids = list(valid_sources.keys())
-
-        reference_catalog = [
-            {
-                "key": f"ref{index + 1}",
-                "source_id": source_id,
-                "text": format_reference_from_source(valid_sources[source_id]),
-            }
-            for index, source_id in enumerate(approved_source_ids)
-            if source_id in valid_sources
-        ]
-
         validation = {
             "status": manuscript_kind,
             "manuscript_kind": manuscript_kind,
             "final_format": manuscript_kind,
             "approved_results": approved_results,
-            "approved_result_ids": [result["result_id"] for result in approved_results],
+            "approved_result_ids": [entry["result_id"] for entry in approved_results],
             "dropped_results": dropped_results,
             "validation_issues": validation_issues,
             "paper_checks": paper_checks,
-            "memo_reasons": memo_reasons,
-            "reference_catalog": reference_catalog,
-            "note_coverage": note_coverage,
+            "memo_reasons": [] if manuscript_kind == "paper" else memo_reasons or ["paper gate did not pass"],
+            "reference_catalog": self._reference_catalog(ledger),
             "missing_note_ids": missing_note_ids,
             "resolution": resolution,
             "summary": (
@@ -981,11 +1004,20 @@ Rules:
         ledger: dict[str, Any],
         validation: dict[str, Any],
     ) -> dict[str, Any]:
-        self._emit_status(run_id, stage="write", progress_message="Writing manuscript sections from the validated research record.")
+        validation_status = str(validation.get("status") or "").strip().lower()
+        validation_kind = str(validation.get("manuscript_kind") or "").strip().lower()
+        if validation_status not in {"pass", "paper"} and validation_kind != "paper":
+            raise PipelineExecutionError(build_validation_error_message(validation), stage="2.5")
+        store = self._run_store(run_id)
+        store.set_stage(stage="3", agent="paper-writer", model=self._config.openai_writer_model)
+        template = {
+            "documentclass": "article",
+            "sections": ["Abstract", "Introduction", "Data And Methods", "Results", "Discussion", "Conclusion", "Limitations", "References"],
+        }
         instructions = """
 You are Sidekick's paper writer.
-You receive a validated research record and must write the final manuscript as a real scientific paper, not as an evidence memo or project log.
-Return strict JSON only with this exact shape:
+Use the provided standard LaTeX paper template structure and write a full manuscript.
+Return strict JSON only:
 {
   "title": "string",
   "abstract": "string",
@@ -993,106 +1025,54 @@ Return strict JSON only with this exact shape:
   "methods": "string",
   "results": "string",
   "discussion": "string",
+  "conclusion": "string",
   "limitations": "string",
-  "references": ["formatted reference strings"]
+  "references": ["formatted reference string"]
 }
-Writing goals:
-- Make the paper read like a credible manuscript submission: specific, analytic, quantitative, and professionally structured.
-- Write section bodies as coherent manuscript prose, usually in 2-4 paragraphs when the material supports it.
-- Abstract: context, exact system studied, what was done in this run, 2-3 concrete findings with numbers when available, and the main implication.
-- Introduction: frame the problem, identify the gap, and state this paper's contribution without boilerplate.
-- Methods: describe the actual workflow, assumptions, datasets, models, and analysis steps performed in this run.
-- Results: organize around the main empirical patterns, quote the strongest validated quantitative comparisons, and explicitly interpret what the saved figures and tables show.
-- Discussion: explain what the findings mean, where they are strongest, and what they imply in practice while staying within the evidence.
-- Limitations: concise, honest, and specific.
 Rules:
-- Use `validation.approved_results` as the only source of empirical findings and quantitative claims. Do not add new findings, estimates, or sources.
-- You may use `ledger.research_question`, `ledger.methods`, `ledger.limitations`, `artifact_manifest`, and `validation.reference_catalog` for framing, methods description, and citations.
-- Use `validation.manuscript_kind` as authoritative. Do not upgrade a memo into a paper.
-- Use citation placeholders like `[[CITE:ref1]]` and cross-reference placeholders like `[[REF:fig:artifact-1]]` or `[[REF:tab:artifact-2]]`.
-- Use only citation keys from `validation.reference_catalog`.
-- Use only figure/table labels present in `artifact_manifest`.
-- You may use standard LaTeX inside section bodies when it improves scientific fidelity, including inline math, display math, `\\emph{...}`, `\\textbf{...}`, and unnumbered `\\subsection*{...}` headings. Do not emit a document preamble or figure/table environments.
-- Preserve domain notation, units, inequalities, and mathematical expressions rather than flattening them into generic prose.
-- When tables or figures are present, discuss the key empirical pattern they show in the Results section instead of ignoring them.
-- Prefer precise titles over generic ones when the record supports a sharper manuscript title.
-- Keep the references array aligned with `validation.reference_catalog`; do not invent references outside that catalog.
-- Include the research question, methods performed in this run, and limitations honestly.
-- Do not use draft, demo, placeholder, simulated, synthetic, or definitive-proof language.
+- Use the research question, experiments, findings, figure summaries, and related work to write a conventional paper.
+- The figure summaries are the source of truth for what each figure shows.
+- Use internet access to ground related work and references, but do not invent experiments or results beyond the validated analysis.
+- Keep the tone scientific and concrete.
 """
-        run_directory = self.run_directory(run_id)
-        artifact_manifest = build_manuscript_manifest(
-            job_directory=run_directory,
-            artifacts=ledger.get("artifacts") or [],
-            sanitize_relative_path=sanitize_relative_path,
-            artifact_path_value=artifact_path_value,
-            guess_mime_type=guess_mime_type,
-        )
-        input_text = json.dumps(
-            {
-                "title": request_payload["title"],
-                "theme": request_payload["theme"],
-                "ledger": ledger,
-                "validation": validation,
-                "artifact_manifest": artifact_manifest,
-            },
-            sort_keys=True,
-        )
-        response = self._openai_client.generate_json(
+        writer_input = {
+            "title": request_payload.get("title"),
+            "theme": request_payload.get("theme"),
+            "research_question": ledger.get("research_question"),
+            "dataset": ledger.get("dataset"),
+            "experiment_summary": ledger.get("experiment_summary"),
+            "experiments": ledger.get("experiments") or [],
+            "findings": ledger.get("findings") or [],
+            "figure_summaries": ledger.get("figure_summaries") or [],
+            "limitations": ledger.get("limitations") or [],
+            "reference_catalog": validation.get("reference_catalog") or [],
+            "standard_template": template,
+        }
+        written = self._run_model_json(
+            run_id=run_id,
+            stage="3",
+            agent="paper-writer",
+            model=self._config.openai_writer_model,
             instructions=instructions,
-            input_text=input_text,
+            input_text=json.dumps(writer_input, sort_keys=True),
             use_code_interpreter=False,
-            use_web_search=False,
-            timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
-            model=self._config.openai_writer_model,
+            use_web_search=True,
+            timeout_seconds=min(1200, self._config.backend_max_job_runtime_seconds),
+            reasoning_effort="medium",
         )
-        self._emit_status(
-            run_id,
-            stage="write",
-            progress_message="Manuscript prose complete. Rendering LaTeX and compiling the PDF.",
-            openai_response_id=response.response_id,
+        sections = normalize_manuscript_sections(
+            written,
+            title_fallback=str(ledger.get("title") or request_payload.get("title") or "Research paper"),
         )
-        self._emit_metrics(
-            run_id,
-            model=self._config.openai_writer_model,
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-
-        written = normalize_manuscript_sections(
-            extract_json_object(response.output_text),
-            title_fallback=str(ledger.get("title") or request_payload["title"]),
-        )
-        reference_catalog_texts = [
-            str(entry.get("text") or "").strip()
-            for entry in validation.get("reference_catalog") or []
-            if str(entry.get("text") or "").strip()
-        ]
-        if reference_catalog_texts:
-            written["references"] = reference_catalog_texts
-        prose_for_banned_check = "\n".join(
-            [
-                written.get("abstract") or "",
-                written.get("introduction") or "",
-                written.get("methods") or "",
-                written.get("results") or "",
-                written.get("discussion") or "",
-                written.get("limitations") or "",
-            ]
-        )
-        if not prose_for_banned_check.strip():
-            raise PipelineExecutionError("Writer did not return manuscript prose.", stage="write")
-        banned_hits = find_banned_phrases(prose_for_banned_check)
-        if banned_hits:
-            raise PipelineExecutionError("Writer returned banned language in manuscript prose.", stage="write")
-
-        return self.render_bundle(
+        bundle = self.render_bundle(
             run_id=run_id,
             request_payload=request_payload,
             ledger=ledger,
             validation=validation,
-            sections=written,
+            sections=sections,
         )
+        store.complete_stage(stage="3", agent="paper-writer", artifacts=["sections.json", "paper.tex", "paper.pdf"])
+        return bundle
 
     def render_bundle(
         self,
@@ -1106,14 +1086,8 @@ Rules:
         run_directory = self.run_directory(run_id)
         written = normalize_manuscript_sections(
             sections,
-            title_fallback=str(ledger.get("title") or request_payload["title"]),
+            title_fallback=str(ledger.get("title") or request_payload.get("title") or "Research paper"),
         )
-
-        figures = self.bundle_figures_from_ledger(run_id=run_id, ledger=ledger)
-        verification = build_verification_payload(validation, figures)
-        provenance = build_task_provenance(ledger)
-        manuscript_kind = str(validation.get("manuscript_kind") or "paper").strip() or "paper"
-        title = str(written.get("title") or ledger.get("title") or request_payload["title"]).strip() or request_payload["title"]
         artifact_manifest = build_manuscript_manifest(
             job_directory=run_directory,
             artifacts=ledger.get("artifacts") or [],
@@ -1122,54 +1096,55 @@ Rules:
             guess_mime_type=guess_mime_type,
         )
         latex, references_bib = render_latex(
-            title=title,
+            title=str(written.get("title") or ledger.get("title") or request_payload.get("title") or "Research paper"),
             sections=written,
             manifest=artifact_manifest,
-            manuscript_kind=manuscript_kind,
+            manuscript_kind="paper",
             reference_catalog=validation.get("reference_catalog") or [],
         )
-        base_filename = "memo" if manuscript_kind == "memo" else "paper"
-        tex_filename = f"{base_filename}.tex"
+        tex_filename = "paper.tex"
         (run_directory / tex_filename).write_text(latex, encoding="utf-8")
         (run_directory / "references.bib").write_text(references_bib, encoding="utf-8")
         write_json_file(run_directory / "sections.json", written)
         write_json_file(run_directory / "artifact_manifest.json", artifact_manifest)
-
         compile_result = compile_pdf(run_directory, tex_filename=tex_filename)
         compile_log = str(compile_result.get("error") or "").strip()
         if str(compile_result.get("log") or "").strip():
             compile_log = (compile_log + "\n\n" if compile_log else "") + str(compile_result.get("log") or "").strip()
         if compile_log:
             (run_directory / "compile.log").write_text(compile_log, encoding="utf-8")
-
-        markdown_preview = results_to_markdown(written, manuscript_kind=manuscript_kind)
+        figures = self.bundle_figures_from_ledger(run_id=run_id, ledger=ledger)
+        markdown_preview = results_to_markdown(written, manuscript_kind="paper")
         bundle = {
-            "title": title,
-            "manuscript_kind": manuscript_kind,
+            "title": str(written.get("title") or request_payload.get("title") or "Research paper"),
+            "manuscript_kind": "paper",
             "sections": written,
             "latex": latex,
             "references_bib": references_bib,
             "artifact_manifest": artifact_manifest,
             "pdf": {
                 "ok": bool(compile_result.get("ok")),
-                "filename": compile_result.get("pdf_path") or f"{base_filename}.pdf",
+                "filename": compile_result.get("pdf_path") or "paper.pdf",
                 "error": str(compile_result.get("error") or "").strip(),
                 "log": str(compile_result.get("log") or "").strip(),
             },
             "figures": figures,
-            "provenance": provenance,
-            "verification": verification,
-            "draft": {"title": title, "markdown": markdown_preview},
+            "draft": {"title": bundle_title(written, request_payload), "markdown": markdown_preview},
             "ledger": ledger,
             "validation": validation,
             "artifact_files": ledger.get("artifact_files", []),
         }
         write_json_file(run_directory / "bundle.json", {"bundle": bundle, "publication": None})
+        self._run_store(run_id).record_artifact(stage="3", artifact_id="paper-tex", artifact_type="latex", path="paper.tex", description="Compiled manuscript source.")
+        self._run_store(run_id).record_artifact(stage="3", artifact_id="paper-pdf", artifact_type="pdf", path="paper.pdf", description="Compiled manuscript PDF.")
         return bundle
 
     def bundle_figures_from_ledger(self, *, run_id: str, ledger: dict[str, Any]) -> list[dict[str, Any]]:
         figures: list[dict[str, Any]] = []
         run_directory = self.run_directory(run_id)
+        summaries_by_artifact_id = {
+            str(entry.get("artifact_id") or "").strip(): entry for entry in ledger.get("figure_summaries", []) if isinstance(entry, dict)
+        }
         for artifact in ledger.get("artifacts", []):
             if not isinstance(artifact, dict):
                 continue
@@ -1180,10 +1155,13 @@ Rules:
             path = run_directory / artifact_path
             if not path.exists() or not path.is_file():
                 continue
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            summary = summaries_by_artifact_id.get(artifact_id) or {}
             figures.append(
                 {
                     "filename": path.name,
-                    "caption": str(artifact.get("description") or "").strip(),
+                    "caption": str(artifact.get("description") or summary.get("title") or "").strip(),
+                    "summary_markdown": str(summary.get("summary_markdown") or "").strip(),
                     "mime_type": mime_type,
                     "base64_data": base64.b64encode(path.read_bytes()).decode("utf-8"),
                 }
@@ -1194,6 +1172,110 @@ Rules:
         directory = self._config.artifact_root / run_id
         directory.mkdir(parents=True, exist_ok=True)
         return directory
+
+    def _run_store(self, run_id: str) -> SidekickRunStore:
+        return SidekickRunStore(run_id=run_id, root=self._config.artifact_root)
+
+    def _run_model_json(
+        self,
+        *,
+        run_id: str,
+        stage: str,
+        agent: str,
+        model: str,
+        instructions: str,
+        input_text: str,
+        use_code_interpreter: bool,
+        use_web_search: bool,
+        timeout_seconds: int,
+        reasoning_effort: str | None,
+    ) -> dict[str, Any]:
+        store = self._run_store(run_id)
+        prompt = f"{instructions.strip()}\n\nINPUT\n{input_text.strip()}"
+        handle = store.start_call(
+            stage=stage,
+            agent=agent,
+            model=model,
+            prompt=prompt,
+            parameters={
+                "use_code_interpreter": use_code_interpreter,
+                "use_web_search": use_web_search,
+                "timeout_seconds": timeout_seconds,
+                "reasoning_effort": reasoning_effort,
+            },
+        )
+        started_ms = store.elapsed_ms()
+        try:
+            response = self._openai_client.generate_json(
+                instructions=instructions,
+                input_text=input_text,
+                use_code_interpreter=use_code_interpreter,
+                use_web_search=use_web_search,
+                timeout_seconds=timeout_seconds,
+                model=model,
+                reasoning_effort=reasoning_effort,
+                on_delta=lambda delta: store.append_call_delta(handle, delta),
+                on_event=lambda event: store.append_call_delta(handle, "", raw_event=event),
+            )
+        except Exception as error:
+            store.fail_call(handle, error=str(error), latency_ms=max(0, store.elapsed_ms() - started_ms))
+            raise
+        latency_ms = max(0, store.elapsed_ms() - started_ms)
+        usage = {"input_tokens": response.usage.input_tokens, "output_tokens": response.usage.output_tokens}
+        store.complete_call(handle, response_text=response.output_text, usage=usage, latency_ms=latency_ms, raw_payload=response.payload)
+        self._emit_status(run_id, stage=stage, progress_message=f"{agent} completed.", status="running", openai_response_id=response.response_id)
+        self._emit_metrics(run_id, model=model, input_tokens=response.usage.input_tokens, output_tokens=response.usage.output_tokens)
+        payload = extract_json_object(response.output_text)
+        payload["_response"] = response
+        return payload
+
+    def _reference_catalog(self, ledger: dict[str, Any]) -> list[dict[str, Any]]:
+        catalog: list[dict[str, Any]] = []
+        for index, source in enumerate(ledger.get("sources") or []):
+            if not isinstance(source, dict):
+                continue
+            key = f"ref{index + 1}"
+            parts = [str(source.get("label") or "Source").strip()]
+            for field in ("accession_id", "download_url", "landing_page_url", "notes"):
+                value = str(source.get(field) or "").strip()
+                if value:
+                    parts.append(value)
+            catalog.append({"key": key, "source_id": source.get("source_id"), "text": ". ".join(parts)})
+        return catalog
+
+    def _ensure_artifact_metadata(self, ledger: dict[str, Any]) -> None:
+        summaries_by_artifact_id = {
+            str(entry.get("artifact_id") or "").strip(): entry for entry in ledger.get("figure_summaries", []) if isinstance(entry, dict)
+        }
+        for artifact in ledger.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            path = str(artifact.get("path") or "").strip()
+            if not path:
+                continue
+            artifact["mime_type"] = artifact.get("mime_type") or guess_mime_type(path)
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            if artifact["mime_type"].startswith("image/") and artifact_id in summaries_by_artifact_id:
+                artifact["description"] = artifact.get("description") or summaries_by_artifact_id[artifact_id].get("title") or artifact.get("description")
+
+    def _choose_search_winner(self, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+        valid = [candidate for candidate in candidates if str(candidate.get("status") or "").strip().lower() == "found"]
+        if not valid:
+            return None
+        valid.sort(
+            key=lambda candidate: (
+                0 if candidate.get("domain_mode") == "allow_list" else 1,
+                0 if str((candidate.get("dataset") or {}).get("download_url") or "").strip() else 1,
+                0 if str((candidate.get("dataset") or {}).get("accession_id") or "").strip() else 1,
+            )
+        )
+        return valid[0]
+
+    def _choose_legacy_search_candidate(self, candidates: list[dict[str, Any]]) -> dict[str, Any] | None:
+        for candidate in candidates:
+            if candidate.get("research_question") and (candidate.get("sources") or candidate.get("artifacts")):
+                return candidate
+        return None
 
     def _emit_status(
         self,
@@ -1217,9 +1299,19 @@ Rules:
     def _emit_metrics(self, run_id: str, *, model: str, input_tokens: int, output_tokens: int) -> None:
         if self._metrics_callback is None:
             return
-        self._metrics_callback(
-            run_id,
-            model=model,
-            input_tokens=input_tokens,
-            output_tokens=output_tokens,
-        )
+        self._metrics_callback(run_id, model=model, input_tokens=input_tokens, output_tokens=output_tokens)
+
+    def _exit_code_for_stage(self, stage: str) -> int:
+        if stage == "1":
+            return 1
+        if stage == "2.5":
+            return 2
+        if stage == "3":
+            return 3
+        if stage == "4":
+            return 4
+        return 20
+
+
+def bundle_title(written: dict[str, Any], request_payload: dict[str, Any]) -> str:
+    return str(written.get("title") or request_payload.get("title") or "Research paper").strip() or "Research paper"

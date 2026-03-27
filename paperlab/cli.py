@@ -6,7 +6,6 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -16,21 +15,19 @@ from github_bootstrap_service.bootstrap_service.openai_client import OpenAIClien
 from github_bootstrap_service.bootstrap_service.pipeline_engine import (
     PaperPipelineEngine,
     PipelineExecutionError,
-    build_validation_error_message,
     read_json_file,
     write_json_file,
 )
-from github_bootstrap_service.bootstrap_service.resolver import SourceFamilyResolver
+from github_bootstrap_service.bootstrap_service.pipeline_runtime import (
+    DEFAULT_RUN_ROOT,
+    SidekickRunStore,
+    iter_jsonl,
+    load_sidekick_config,
+    save_sidekick_config,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-RUNS_ROOT = REPO_ROOT / "paperlab" / "runs"
-FIXTURES_ROOT = REPO_ROOT / "paperlab" / "fixtures"
-DEFAULT_RENDER_SERVICE_ID = os.getenv("SIDEKICK_RENDER_SERVICE_ID", "srv-d70bar1r0fns73co8f9g").strip() or "srv-d70bar1r0fns73co8f9g"
-DEFAULT_RENDER_SERVICE_NAME = os.getenv("SIDEKICK_RENDER_SERVICE_NAME", "sidekick").strip() or "sidekick"
-DEFAULT_RENDER_SERVICE_URL = os.getenv("SIDEKICK_RENDER_SERVICE_URL", "https://sidekick-ion1.onrender.com").strip() or "https://sidekick-ion1.onrender.com"
-RENDER_SUCCESS_STATES = {"live"}
-RENDER_FAILURE_STATES = {"build_failed", "update_failed", "canceled", "failed"}
-RENDER_TERMINAL_STATES = RENDER_SUCCESS_STATES | RENDER_FAILURE_STATES | {"deactivated"}
+RUNS_ROOT = DEFAULT_RUN_ROOT
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,335 +36,475 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return args.func(args)
     except PipelineExecutionError as error:
-        print(f"[{error.stage}] {error}", file=sys.stderr)
-        return 1
+        if args.command == "_worker":
+            return exit_code_for_stage(error.stage)
+        print(str(error), file=sys.stderr)
+        return exit_code_for_stage(error.stage)
     except FileNotFoundError as error:
         print(str(error), file=sys.stderr)
         return 1
     except ValueError as error:
         print(str(error), file=sys.stderr)
-        return 1
+        return 20
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="paperlab", description="Terminal-first harness for the Sidekick paper engine.")
+    parser = argparse.ArgumentParser(prog="sidekick", description="Terminal-first research paper pipeline.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    run_parser = subparsers.add_parser("run", help="Run the full pipeline locally.")
-    add_payload_arguments(run_parser)
-    run_parser.add_argument("--run-id", help="Optional run id. Defaults to a generated timestamp slug.")
+    run_parser = subparsers.add_parser("run", help="Start a pipeline run and return a run id immediately.")
+    run_parser.add_argument("note", nargs="?", help="Research note text.")
+    run_parser.add_argument("--notes-file", help="Read the note text from a file.")
+    run_parser.add_argument("--title", help="Explicit title for the run.")
+    run_parser.add_argument("--theme", help="Explicit theme for the run.")
+    run_parser.add_argument("--run-id", help="Optional run id.")
+    run_parser.add_argument("--foreground", action="store_true", help="Run inline instead of spawning a background worker.")
+    run_parser.add_argument("--json", action="store_true", help="Print JSON instead of plain text.")
     run_parser.set_defaults(func=run_command)
 
-    workspace_parser = subparsers.add_parser("workspace", help="Run or rerun the workspace stage for a saved run.")
-    add_run_ref_argument(workspace_parser)
-    workspace_parser.set_defaults(func=workspace_command)
-
-    resolve_parser = subparsers.add_parser("resolve", help="Resolve the primary dataset/source family for a payload.")
-    add_payload_arguments(resolve_parser)
-    resolve_parser.set_defaults(func=resolve_command)
-
-    validate_parser = subparsers.add_parser("validate", help="Run or rerun the validation stage for a saved run.")
-    add_run_ref_argument(validate_parser)
-    validate_parser.set_defaults(func=validate_command)
-
-    write_parser = subparsers.add_parser("write", help="Run or rerun the writer stage for a saved run.")
-    add_run_ref_argument(write_parser)
-    write_parser.set_defaults(func=write_command)
-
-    render_parser = subparsers.add_parser("render", help="Rerender LaTeX and PDF from saved sections without new model calls.")
+    render_parser = subparsers.add_parser("render", help="Legacy compatibility: rerender a saved run.")
     add_run_ref_argument(render_parser)
     render_parser.set_defaults(func=render_command)
 
-    inspect_parser = subparsers.add_parser("inspect", help="Inspect a saved run and its local artifacts.")
-    add_run_ref_argument(inspect_parser)
-    inspect_parser.add_argument(
-        "--file",
-        choices=["input", "ledger", "validation", "sections", "bundle", "events", "metrics"],
-        help="Print one saved artifact instead of the summary.",
-    )
-    inspect_parser.set_defaults(func=inspect_command)
-
-    open_parser = subparsers.add_parser("open", help="Open a saved run artifact in Finder/default app.")
-    add_run_ref_argument(open_parser)
-    open_parser.add_argument("--target", choices=["pdf", "tex", "dir", "compile-log"], default="pdf")
-    open_parser.set_defaults(func=open_command)
-
-    latest_parser = subparsers.add_parser("latest", help="Print the latest local run directory.")
-    latest_parser.set_defaults(func=latest_command)
-
-    runs_parser = subparsers.add_parser("runs", help="List recent local runs with approval and dataset status.")
-    runs_parser.add_argument("--limit", type=int, default=10, help="Maximum number of runs to print.")
-    runs_parser.set_defaults(func=runs_command)
-
-    app_state_parser = subparsers.add_parser("app-state", help="Inspect the Sidekick simulator SwiftData store.")
-    add_app_state_arguments(app_state_parser)
-    app_state_parser.set_defaults(func=app_state_command)
-
-    render_status_parser = subparsers.add_parser("render-status", help="Inspect or wait on Render backend deploy status.")
-    add_render_status_arguments(render_status_parser)
+    render_status_parser = subparsers.add_parser("render-status", help="Legacy compatibility: inspect Render deploy state.")
+    render_status_parser.add_argument("--service-id", default=os.getenv("SIDEKICK_RENDER_SERVICE_ID", ""))
+    render_status_parser.add_argument("--service-name", default=os.getenv("SIDEKICK_RENDER_SERVICE_NAME", "sidekick"))
+    render_status_parser.add_argument("--service-url", default=os.getenv("SIDEKICK_RENDER_SERVICE_URL", ""))
+    render_status_parser.add_argument("--commit")
+    render_status_parser.add_argument("--wait", action="store_true")
+    render_status_parser.add_argument("--timeout-seconds", type=int, default=300)
+    render_status_parser.add_argument("--poll-seconds", type=int, default=5)
+    render_status_parser.add_argument("--json", action="store_true")
     render_status_parser.set_defaults(func=render_status_command)
+
+    worker_parser = subparsers.add_parser("_worker")
+    worker_parser.add_argument("run_id")
+    worker_parser.set_defaults(func=worker_command)
+
+    status_parser = subparsers.add_parser("status", help="Show run state.")
+    add_run_ref_argument(status_parser)
+    status_parser.add_argument("--watch", action="store_true")
+    status_parser.add_argument("--json", action="store_true")
+    status_parser.set_defaults(func=status_command)
+
+    list_parser = subparsers.add_parser("list", help="List all runs.")
+    list_parser.add_argument("--json", action="store_true")
+    list_parser.set_defaults(func=list_command)
+
+    cancel_parser = subparsers.add_parser("cancel", help="Cancel a running pipeline.")
+    add_run_ref_argument(cancel_parser)
+    cancel_parser.set_defaults(func=cancel_command)
+
+    logs_parser = subparsers.add_parser("logs", help="Read logs for a run.")
+    add_run_ref_argument(logs_parser)
+    logs_parser.add_argument("--stage")
+    logs_parser.add_argument("--level", choices=["debug", "info", "warn", "error"])
+    logs_parser.add_argument("--follow", action="store_true")
+    logs_parser.add_argument("--since")
+    logs_parser.add_argument("--tail", type=int)
+    logs_parser.add_argument("--json", action="store_true")
+    logs_parser.set_defaults(func=logs_command)
+
+    log_level_parser = subparsers.add_parser("log-level", help="Get or set the log level for a running run.")
+    add_run_ref_argument(log_level_parser)
+    log_level_subparsers = log_level_parser.add_subparsers(dest="action", required=True)
+    log_level_get = log_level_subparsers.add_parser("get")
+    log_level_get.set_defaults(func=log_level_get_command)
+    log_level_set = log_level_subparsers.add_parser("set")
+    log_level_set.add_argument("level", choices=["debug", "info", "warn", "error"])
+    log_level_set.set_defaults(func=log_level_set_command)
+
+    calls_parser = subparsers.add_parser("calls", help="List LLM calls for a run.")
+    add_run_ref_argument(calls_parser)
+    calls_parser.add_argument("--stage")
+    calls_parser.add_argument("--json", action="store_true")
+    calls_parser.set_defaults(func=calls_command)
+
+    call_parser = subparsers.add_parser("call", help="Show an individual LLM call.")
+    add_run_ref_argument(call_parser)
+    call_parser.add_argument("call_id")
+    call_parser.add_argument("--prompt", action="store_true")
+    call_parser.add_argument("--response", action="store_true")
+    call_parser.set_defaults(func=call_command)
+
+    stream_parser = subparsers.add_parser("stream", help="Attach to the active LLM call stream.")
+    add_run_ref_argument(stream_parser)
+    stream_parser.add_argument("--stage")
+    stream_parser.add_argument("--raw", action="store_true")
+    stream_parser.set_defaults(func=stream_command)
+
+    artifacts_parser = subparsers.add_parser("artifacts", help="List artifacts produced by a run.")
+    add_run_ref_argument(artifacts_parser)
+    artifacts_parser.add_argument("--stage")
+    artifacts_parser.add_argument("--download")
+    artifacts_parser.add_argument("--json", action="store_true")
+    artifacts_parser.set_defaults(func=artifacts_command)
+
+    artifact_parser = subparsers.add_parser("artifact", help="Dump an artifact to stdout.")
+    add_run_ref_argument(artifact_parser)
+    artifact_parser.add_argument("artifact_id")
+    artifact_parser.set_defaults(func=artifact_command)
+
+    retries_parser = subparsers.add_parser("retries", help="Inspect retry history.")
+    add_run_ref_argument(retries_parser)
+    retries_parser.add_argument("--attempt", type=int)
+    retries_parser.add_argument("--json", action="store_true")
+    retries_parser.set_defaults(func=retries_command)
+
+    events_parser = subparsers.add_parser("events", help="Read structured run events.")
+    add_run_ref_argument(events_parser)
+    events_parser.add_argument("--stage")
+    events_parser.add_argument("--follow", action="store_true")
+    events_parser.add_argument("--json", action="store_true")
+    events_parser.set_defaults(func=events_command)
+
+    config_parser = subparsers.add_parser("config", help="Manage Sidekick CLI config.")
+    config_subparsers = config_parser.add_subparsers(dest="action", required=True)
+    config_set = config_subparsers.add_parser("set")
+    config_set.add_argument("key")
+    config_set.add_argument("value")
+    config_set.set_defaults(func=config_set_command)
+    config_get = config_subparsers.add_parser("get")
+    config_get.add_argument("key")
+    config_get.set_defaults(func=config_get_command)
+    config_list = config_subparsers.add_parser("list")
+    config_list.set_defaults(func=config_list_command)
 
     return parser
 
 
-def add_payload_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--input", help="JSON file with the full request payload.")
-    parser.add_argument("--title", help="Title for the run when not using --input.")
-    parser.add_argument("--theme", help="Theme for the run when not using --input.")
-    parser.add_argument("--notes", help="Research prompt text.")
-    parser.add_argument("--notes-file", help="File containing the research prompt text.")
-    parser.add_argument("--dataset-id", action="append", default=[], help="Explicit dataset id to preserve during resolution.")
-    parser.add_argument("--domain-guidance", help="Optional domain guidance text.")
-    parser.add_argument("--domain-guidance-file", help="File containing optional domain guidance text.")
-    parser.add_argument("--must-use-sources", help="JSON file containing must-use materials.")
-
-
 def add_run_ref_argument(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("run_ref", help="Run id, absolute path, or `latest`.")
-
-
-def add_app_state_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "section",
-        nargs="?",
-        default="summary",
-        choices=["summary", "notes", "papers", "runs", "all"],
-        help="Which section to print.",
-    )
-    parser.add_argument("--bundle-id", default="com.vineet.Sidekick", help="App bundle ID. Defaults to Sidekick.")
-    parser.add_argument("--device", default="booted", help="Simulator device selector for simctl. Defaults to `booted`.")
-    parser.add_argument("--store-path", help="Use an explicit SwiftData store path instead of resolving via simctl.")
-    parser.add_argument("--json", action="store_true", help="Print JSON instead of the human-readable summary.")
-
-
-def add_render_status_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--service-id", default=DEFAULT_RENDER_SERVICE_ID, help="Render service id. Defaults to the Sidekick backend.")
-    parser.add_argument("--service-name", default=DEFAULT_RENDER_SERVICE_NAME, help="Display name for the Render service.")
-    parser.add_argument("--service-url", default=DEFAULT_RENDER_SERVICE_URL, help="Display URL for the Render service.")
-    parser.add_argument("--commit", help="Commit sha or prefix to match against deploys.")
-    parser.add_argument("--wait", action="store_true", help="Poll until the matched deploy reaches a terminal state.")
-    parser.add_argument("--timeout-seconds", type=int, default=300, help="Maximum time to wait when --wait is set.")
-    parser.add_argument("--poll-seconds", type=int, default=5, help="Polling interval when --wait is set.")
-    parser.add_argument("--json", action="store_true", help="Print JSON instead of the human-readable summary.")
+    parser.add_argument("run_ref")
 
 
 def run_command(args: argparse.Namespace) -> int:
-    request_payload = resolve_request_payload(args)
-    run_id = args.run_id or generate_run_id(request_payload["title"])
-    runtime = CLIRuntime(run_id=run_id)
-    engine = build_engine(runtime=runtime)
-    run_directory = engine.run_directory(run_id)
-    write_json_file(run_directory / "input.json", request_payload)
-    print(f"run_id: {run_id}")
-    print(f"run_dir: {run_directory}")
-    outputs = engine.execute(run_id=run_id, request_payload=request_payload)
-    print_summary(run_directory, outputs["validation"], outputs["bundle"])
-    return 0
-
-
-def workspace_command(args: argparse.Namespace) -> int:
-    run_directory = resolve_run_directory(args.run_ref)
-    request_payload = read_json_file(run_directory / "input.json")
-    runtime = CLIRuntime(run_id=run_directory.name, run_directory=run_directory)
-    engine = build_engine(runtime=runtime)
-    ledger = engine.run_research_workspace(run_id=run_directory.name, request_payload=request_payload)
-    print(f"ledger: {run_directory / 'ledger.json'}")
-    print(f"results: {len(ledger.get('results') or [])}")
-    return 0
-
-
-def resolve_command(args: argparse.Namespace) -> int:
-    request_payload = resolve_request_payload(args)
-    resolution = SourceFamilyResolver().resolve(
-        title=str(request_payload.get("title") or "").strip(),
-        theme=str(request_payload.get("theme") or "").strip(),
-        notes=normalize_cli_notes(request_payload.get("notes")),
-        dataset_hints=request_payload.get("dataset_hints") or [],
-        dataset_ids=request_payload.get("dataset_ids") or [],
+    note = resolve_note_text(args.note, args.notes_file)
+    if not note:
+        raise ValueError("Provide a note argument or --notes-file.")
+    title = str(args.title or derive_title(note)).strip() or "Untitled research run"
+    theme = str(args.theme or title).strip() or title
+    run_id = args.run_id or generate_run_id(title)
+    run_dir = run_directory(run_id)
+    write_json_file(
+        run_dir / "input.json",
+        {
+            "title": title,
+            "theme": theme,
+            "notes": note,
+        },
     )
-    print(json.dumps(resolution.as_dict(), indent=2, sort_keys=True))
-    return 0
+    store = SidekickRunStore(run_id=run_id, root=RUNS_ROOT)
+    state = store.read_state()
+    state.update({"title": title, "note": note, "updated_at": iso_now()})
+    store.write_state(state)
 
+    run_foreground = args.foreground or RUNS_ROOT != DEFAULT_RUN_ROOT
+    if run_foreground:
+        exit_code = worker_main(run_id)
+        if args.json:
+            print(json.dumps({"run_id": run_id, "run_dir": str(run_dir), "exit_code": exit_code}, indent=2, sort_keys=True))
+        else:
+            print(run_id)
+        return exit_code
 
-def validate_command(args: argparse.Namespace) -> int:
-    run_directory = resolve_run_directory(args.run_ref)
-    runtime = CLIRuntime(run_id=run_directory.name, run_directory=run_directory)
-    engine = build_engine(runtime=runtime, require_openai=False)
-    validation = engine.validate_ledger(
-        run_id=run_directory.name,
-        ledger=read_json_file(run_directory / "ledger.json"),
-        request_payload=read_json_file(run_directory / "input.json"),
+    command = [sys.executable, "-m", "paperlab.cli", "_worker", run_id]
+    subprocess.Popen(
+        command,
+        cwd=str(REPO_ROOT),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        env=os.environ.copy(),
     )
-    print(f"validation: {run_directory / 'validation.json'}")
-    print(f"manuscript_kind: {validation.get('manuscript_kind')}")
-    print(validation.get("summary") or "")
-    return 0
-
-
-def write_command(args: argparse.Namespace) -> int:
-    run_directory = resolve_run_directory(args.run_ref)
-    runtime = CLIRuntime(run_id=run_directory.name, run_directory=run_directory)
-    engine = build_engine(runtime=runtime, require_openai=True)
-    bundle = engine.write_bundle(
-        run_id=run_directory.name,
-        request_payload=read_json_file(run_directory / "input.json"),
-        ledger=read_json_file(run_directory / "ledger.json"),
-        validation=read_json_file(run_directory / "validation.json"),
-    )
-    print_bundle_paths(run_directory, bundle)
+    if args.json:
+        print(json.dumps({"run_id": run_id, "run_dir": str(run_dir)}, indent=2, sort_keys=True))
+    else:
+        print(run_id)
     return 0
 
 
 def render_command(args: argparse.Namespace) -> int:
-    run_directory = resolve_run_directory(args.run_ref)
-    runtime = CLIRuntime(run_id=run_directory.name, run_directory=run_directory)
-    engine = build_engine(runtime=runtime, require_openai=False)
-    bundle = engine.render_bundle(
-        run_id=run_directory.name,
-        request_payload=read_json_file(run_directory / "input.json"),
-        ledger=read_json_file(run_directory / "ledger.json"),
-        validation=read_json_file(run_directory / "validation.json"),
-        sections=read_json_file(run_directory / "sections.json"),
-    )
-    print_bundle_paths(run_directory, bundle)
+    run_dir = resolve_run_directory(args.run_ref)
+    bundle_path = run_dir / "bundle.json"
+    if not bundle_path.exists():
+        raise FileNotFoundError(f"Missing bundle.json for {run_dir.name}")
+    bundle_payload = read_json_file(bundle_path)
+    bundle = bundle_payload.get("bundle") if isinstance(bundle_payload.get("bundle"), dict) else bundle_payload
+    if not bundle:
+        raise FileNotFoundError(f"Missing bundle payload for {run_dir.name}")
+    print(json.dumps(bundle, indent=2, sort_keys=True))
     return 0
 
 
-def inspect_command(args: argparse.Namespace) -> int:
-    run_directory = resolve_run_directory(args.run_ref)
-    if args.file:
-        print_artifact(run_directory, args.file)
+def worker_command(args: argparse.Namespace) -> int:
+    return worker_main(args.run_id)
+
+
+def worker_main(run_id: str) -> int:
+    run_dir = run_directory(run_id)
+    payload = read_json_file(run_dir / "input.json")
+    engine = build_engine(require_openai=True)
+    store = SidekickRunStore(run_id=run_id, root=RUNS_ROOT)
+    try:
+        engine.execute(run_id=run_id, request_payload=payload)
+        store.complete_stage(stage="4", agent="github-push", artifacts=[])
+        store.complete_run(exit_code=0)
         return 0
-
-    input_payload = maybe_read_json(run_directory / "input.json")
-    ledger = maybe_read_json(run_directory / "ledger.json")
-    validation = maybe_read_json(run_directory / "validation.json")
-    sections = maybe_read_json(run_directory / "sections.json")
-    bundle_envelope = maybe_read_json(run_directory / "bundle.json")
-    bundle = bundle_envelope.get("bundle") if isinstance(bundle_envelope, dict) else {}
-
-    print(f"run_dir: {run_directory}")
-    if input_payload:
-        print(f"title: {input_payload.get('title')}")
-        print(f"theme: {input_payload.get('theme')}")
-        resolution = input_payload.get("resolution") if isinstance(input_payload.get("resolution"), dict) else {}
-        if resolution:
-            print(f"paper_mode: {resolution.get('paper_mode')}")
-            print(f"resolution: {resolution.get('status')}")
-            selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
-            if selected_candidate:
-                print(f"primary_dataset: {selected_candidate.get('dataset_id')}")
-    if ledger:
-        print(f"ledger results: {len(ledger.get('results') or [])}")
-        print(f"ledger artifacts: {len(ledger.get('artifacts') or [])}")
-        print(f"ledger sources: {len(ledger.get('sources') or [])}")
-    if validation:
-        print(f"manuscript_kind: {validation.get('manuscript_kind')}")
-        print(f"approved_results: {len(validation.get('approved_results') or [])}")
-        print(f"missing_notes: {len(validation.get('missing_note_ids') or [])}")
-        print(f"summary: {validation.get('summary')}")
-        if validation.get("manuscript_kind") != "paper":
-            print(build_validation_error_message(validation))
-    if sections:
-        print(f"sections: {', '.join(sorted(key for key in sections.keys() if key != 'references'))}")
-    if bundle:
-        pdf = bundle.get("pdf") or {}
-        print(f"pdf_ok: {pdf.get('ok')}")
-        print(f"pdf_file: {run_directory / (pdf.get('filename') or 'paper.pdf')}")
-        print(f"tex_file: {run_directory / ('memo.tex' if bundle.get('manuscript_kind') == 'memo' else 'paper.tex')}")
-    print("artifacts:")
-    for candidate in ["input.json", "ledger.json", "validation.json", "sections.json", "bundle.json", "compile.log"]:
-        path = run_directory / candidate
-        if path.exists():
-            print(f"  {path}")
-    return 0
+    except PipelineExecutionError as error:
+        return exit_code_for_stage(error.stage)
 
 
-def open_command(args: argparse.Namespace) -> int:
-    run_directory = resolve_run_directory(args.run_ref)
-    target = {
-        "pdf": first_existing(run_directory / "paper.pdf", run_directory / "memo.pdf", run_directory / "paper.tex", run_directory / "memo.tex"),
-        "tex": first_existing(run_directory / "paper.tex", run_directory / "memo.tex"),
-        "dir": run_directory,
-        "compile-log": run_directory / "compile.log",
-    }[args.target]
-    if target is None or not target.exists():
-        raise FileNotFoundError(f"No {args.target} artifact exists for {run_directory.name}.")
-
-    if sys.platform == "darwin":
-        subprocess.run(["open", str(target)], check=True)
-    else:
-        print(target)
-    return 0
-
-
-def latest_command(_: argparse.Namespace) -> int:
-    print(resolve_run_directory("latest"))
-    return 0
-
-
-def runs_command(args: argparse.Namespace) -> int:
-    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
-    runs = sorted(
-        [path for path in RUNS_ROOT.iterdir() if path.is_dir()],
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[: max(1, args.limit)]
-
-    if not runs:
-        print("No local paperlab runs exist yet.")
+def status_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    def render() -> None:
+        payload = build_status_payload(run_dir)
+        if args.json:
+            print(json.dumps(payload, indent=2, sort_keys=True))
+        else:
+            print_status_payload(payload)
+    if not args.watch:
+        render()
         return 0
+    while True:
+        render()
+        payload = build_status_payload(run_dir)
+        if payload.get("status") in {"completed", "failed", "cancelled"}:
+            return int(payload.get("exit_code") or 0)
+        time.sleep(2)
 
-    print("run_id\tkind\tapproved\tmissing_notes\tpaper_mode\tresolution\tprimary_dataset\tlast_event")
-    for run_directory in runs:
-        input_payload = maybe_read_json(run_directory / "input.json")
-        validation = maybe_read_json(run_directory / "validation.json")
-        resolution = {}
-        if isinstance(input_payload.get("resolution"), dict):
-            resolution = input_payload["resolution"]
-        elif isinstance(validation.get("resolution"), dict):
-            resolution = validation["resolution"]
-        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
+
+def list_command(args: argparse.Namespace) -> int:
+    runs = sorted([path for path in RUNS_ROOT.iterdir() if path.is_dir()], key=lambda path: path.stat().st_mtime, reverse=True)
+    payload = [build_status_payload(run) for run in runs]
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+    for entry in payload:
         print(
-            "\t".join(
+            " | ".join(
                 [
-                    run_directory.name,
-                    str(validation.get("manuscript_kind") or "-"),
-                    str(len(validation.get("approved_results") or [])),
-                    str(len(validation.get("missing_note_ids") or [])),
-                    str(resolution.get("paper_mode") or "-"),
-                    str(resolution.get("status") or "-"),
-                    str(selected_candidate.get("dataset_id") or "-"),
-                    last_event_summary(run_directory),
+                    str(entry.get("run_id") or "-"),
+                    str(entry.get("status") or "-"),
+                    str(entry.get("current_stage") or "-"),
+                    str(entry.get("health") or "-"),
+                    str(entry.get("title") or "-"),
                 ]
             )
         )
     return 0
 
 
-def app_state_command(args: argparse.Namespace) -> int:
-    command = [
-        sys.executable,
-        str((REPO_ROOT / "scripts" / "sidekick_state.py").resolve()),
-        args.section,
-        "--bundle-id",
-        str(args.bundle_id),
-        "--device",
-        str(args.device),
-    ]
-    if args.store_path:
-        command.extend(["--store-path", str(args.store_path)])
-    if args.json:
-        command.append("--json")
+def cancel_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    store = SidekickRunStore(run_id=run_dir.name, root=RUNS_ROOT)
+    store.request_cancel()
+    print(json.dumps({"run_id": run_dir.name, "cancel_requested": True}, indent=2, sort_keys=True))
+    return 0
 
-    completed = subprocess.run(command, check=False)
-    return int(completed.returncode)
+
+def logs_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    path = log_path(run_dir, args.stage)
+    return stream_jsonl_command(path=path, args=args, stage_filter=args.stage, level_filter=args.level)
+
+
+def log_level_get_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    store = SidekickRunStore(run_id=run_dir.name, root=RUNS_ROOT)
+    print(store.current_log_level())
+    return 0
+
+
+def log_level_set_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    store = SidekickRunStore(run_id=run_dir.name, root=RUNS_ROOT)
+    state = store.read_state()
+    state["log_level"] = args.level
+    store.write_state(state)
+    print(args.level)
+    return 0
+
+
+def calls_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    entries = []
+    for path in sorted((run_dir / "calls").glob("*.json")):
+        if path.name.endswith(".stream.json"):
+            continue
+        payload = read_json_file(path)
+        if args.stage and str(payload.get("stage") or "").strip() != args.stage:
+            continue
+        entries.append(
+            {
+                "call_id": payload.get("call_id"),
+                "stage": payload.get("stage"),
+                "agent": payload.get("agent"),
+                "model": payload.get("model"),
+                "status": payload.get("status"),
+                "latency_ms": payload.get("latency_ms"),
+                "usage": payload.get("usage"),
+            }
+        )
+    if args.json:
+        print(json.dumps(entries, indent=2, sort_keys=True))
+        return 0
+    for entry in entries:
+        print(
+            " | ".join(
+                [
+                    str(entry.get("call_id") or "-"),
+                    str(entry.get("stage") or "-"),
+                    str(entry.get("model") or "-"),
+                    str(entry.get("status") or "-"),
+                    str((entry.get("usage") or {}).get("output_tokens") or 0),
+                ]
+            )
+        )
+    return 0
+
+
+def call_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    payload = read_json_file(run_dir / "calls" / f"{args.call_id}.json")
+    if args.prompt:
+        print(str(payload.get("prompt") or ""))
+        return 0
+    if args.response:
+        print(str(payload.get("response") or ""))
+        return 0
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def stream_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    active_call = latest_active_call(run_dir, stage=args.stage)
+    if active_call is None:
+        raise FileNotFoundError("No active call stream found.")
+    stream_path = run_dir / "calls" / f"{active_call}.stream.jsonl"
+    position = 0
+    while True:
+        if not stream_path.exists():
+            time.sleep(0.25)
+            continue
+        with stream_path.open("r", encoding="utf-8") as handle:
+            handle.seek(position)
+            lines = handle.readlines()
+            position = handle.tell()
+        for line in lines:
+            payload = json.loads(line)
+            if args.raw:
+                print(json.dumps(payload, sort_keys=True))
+            else:
+                if payload.get("event") == "delta":
+                    print(str(payload.get("delta") or ""), end="", flush=True)
+                elif payload.get("event") in {"completed", "failed"}:
+                    if payload.get("event") == "completed":
+                        print()
+                    return 0
+        time.sleep(0.25)
+
+
+def artifacts_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    payload = read_json_file(run_dir / "artifacts.json")
+    artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else []
+    if args.stage:
+        artifacts = [artifact for artifact in artifacts if str(artifact.get("stage") or "").strip() == args.stage]
+    if args.download:
+        destination = Path(args.download).expanduser().resolve()
+        destination.mkdir(parents=True, exist_ok=True)
+        for artifact in artifacts:
+            source = run_dir / str(artifact.get("path") or "")
+            if not source.exists() or not source.is_file():
+                continue
+            target = destination / source.name
+            target.write_bytes(source.read_bytes())
+    if args.json:
+        print(json.dumps(artifacts, indent=2, sort_keys=True))
+        return 0
+    for artifact in artifacts:
+        print(
+            " | ".join(
+                [
+                    str(artifact.get("artifact_id") or "-"),
+                    str(artifact.get("stage") or "-"),
+                    str(artifact.get("artifact_type") or "-"),
+                    str(artifact.get("path") or "-"),
+                ]
+            )
+        )
+    return 0
+
+
+def artifact_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    payload = read_json_file(run_dir / "artifacts.json")
+    artifacts = payload.get("artifacts") if isinstance(payload.get("artifacts"), list) else []
+    artifact = next((entry for entry in artifacts if str(entry.get("artifact_id") or "") == args.artifact_id), None)
+    if artifact is None:
+        raise FileNotFoundError(f"Unknown artifact: {args.artifact_id}")
+    path = run_dir / str(artifact.get("path") or "")
+    if not path.exists():
+        raise FileNotFoundError(f"Artifact file does not exist: {path}")
+    sys.stdout.write(path.read_text(encoding="utf-8", errors="replace"))
+    return 0
+
+
+def retries_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    payload = read_json_file(run_dir / "retries.json")
+    attempts = payload.get("attempts") if isinstance(payload.get("attempts"), list) else []
+    if args.attempt is not None:
+        attempts = [entry for entry in attempts if int(entry.get("attempt") or 0) == args.attempt]
+    if args.json:
+        print(json.dumps(attempts, indent=2, sort_keys=True))
+        return 0
+    for entry in attempts:
+        print(
+            " | ".join(
+                [
+                    f"attempt {entry.get('attempt')}",
+                    str(entry.get("status") or "-"),
+                    str(entry.get("feedback_message") or "-"),
+                ]
+            )
+        )
+    return 0
+
+
+def events_command(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_directory(args.run_ref)
+    return stream_jsonl_command(path=run_dir / "events.jsonl", args=args, stage_filter=args.stage, level_filter=None)
+
+
+def config_set_command(args: argparse.Namespace) -> int:
+    payload = load_sidekick_config()
+    key = str(args.key).strip()
+    value: Any = args.value
+    if key == "stream_buffer_size":
+        value = int(value)
+    payload[key] = value
+    save_sidekick_config(payload)
+    print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def config_get_command(args: argparse.Namespace) -> int:
+    payload = load_sidekick_config()
+    print(payload.get(args.key))
+    return 0
+
+
+def config_list_command(_: argparse.Namespace) -> int:
+    print(json.dumps(load_sidekick_config(), indent=2, sort_keys=True))
+    return 0
 
 
 def render_status_command(args: argparse.Namespace) -> int:
     deadline = time.monotonic() + max(1, int(args.timeout_seconds))
     while True:
-        deploys = fetch_render_deploys(args.service_id)
+        deploys = fetch_render_deploys(str(args.service_id))
         selected = select_render_deploy(deploys, args.commit)
         payload = build_render_status_payload(
             deploys=deploys,
@@ -377,254 +514,194 @@ def render_status_command(args: argparse.Namespace) -> int:
             service_url=str(args.service_url),
             commit_ref=str(args.commit or "").strip() or None,
         )
-
         if args.json:
             print(json.dumps(payload, indent=2, sort_keys=True))
         else:
             print_render_status(payload)
-
         if not args.wait:
             return 0
         if render_wait_completed(payload, commit_ref=str(args.commit or "").strip() or None):
             return render_wait_exit_code(payload, commit_ref=str(args.commit or "").strip() or None)
         if time.monotonic() >= deadline:
-            if not args.json:
-                print(f"Timed out after {max(1, int(args.timeout_seconds))}s.")
             return 1
-        if not args.json:
-            print(f"Polling again in {max(1, int(args.poll_seconds))}s...")
         time.sleep(max(1, int(args.poll_seconds)))
 
 
-def build_engine(*, runtime: "CLIRuntime", require_openai: bool = True) -> PaperPipelineEngine:
+def build_engine(*, require_openai: bool) -> PaperPipelineEngine:
     config = build_local_config(require_openai=require_openai)
     return PaperPipelineEngine(
         config=config,
         openai_client=OpenAIClient(config),
-        status_callback=runtime.record_status,
-        metrics_callback=runtime.record_metrics,
-        source_resolver=SourceFamilyResolver(),
+        status_callback=lambda run_id, **kwargs: record_status(run_id, **kwargs),
+        metrics_callback=lambda run_id, **kwargs: record_metrics(run_id, **kwargs),
     )
 
 
-def build_local_config(*, require_openai: bool = True) -> BootstrapServiceConfig:
+def build_local_config(*, require_openai: bool) -> BootstrapServiceConfig:
     api_key = os.getenv("OPENAI_API_KEY", "").strip()
     if require_openai and not api_key:
         raise ValueError("Missing OPENAI_API_KEY.")
-
     return BootstrapServiceConfig(
-        github_client_id=os.getenv("GITHUB_CLIENT_ID", "paperlab").strip() or "paperlab",
-        github_client_secret=os.getenv("GITHUB_CLIENT_SECRET", "paperlab").strip() or "paperlab",
+        github_client_id=os.getenv("GITHUB_CLIENT_ID", "sidekick").strip() or "sidekick",
+        github_client_secret=os.getenv("GITHUB_CLIENT_SECRET", "sidekick").strip() or "sidekick",
         backend_base_url=os.getenv("SIDEKICK_BACKEND_BASE_URL", "http://localhost").strip() or "http://localhost",
-        openai_api_key=api_key or "paperlab-local-only",
-        backend_database_path=str((REPO_ROOT / ".sidekick-runtime" / "paperlab.sqlite3").resolve()),
+        openai_api_key=api_key or "sidekick-local-only",
+        backend_database_path=str((REPO_ROOT / ".sidekick-runtime" / "sidekick.sqlite3").resolve()),
         backend_artifact_root=str(RUNS_ROOT.resolve()),
-        openai_model=os.getenv("SIDEKICK_OPENAI_MODEL", "gpt-5-nano").strip() or "gpt-5-nano",
-        openai_workspace_model=os.getenv("SIDEKICK_OPENAI_WORKSPACE_MODEL", "gpt-5-mini").strip() or "gpt-5-mini",
-        openai_writer_model=os.getenv("SIDEKICK_OPENAI_WRITER_MODEL", "gpt-5-nano").strip() or "gpt-5-nano",
+        openai_model=os.getenv("SIDEKICK_OPENAI_MODEL", "gpt-5-mini").strip() or "gpt-5-mini",
+        openai_search_model=os.getenv("SIDEKICK_OPENAI_SEARCH_MODEL", "gpt-5-mini").strip() or "gpt-5-mini",
+        openai_validation_model=os.getenv("SIDEKICK_OPENAI_VALIDATION_MODEL", "gpt-5-mini").strip() or "gpt-5-mini",
+        openai_workspace_model=os.getenv("SIDEKICK_OPENAI_WORKSPACE_MODEL", "gpt-5.4").strip() or "gpt-5.4",
+        openai_writer_model=os.getenv("SIDEKICK_OPENAI_WRITER_MODEL", "gpt-5.4").strip() or "gpt-5.4",
         openai_reasoning_effort=os.getenv("SIDEKICK_OPENAI_REASONING_EFFORT", "").strip(),
         openai_base_url=os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").strip() or "https://api.openai.com/v1",
-        encryption_secret=os.getenv("SIDEKICK_ENCRYPTION_SECRET", "paperlab-secret").strip() or "paperlab-secret",
+        encryption_secret=os.getenv("SIDEKICK_ENCRYPTION_SECRET", "sidekick-secret").strip() or "sidekick-secret",
     )
 
 
-def resolve_request_payload(args: argparse.Namespace) -> dict[str, Any]:
-    if args.input:
-        return read_json_file(Path(args.input).expanduser().resolve())
-
-    notes = load_optional_text(args.notes, args.notes_file)
-    if not notes.strip():
-        raise ValueError("Provide --input or --notes/--notes-file.")
-
-    title = (args.title or derive_title(notes)).strip()
-    if not title:
-        raise ValueError("Could not derive a title. Pass --title explicitly.")
-
-    theme = str(args.theme or title).strip() or title
-    domain_guidance = load_optional_text(args.domain_guidance, args.domain_guidance_file).strip()
-    must_use_sources = []
-    if args.must_use_sources:
-        raw_sources = read_json_file(Path(args.must_use_sources).expanduser().resolve())
-        if isinstance(raw_sources, dict):
-            must_use_sources = raw_sources.get("must_use_sources") or []
-        elif isinstance(raw_sources, list):
-            must_use_sources = raw_sources
-
-    return {
-        "title": title,
-        "theme": theme,
-        "notes": notes,
-        "dataset_ids": [str(dataset_id).strip() for dataset_id in args.dataset_id if str(dataset_id).strip()],
-        "dataset_hints": [],
-        "must_use_sources": must_use_sources,
-        "domain_guidance": domain_guidance,
-    }
+def record_status(run_id: str, *, stage: str, progress_message: str, status: str | None = None, openai_response_id: str | None = None) -> None:
+    del openai_response_id
+    store = SidekickRunStore(run_id=run_id, root=RUNS_ROOT)
+    current = store.read_state()
+    current["current_stage"] = stage
+    current["status"] = status or current.get("status") or "running"
+    current["progress_message"] = progress_message
+    store.write_state(current)
 
 
-def resolve_run_directory(run_ref: str) -> Path:
-    RUNS_ROOT.mkdir(parents=True, exist_ok=True)
-    if run_ref == "latest":
-        candidates = [path for path in RUNS_ROOT.iterdir() if path.is_dir()]
-        if not candidates:
-            raise FileNotFoundError("No local paperlab runs exist yet.")
-        return max(candidates, key=lambda path: path.stat().st_mtime)
-
-    direct = Path(run_ref).expanduser()
-    if direct.exists():
-        return direct.resolve()
-
-    candidate = (RUNS_ROOT / run_ref).resolve()
-    if candidate.exists():
-        return candidate
-    raise FileNotFoundError(f"Unknown run reference: {run_ref}")
-
-
-def print_artifact(run_directory: Path, artifact_name: str) -> None:
-    mapping = {
-        "input": run_directory / "input.json",
-        "ledger": run_directory / "ledger.json",
-        "validation": run_directory / "validation.json",
-        "sections": run_directory / "sections.json",
-        "bundle": run_directory / "bundle.json",
-        "events": run_directory / "events.jsonl",
-        "metrics": run_directory / "metrics.jsonl",
-    }
-    path = mapping[artifact_name]
-    if not path.exists():
-        raise FileNotFoundError(f"{path.name} does not exist for {run_directory.name}.")
-    print(path.read_text(encoding="utf-8"))
-
-
-def print_summary(run_directory: Path, validation: dict[str, Any], bundle: dict[str, Any]) -> None:
-    print(f"manuscript_kind: {validation.get('manuscript_kind')}")
-    print(f"summary: {validation.get('summary')}")
-    if validation.get("manuscript_kind") != "paper":
-        print(build_validation_error_message(validation))
-    print_bundle_paths(run_directory, bundle)
-
-
-def print_bundle_paths(run_directory: Path, bundle: dict[str, Any]) -> None:
-    manuscript_kind = str(bundle.get("manuscript_kind") or "paper").strip() or "paper"
-    base = "memo" if manuscript_kind == "memo" else "paper"
-    print(f"sections: {run_directory / 'sections.json'}")
-    print(f"tex: {run_directory / f'{base}.tex'}")
-    print(f"pdf: {run_directory / f'{base}.pdf'}")
-    print(f"bundle: {run_directory / 'bundle.json'}")
-    pdf = bundle.get("pdf") or {}
-    if not pdf.get("ok"):
-        print(f"compile_error: {pdf.get('error')}")
-
-
-def maybe_read_json(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-    return read_json_file(path)
-
-
-def load_optional_text(inline_value: str | None, file_value: str | None) -> str:
-    if inline_value and inline_value.strip():
-        return inline_value
-    if file_value and file_value.strip():
-        return Path(file_value).expanduser().resolve().read_text(encoding="utf-8")
-    return ""
-
-
-def normalize_cli_notes(value: Any) -> list[dict[str, str]]:
-    if isinstance(value, list):
-        normalized: list[dict[str, str]] = []
-        for index, note in enumerate(value):
-            if not isinstance(note, dict):
-                continue
-            content = str(note.get("content") or "").strip()
-            if not content:
-                continue
-            normalized.append(
+def record_metrics(run_id: str, *, model: str, input_tokens: int, output_tokens: int) -> None:
+    metrics_path = run_directory(run_id) / "metrics.jsonl"
+    with metrics_path.open("a", encoding="utf-8") as handle:
+        handle.write(
+            json.dumps(
                 {
-                    "id": str(note.get("id") or f"note_{index + 1}").strip() or f"note_{index + 1}",
-                    "title": str(note.get("title") or derive_title(content)).strip() or derive_title(content),
-                    "content": content,
-                }
+                    "timestamp": iso_now(),
+                    "run_id": run_id,
+                    "model": model,
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                },
+                sort_keys=True,
             )
-        return normalized
-    if isinstance(value, str) and value.strip():
-        content = value.strip()
-        return [{"id": "note_1", "title": derive_title(content), "content": content}]
-    return []
+            + "\n"
+        )
 
 
-def derive_title(notes: str) -> str:
-    for line in notes.splitlines():
-        stripped = line.strip()
-        if stripped:
-            return stripped[:120]
-    return "Untitled research run"
+def build_status_payload(run_dir: Path) -> dict[str, Any]:
+    state = read_json_file(run_dir / "state.json") if (run_dir / "state.json").exists() else {}
+    updated_at = str(state.get("updated_at") or "").strip()
+    health = "unknown"
+    if state.get("status") in {"completed", "failed", "cancelled"}:
+        health = "terminal"
+    elif updated_at:
+        try:
+            delta = datetime.now(tz=UTC) - datetime.fromisoformat(updated_at)
+            health = "stalled" if delta.total_seconds() > 120 else "healthy"
+        except ValueError:
+            health = "healthy"
+    return {
+        "run_id": run_dir.name,
+        "title": state.get("title"),
+        "status": state.get("status"),
+        "current_stage": state.get("current_stage"),
+        "current_agent": state.get("current_agent"),
+        "progress_message": state.get("progress_message"),
+        "started_at": state.get("started_at"),
+        "updated_at": state.get("updated_at"),
+        "completed_at": state.get("completed_at"),
+        "exit_code": state.get("exit_code"),
+        "health": health,
+        "run_dir": str(run_dir),
+    }
 
 
-def generate_run_id(title: str) -> str:
-    timestamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
-    slug = re_slug(title)
-    return f"{timestamp}-{slug}"
+def print_status_payload(payload: dict[str, Any]) -> None:
+    print(f"run_id: {payload.get('run_id')}")
+    print(f"status: {payload.get('status')}")
+    print(f"stage: {payload.get('current_stage')}")
+    print(f"agent: {payload.get('current_agent')}")
+    print(f"health: {payload.get('health')}")
+    print(f"message: {payload.get('progress_message')}")
+    print(f"elapsed: {payload.get('started_at')} -> {payload.get('updated_at')}")
 
 
-def re_slug(value: str) -> str:
-    import re
+def stream_jsonl_command(path: Path, args: argparse.Namespace, stage_filter: str | None, level_filter: str | None) -> int:
+    def filtered_rows() -> list[dict[str, Any]]:
+        rows = iter_jsonl(path)
+        if stage_filter:
+            rows = [row for row in rows if str(row.get("stage") or "") == stage_filter]
+        if level_filter:
+            rows = [row for row in rows if str(row.get("level") or "") == level_filter]
+        if getattr(args, "since", None):
+            rows = [row for row in rows if str(row.get("timestamp") or "") >= str(args.since)]
+        if getattr(args, "tail", None):
+            rows = rows[-max(0, int(args.tail)) :]
+        return rows
 
-    normalized = value.strip().lower()
-    normalized = re.sub(r"[^a-z0-9]+", "-", normalized)
-    normalized = re.sub(r"-+", "-", normalized).strip("-")
-    return normalized or "paper-run"
+    def print_rows(rows: list[dict[str, Any]]) -> None:
+        for row in rows:
+            if getattr(args, "json", False):
+                print(json.dumps(row, sort_keys=True))
+            else:
+                print(" | ".join([str(row.get("timestamp") or "-"), str(row.get("stage") or "-"), str(row.get("level") or row.get("event") or "-"), str(row.get("message") or row.get("event") or "-")]))
+
+    if not getattr(args, "follow", False):
+        print_rows(filtered_rows())
+        return 0
+    position = 0
+    while True:
+        if not path.exists():
+            time.sleep(0.5)
+            continue
+        with path.open("r", encoding="utf-8") as handle:
+            handle.seek(position)
+            lines = handle.readlines()
+            position = handle.tell()
+        rows = []
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            payload = json.loads(stripped)
+            if stage_filter and str(payload.get("stage") or "") != stage_filter:
+                continue
+            if level_filter and str(payload.get("level") or "") != level_filter:
+                continue
+            rows.append(payload)
+        print_rows(rows)
+        time.sleep(0.5)
 
 
-def first_existing(*paths: Path) -> Path | None:
-    for path in paths:
-        if path.exists():
-            return path
-    return None
+def log_path(run_dir: Path, stage: str | None) -> Path:
+    if stage:
+        return run_dir / "logs" / f"stage-{stage}.log"
+    return run_dir / "logs" / "combined.log"
 
 
-def last_event_summary(run_directory: Path) -> str:
-    path = run_directory / "events.jsonl"
-    if not path.exists():
-        return "-"
-    last_line = ""
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
-            if line.strip():
-                last_line = line
-    if not last_line:
-        return "-"
-    try:
-        payload = json.loads(last_line)
-    except json.JSONDecodeError:
-        return "-"
-    stage = str(payload.get("stage") or "").strip()
-    message = str(payload.get("progress_message") or "").strip()
-    if stage and message:
-        return f"{stage}: {message}"
-    return message or stage or "-"
+def latest_active_call(run_dir: Path, *, stage: str | None) -> str | None:
+    candidates = []
+    for path in sorted((run_dir / "calls").glob("call_*.json")):
+        payload = read_json_file(path)
+        if stage and str(payload.get("stage") or "") != stage:
+            continue
+        if str(payload.get("status") or "") != "running":
+            continue
+        candidates.append((str(payload.get("started_at") or ""), str(payload.get("call_id") or "")))
+    if not candidates:
+        return None
+    candidates.sort()
+    return candidates[-1][1]
 
 
 def fetch_render_deploys(service_id: str) -> list[dict[str, Any]]:
-    try:
-        completed = subprocess.run(
-            ["render", "deploys", "list", str(service_id), "--output", "json"],
-            check=True,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as error:
-        raise FileNotFoundError("Render CLI is not installed or not on PATH.") from error
-    except subprocess.CalledProcessError as error:
-        stderr = (error.stderr or "").strip()
-        raise ValueError(stderr or f"Failed to query Render deploys for {service_id}.") from error
-
-    try:
-        payload = json.loads(completed.stdout or "[]")
-    except json.JSONDecodeError as error:
-        raise ValueError("Render CLI returned invalid JSON for deploy status.") from error
-    if not isinstance(payload, list):
-        raise ValueError("Render CLI returned an unexpected deploy payload.")
-    return [deploy for deploy in payload if isinstance(deploy, dict)]
+    completed = subprocess.run(
+        ["render", "deploys", "list", str(service_id), "--output", "json"],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    payload = json.loads(completed.stdout or "[]")
+    return [entry for entry in payload if isinstance(entry, dict)] if isinstance(payload, list) else []
 
 
 def select_render_deploy(deploys: list[dict[str, Any]], commit_ref: str | None) -> dict[str, Any] | None:
@@ -652,11 +729,7 @@ def build_render_status_payload(
 ) -> dict[str, Any]:
     live_deploy = next((deploy for deploy in deploys if str(deploy.get("status") or "").strip() == "live"), None)
     return {
-        "service": {
-            "id": service_id,
-            "name": service_name,
-            "url": service_url,
-        },
+        "service": {"id": service_id, "name": service_name, "url": service_url},
         "commit_ref": commit_ref,
         "matched": selected_deploy is not None,
         "selected_deploy": summarize_render_deploy(selected_deploy),
@@ -672,10 +745,6 @@ def summarize_render_deploy(deploy: dict[str, Any] | None) -> dict[str, Any] | N
     return {
         "id": str(deploy.get("id") or "").strip() or None,
         "status": str(deploy.get("status") or "").strip() or None,
-        "trigger": str(deploy.get("trigger") or "").strip() or None,
-        "created_at": str(deploy.get("createdAt") or "").strip() or None,
-        "started_at": str(deploy.get("startedAt") or "").strip() or None,
-        "finished_at": str(deploy.get("finishedAt") or "").strip() or None,
         "updated_at": str(deploy.get("updatedAt") or "").strip() or None,
         "commit_id": str(commit.get("id") or "").strip() or None,
         "commit_message": str(commit.get("message") or "").strip() or None,
@@ -686,48 +755,12 @@ def print_render_status(payload: dict[str, Any]) -> None:
     service = payload.get("service") if isinstance(payload.get("service"), dict) else {}
     print(f"service: {service.get('name')} ({service.get('id')})")
     print(f"url: {service.get('url')}")
-    commit_ref = payload.get("commit_ref")
-    if commit_ref:
-        print(f"commit_ref: {commit_ref}")
-
     selected = payload.get("selected_deploy") if isinstance(payload.get("selected_deploy"), dict) else None
     if selected:
-        print("selected:")
-        print(f"  id: {selected.get('id')}")
-        print(f"  status: {selected.get('status')}")
-        print(f"  commit: {selected.get('commit_id')}")
-        print(f"  message: {selected.get('commit_message')}")
-        print(f"  updated_at: {selected.get('updated_at')}")
-    elif commit_ref:
-        print("selected: no deploy matched that commit yet")
-    else:
-        print("selected: no deploys found")
-
+        print(f"selected: {selected.get('status')} {selected.get('id')} {selected.get('commit_id')}")
     live = payload.get("live_deploy") if isinstance(payload.get("live_deploy"), dict) else None
     if live:
-        print("live:")
-        print(f"  id: {live.get('id')}")
-        print(f"  commit: {live.get('commit_id')}")
-        print(f"  message: {live.get('commit_message')}")
-        print(f"  updated_at: {live.get('updated_at')}")
-
-    recent = payload.get("recent_deploys") if isinstance(payload.get("recent_deploys"), list) else []
-    if recent:
-        print("recent:")
-        for deploy in recent:
-            if not isinstance(deploy, dict):
-                continue
-            print(
-                "  "
-                + " | ".join(
-                    [
-                        str(deploy.get("status") or "-"),
-                        str(deploy.get("id") or "-"),
-                        str(deploy.get("commit_id") or "-"),
-                        str(deploy.get("updated_at") or "-"),
-                    ]
-                )
-            )
+        print(f"live: {live.get('status')} {live.get('id')} {live.get('commit_id')}")
 
 
 def render_wait_completed(payload: dict[str, Any], *, commit_ref: str | None) -> bool:
@@ -735,73 +768,80 @@ def render_wait_completed(payload: dict[str, Any], *, commit_ref: str | None) ->
     if commit_ref and selected is None:
         return False
     status = str((selected or {}).get("status") or "").strip()
-    if not status:
-        return False
-    return status in RENDER_TERMINAL_STATES
+    return status in {"live", "build_failed", "update_failed", "canceled", "failed", "deactivated"}
 
 
 def render_wait_exit_code(payload: dict[str, Any], *, commit_ref: str | None) -> int:
     selected = payload.get("selected_deploy") if isinstance(payload.get("selected_deploy"), dict) else None
-    status = str((selected or {}).get("status") or "").strip()
     if commit_ref and selected is None:
         return 1
-    if status in RENDER_SUCCESS_STATES:
-        return 0
-    return 1
+    return 0 if str((selected or {}).get("status") or "").strip() == "live" else 1
 
 
-class CLIRuntime:
-    def __init__(self, *, run_id: str, run_directory: Path | None = None):
-        self.run_id = run_id
-        self.run_directory = run_directory or (RUNS_ROOT / run_id)
-        self.run_directory.mkdir(parents=True, exist_ok=True)
+def run_directory(run_id: str) -> Path:
+    directory = RUNS_ROOT / run_id
+    directory.mkdir(parents=True, exist_ok=True)
+    return directory
 
-    def record_status(
-        self,
-        run_id: str,
-        *,
-        stage: str,
-        progress_message: str,
-        status: str | None = None,
-        openai_response_id: str | None = None,
-    ) -> None:
-        payload = {
-            "kind": "status",
-            "timestamp": datetime.now(tz=UTC).isoformat(),
-            "run_id": run_id,
-            "stage": stage,
-            "status": status,
-            "progress_message": progress_message,
-            "openai_response_id": openai_response_id,
-        }
-        self._append_jsonl(self.run_directory / "events.jsonl", payload)
-        status_text = f"[{stage}] {progress_message}"
-        if openai_response_id:
-            status_text += f" ({openai_response_id})"
-        print(status_text)
 
-    def record_metrics(
-        self,
-        run_id: str,
-        *,
-        model: str,
-        input_tokens: int,
-        output_tokens: int,
-    ) -> None:
-        payload = {
-            "timestamp": datetime.now(tz=UTC).isoformat(),
-            "run_id": run_id,
-            "model": model,
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-        }
-        self._append_jsonl(self.run_directory / "metrics.jsonl", payload)
-        print(f"[metrics] {model} input={input_tokens} output={output_tokens}")
+def resolve_run_directory(run_ref: str) -> Path:
+    if run_ref == "latest":
+        candidates = [path for path in RUNS_ROOT.iterdir() if path.is_dir()]
+        if not candidates:
+            raise FileNotFoundError("No Sidekick runs exist yet.")
+        return max(candidates, key=lambda path: path.stat().st_mtime)
+    candidate = Path(run_ref).expanduser()
+    if candidate.exists():
+        return candidate.resolve()
+    candidate = RUNS_ROOT / run_ref
+    if candidate.exists():
+        return candidate.resolve()
+    raise FileNotFoundError(f"Unknown run reference: {run_ref}")
 
-    def _append_jsonl(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, sort_keys=True) + "\n")
+
+def derive_title(note: str) -> str:
+    for line in note.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return stripped[:120]
+    return "Untitled research run"
+
+
+def resolve_note_text(note: str | None, notes_file: str | None) -> str:
+    if note and note.strip():
+        return note.strip()
+    if notes_file and notes_file.strip():
+        return Path(notes_file).expanduser().resolve().read_text(encoding="utf-8").strip()
+    return ""
+
+
+def generate_run_id(title: str) -> str:
+    timestamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
+    slug = re_slug(title)
+    return f"{timestamp}-{slug}"
+
+
+def re_slug(value: str) -> str:
+    normalized = value.strip().lower()
+    normalized = "".join(character if character.isalnum() else "-" for character in normalized)
+    normalized = "-".join(part for part in normalized.split("-") if part)
+    return normalized or "paper-run"
+
+
+def exit_code_for_stage(stage: str) -> int:
+    if stage == "1":
+        return 1
+    if stage == "2.5":
+        return 2
+    if stage == "3":
+        return 3
+    if stage == "4":
+        return 4
+    return 20
+
+
+def iso_now() -> str:
+    return datetime.now(tz=UTC).isoformat()
 
 
 if __name__ == "__main__":

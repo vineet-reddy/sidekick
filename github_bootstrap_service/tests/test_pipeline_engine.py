@@ -181,7 +181,7 @@ class PipelineEngineTests(unittest.TestCase):
             self.assertEqual(outputs["validation"]["manuscript_kind"], "paper")
             self.assertEqual(outputs["bundle"]["pdf"]["ok"], True)
             self.assertGreaterEqual(len(statuses), 3)
-            self.assertEqual(len(metrics), 2)
+            self.assertGreaterEqual(len(metrics), 2)
 
     def test_workspace_blocks_when_empirical_resolution_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

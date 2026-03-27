@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
@@ -60,11 +60,12 @@ class OpenAIClient:
         timeout_seconds: int,
         model: str | None = None,
         reasoning_effort: str | None = None,
+        on_delta: Callable[[str], None] | None = None,
+        on_event: Callable[[dict[str, Any]], None] | None = None,
     ) -> OpenAIResponseResult:
         selected_model = (model or self._config.openai_model).strip()
         payload: dict[str, Any] = {
             "model": selected_model,
-            "background": True,
             "instructions": instructions,
             "input": input_text,
         }
@@ -89,6 +90,15 @@ class OpenAIClient:
         if tools:
             payload["tools"] = tools
 
+        if on_delta is not None or on_event is not None:
+            return self._generate_streaming_response(
+                payload=payload,
+                timeout_seconds=timeout_seconds,
+                on_delta=on_delta,
+                on_event=on_event,
+            )
+
+        payload["background"] = True
         created = self._request_json("POST", "/responses", payload)
         response_id = str(created.get("id") or "").strip()
         if not response_id:
@@ -113,6 +123,125 @@ class OpenAIClient:
             latest = self._request_json("GET", f"/responses/{response_id}", None)
 
         raise OpenAIClientError("OpenAI response exceeded the configured timeout.")
+
+    def _generate_streaming_response(
+        self,
+        *,
+        payload: dict[str, Any],
+        timeout_seconds: int,
+        on_delta: Callable[[str], None] | None,
+        on_event: Callable[[dict[str, Any]], None] | None,
+    ) -> OpenAIResponseResult:
+        request_payload = dict(payload)
+        request_payload["stream"] = True
+        started = time.monotonic()
+        event_name = ""
+        data_lines: list[str] = []
+        final_response: dict[str, Any] | None = None
+        aggregated_text = ""
+        stream_url = f"{self._config.openai_base_url.rstrip('/')}/responses"
+        headers = {
+            "Authorization": f"Bearer {self._config.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        request = Request(
+            url=stream_url,
+            data=json.dumps(request_payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+
+        def flush_event() -> None:
+            nonlocal event_name, data_lines, final_response, aggregated_text
+            if not data_lines:
+                event_name = ""
+                return
+            raw_data = "\n".join(data_lines).strip()
+            data_lines = []
+            if raw_data == "[DONE]":
+                event_name = ""
+                return
+            try:
+                payload_data = json.loads(raw_data)
+            except json.JSONDecodeError:
+                payload_data = {"raw": raw_data}
+
+            if on_event is not None and isinstance(payload_data, dict):
+                callback_payload = dict(payload_data)
+                if event_name:
+                    callback_payload.setdefault("event", event_name)
+                on_event(callback_payload)
+
+            delta_text = self._extract_stream_delta(event_name, payload_data)
+            if delta_text:
+                aggregated_text += delta_text
+                if on_delta is not None:
+                    on_delta(delta_text)
+
+            candidate_response = self._extract_stream_response(payload_data)
+            if candidate_response is not None:
+                final_response = candidate_response
+            event_name = ""
+
+        try:
+            with urlopen(request, timeout=max(60, timeout_seconds + 60)) as response:
+                for raw_line in response:
+                    line = raw_line.decode("utf-8", errors="replace").rstrip("\n")
+                    if not line.strip():
+                        flush_event()
+                        continue
+                    if line.startswith("event:"):
+                        event_name = line.partition(":")[2].strip()
+                        continue
+                    if line.startswith("data:"):
+                        data_lines.append(line.partition(":")[2].lstrip())
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            raise OpenAIClientError(f"OpenAI request failed with HTTP {error.code}: {detail}") from error
+        except URLError as error:
+            raise OpenAIClientError(f"OpenAI request failed: {error.reason}") from error
+
+        flush_event()
+        if final_response is None:
+            final_response = {
+                "id": "",
+                "status": "completed" if aggregated_text else "failed",
+                "output_text": aggregated_text,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+                "output": [],
+            }
+
+        latency_ms = int((time.monotonic() - started) * 1000)
+        payload_copy = dict(final_response)
+        payload_copy.setdefault("latency_ms", latency_ms)
+        return OpenAIResponseResult(
+            response_id=str(final_response.get("id") or "").strip(),
+            output_text=self._output_text(final_response) or aggregated_text,
+            usage=self._usage(final_response),
+            payload=payload_copy,
+        )
+
+    def _extract_stream_delta(self, event_name: str, payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        if "delta" in payload and isinstance(payload.get("delta"), str):
+            return str(payload.get("delta") or "")
+        if event_name.endswith("output_text.delta"):
+            if isinstance(payload.get("text"), str):
+                return str(payload.get("text") or "")
+            if isinstance(payload.get("delta"), str):
+                return str(payload.get("delta") or "")
+        return ""
+
+    def _extract_stream_response(self, payload: Any) -> dict[str, Any] | None:
+        if not isinstance(payload, dict):
+            return None
+        response = payload.get("response")
+        if isinstance(response, dict):
+            return response
+        if payload.get("status") in {"completed", "failed", "cancelled", "incomplete", "expired"}:
+            return payload
+        return None
 
     def extract_container_file_citations(self, response: OpenAIResponseResult) -> list[OpenAIContainerFileCitation]:
         citations: list[OpenAIContainerFileCitation] = []
@@ -268,6 +397,9 @@ class OpenAIClient:
         return decoded
 
     def _output_text(self, payload: dict[str, Any]) -> str:
+        direct_text = payload.get("output_text")
+        if isinstance(direct_text, str) and direct_text.strip():
+            return direct_text.strip()
         collected: list[str] = []
         for item in payload.get("output", []) or []:
             if not isinstance(item, dict):

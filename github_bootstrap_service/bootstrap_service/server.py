@@ -411,20 +411,28 @@ class JobProcessor(threading.Thread):
         )
 
         try:
-            ledger = self._run_research_workspace(context)
-            validation = self._validate_ledger(
+            outputs = self._engine.execute(run_id=context.job["id"], request_payload=context.request_payload)
+            ledger = outputs["ledger"]
+            validation = outputs["validation"]
+            bundle = outputs["bundle"]
+            self._database.update_paper_job(
                 context.job["id"],
-                ledger,
-                request_payload=context.request_payload,
+                stage="4",
+                progress_message="Publishing the canonical manuscript bundle to GitHub.",
             )
-            bundle = self._write_bundle(context, ledger, validation)
             publication = self._publish_bundle(context, bundle)
             self._persist_artifacts(context.job["id"], bundle, publication)
+            self._engine._run_store(context.job["id"]).complete_stage(
+                stage="4",
+                agent="github-push",
+                artifacts=["bundle.json"],
+            )
+            self._engine._run_store(context.job["id"]).complete_run(exit_code=0)
             manuscript_kind = str(bundle.get("manuscript_kind") or "paper").strip() or "paper"
             self._database.update_paper_job(
                 context.job["id"],
                 status="completed",
-                stage="write",
+                stage="4",
                 progress_message=(
                     "Paper bundle published to GitHub and ready for download."
                     if manuscript_kind == "paper"
@@ -513,7 +521,7 @@ class JobProcessor(threading.Thread):
     def _publish_bundle(self, context: JobContext, bundle: dict[str, Any]) -> dict[str, Any]:
         self._database.update_paper_job(
             context.job["id"],
-            stage="write",
+            stage="4",
             progress_message="Publishing the canonical manuscript bundle to GitHub.",
         )
         access_token = decrypt_text(context.github_connection["access_token_encrypted"], self._config.encryption_secret)

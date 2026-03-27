@@ -446,8 +446,8 @@ class SidekickDatabase:
                     github_connection_id,
                     paper_title,
                     "queued",
-                    "inspect",
-                    "Queued for the research workspace.",
+                    "1",
+                    "Queued for Stage 1 dataset search.",
                     None,
                     None,
                     None,
@@ -547,7 +547,7 @@ class SidekickDatabase:
                     (
                         iso_now(),
                         iso_now(),
-                        "Inspecting public evidence and building the research workspace.",
+                        "Running Stage 1 dataset search.",
                         row["id"],
                     ),
                 )

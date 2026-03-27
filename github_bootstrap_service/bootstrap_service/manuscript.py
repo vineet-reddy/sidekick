@@ -27,6 +27,7 @@ def normalize_manuscript_sections(raw_sections: dict[str, Any], *, title_fallbac
         "methods": str(raw_sections.get("methods") or "").strip(),
         "results": str(raw_sections.get("results") or "").strip(),
         "discussion": str(raw_sections.get("discussion") or "").strip(),
+        "conclusion": str(raw_sections.get("conclusion") or "").strip(),
         "limitations": str(raw_sections.get("limitations") or "").strip(),
         "references": [str(entry).strip() for entry in references if str(entry).strip()],
     }
@@ -44,6 +45,7 @@ def results_to_markdown(sections: dict[str, Any], *, manuscript_kind: str) -> st
         ("Methods", sections.get("methods")),
         ("Results", sections.get("results")),
         ("Discussion", sections.get("discussion")),
+        ("Conclusion", sections.get("conclusion")),
         ("Limitations", sections.get("limitations")),
     ]
     for title, body in ordered_sections:
@@ -170,6 +172,7 @@ def render_latex(
         "methods",
         "results",
         "discussion",
+        "conclusion",
         "limitations",
     )]
     cited_keys: list[str] = []
@@ -208,9 +211,10 @@ def render_latex(
     abstract_body = _latex_escape_prose(str(sections.get("abstract") or ""))
     section_blocks = [
         ("Introduction", _latex_escape_prose(str(sections.get("introduction") or ""))),
-        ("Methods", _latex_escape_prose(str(sections.get("methods") or ""))),
+        ("Data And Methods", _latex_escape_prose(str(sections.get("methods") or ""))),
         ("Results", _latex_escape_prose(str(sections.get("results") or ""))),
         ("Discussion", _latex_escape_prose(str(sections.get("discussion") or ""))),
+        ("Conclusion", _latex_escape_prose(str(sections.get("conclusion") or ""))),
         ("Limitations", _latex_escape_prose(str(sections.get("limitations") or ""))),
     ]
     rendered_sections: list[str] = []
