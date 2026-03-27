@@ -511,6 +511,22 @@ class SidekickDatabase:
             ).fetchone()
             return int(row["count"] if row is not None else 0)
 
+    def job_counts(self) -> dict[str, int]:
+        with self._lock, self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT status, COUNT(*) AS count
+                FROM paper_jobs
+                GROUP BY status
+                """
+            ).fetchall()
+            counts = {"queued": 0, "running": 0, "completed": 0, "failed": 0, "cancelled": 0}
+            for row in rows:
+                status = str(row["status"] or "").strip().lower()
+                if status in counts:
+                    counts[status] = int(row["count"])
+            return counts
+
     def claim_next_queued_job(self, max_concurrent_jobs_per_install: int) -> JobClaim | None:
         with self._lock, self._connection() as connection:
             queued_jobs = connection.execute(

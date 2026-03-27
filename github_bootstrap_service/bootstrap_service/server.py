@@ -736,7 +736,14 @@ class BootstrapServiceHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
 
         if parsed.path == "/health":
-            self._send_json(HTTPStatus.OK, {"ok": True})
+            self._send_json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "job_processor_alive": self.server.job_processor.is_alive(),
+                    "job_counts": self.server.database.job_counts(),
+                },
+            )
             return
 
         if parsed.path.startswith("/api/github/connect/sessions/"):
