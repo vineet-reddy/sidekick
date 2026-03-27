@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import time
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -40,6 +41,9 @@ class GitHubCommitResult:
 class GitHubClient:
     def __init__(self, config: BootstrapServiceConfig):
         self._config = config
+        self._rate_limit_retry_count = 5
+        self._rate_limit_default_delay_seconds = 15.0
+        self._rate_limit_max_delay_seconds = 180.0
 
     def build_user_authorization_url(self, state: str) -> str:
         query = urlencode(
@@ -289,15 +293,23 @@ class GitHubClient:
             request_headers["Content-Type"] = "application/json"
 
         request = Request(url=url, data=data, headers=request_headers, method=method)
+        payload: bytes | None = None
+        for attempt in range(1, self._rate_limit_retry_count + 1):
+            try:
+                with urlopen(request, timeout=30) as response:
+                    payload = response.read()
+                break
+            except HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")
+                if self._is_retryable_rate_limit_error(error, detail) and attempt < self._rate_limit_retry_count:
+                    time.sleep(self._rate_limit_delay_seconds(error))
+                    continue
+                raise GitHubClientError(f"GitHub request failed with HTTP {error.code}: {detail}") from error
+            except URLError as error:
+                raise GitHubClientError(f"GitHub request failed: {error.reason}") from error
 
-        try:
-            with urlopen(request, timeout=30) as response:
-                payload = response.read()
-        except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            raise GitHubClientError(f"GitHub request failed with HTTP {error.code}: {detail}") from error
-        except URLError as error:
-            raise GitHubClientError(f"GitHub request failed: {error.reason}") from error
+        if payload is None:
+            raise GitHubClientError("GitHub request failed with an empty response.")
 
         if not payload:
             return {}
@@ -311,3 +323,33 @@ class GitHubClient:
             raise GitHubClientError("GitHub returned an unexpected JSON payload.")
 
         return decoded
+
+    def _is_retryable_rate_limit_error(self, error: HTTPError, detail: str) -> bool:
+        status_code = int(getattr(error, "code", 0) or 0)
+        if status_code not in {403, 429}:
+            return False
+        lowered = detail.lower()
+        return "rate limit" in lowered or "secondary rate limit" in lowered
+
+    def _rate_limit_delay_seconds(self, error: HTTPError) -> float:
+        headers = getattr(error, "headers", None)
+        if headers is None:
+            return self._rate_limit_default_delay_seconds
+
+        retry_after = headers.get("Retry-After")
+        if retry_after:
+            try:
+                delay = float(retry_after)
+            except (TypeError, ValueError):
+                delay = self._rate_limit_default_delay_seconds
+            return max(1.0, min(delay, self._rate_limit_max_delay_seconds))
+
+        reset_epoch = headers.get("X-RateLimit-Reset")
+        if reset_epoch:
+            try:
+                reset_seconds = float(reset_epoch) - time.time() + 1.0
+            except (TypeError, ValueError):
+                reset_seconds = self._rate_limit_default_delay_seconds
+            return max(1.0, min(reset_seconds, self._rate_limit_max_delay_seconds))
+
+        return self._rate_limit_default_delay_seconds
