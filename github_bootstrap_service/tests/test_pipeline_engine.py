@@ -27,20 +27,63 @@ def _config(root: pathlib.Path) -> BootstrapServiceConfig:
 
 class FakeOpenAIClient:
     def __init__(self) -> None:
-        self.workspace_result = OpenAIResponseResult(
+        self.profiler_result = OpenAIResponseResult(
+            response_id="resp_profiler",
+            output_text="""
+{
+  "analyzable": true,
+  "profile_summary": "The public CSV contains a simple prevalence table with metric and value columns.",
+  "retrieval_summary": "Downloaded the single CSV and confirmed that it contains one prevalence estimate.",
+  "dataset": {
+    "label": "Public CSV",
+    "download_url": "https://example.org/data/table_1.csv"
+  },
+  "available_assets": ["table_1.csv with metric and value columns"],
+  "constraints": ["Only one source file is available."],
+  "suggested_analysis_targets": ["Compute the descriptive prevalence estimate from the retrieved table."],
+  "sources": [
+    {
+      "source_id": "source_1",
+      "label": "Public CSV",
+      "download_url": "https://example.org/data/table_1.csv"
+    }
+  ]
+}
+""".strip(),
+            usage=OpenAIUsage(input_tokens=40, output_tokens=80),
+            payload={"output": [{"type": "message", "content": []}], "status": "completed"},
+        )
+        self.planner_result = OpenAIResponseResult(
+            response_id="resp_planner",
+            output_text="""
+{
+  "plan_summary": "Run a single descriptive extraction on the retrieved prevalence table and save both code and the table as artifacts.",
+  "execution_focus": "Compute and document the prevalence estimate directly visible in the public file.",
+  "selected_experiments": [
+    {
+      "experiment_id": "exp_1",
+      "title": "Extract descriptive prevalence estimate",
+      "rationale": "The dataset contains a direct prevalence value and supports a simple reproducible descriptive analysis.",
+      "method_summary": "Load the CSV, inspect the metric column, and record the prevalence value in a saved table.",
+      "expected_artifacts": ["analysis/run_analysis.py", "artifacts/table_1.csv"],
+      "success_criteria": "A reproducible table artifact contains the prevalence value.",
+      "fallback_if_blocked": "Document the retrieval limitation and save the raw extracted table."
+    }
+  ],
+  "deferred_experiments": []
+}
+""".strip(),
+            usage=OpenAIUsage(input_tokens=35, output_tokens=70),
+            payload={"output": [{"type": "message", "content": []}], "status": "completed"},
+        )
+        self.executor_result = OpenAIResponseResult(
             response_id="resp_workspace",
             output_text="""
 {
-  "title": "Example prevalence study",
   "research_question": "What prevalence estimate is visible in the saved table?",
-  "methods": "We downloaded the public CSV, cleaned the extracted values, computed the descriptive prevalence estimate in Python, saved the analysis table, and checked the resulting artifact before recording the result. This run was executed directly in the workspace using the retrieved source file rather than summarizing prior literature.",
-  "results": [
-    {
-      "text": "The saved analysis table reports a prevalence estimate of 0.18 in the retrieved slice.",
-      "artifact_ids": ["artifact_1"],
-      "note_ids": ["note_1"]
-    }
-  ],
+  "experiment_summary": "We downloaded the public CSV, cleaned the extracted values, computed the descriptive prevalence estimate in Python, saved the analysis table, and checked the resulting artifact before recording the result. This run was executed directly in the workspace using the retrieved source file rather than summarizing prior literature.",
+  "experiments": ["Loaded the CSV, extracted the prevalence estimate, and saved the resulting table artifact."],
+  "findings": ["The saved analysis table reports a prevalence estimate of 0.18 in the retrieved slice."],
   "limitations": ["Only one public source file was available in this run."],
   "sources": [
     {
@@ -58,7 +101,17 @@ class FakeOpenAIClient:
       "description": "Extracted prevalence table",
       "source_ids": ["source_1"]
     }
-  ]
+  ],
+  "figure_summaries": [],
+  "results": [
+    {
+      "result_id": "result_1",
+      "text": "The saved analysis table reports a prevalence estimate of 0.18 in the retrieved slice.",
+      "artifact_ids": ["artifact_1"],
+      "note_ids": ["note_1"]
+    }
+  ],
+  "code_summary": "A short Python script downloads the CSV, extracts the prevalence row, and saves the artifact table."
 }
 """.strip(),
             usage=OpenAIUsage(input_tokens=100, output_tokens=200),
@@ -82,13 +135,20 @@ class FakeOpenAIClient:
             payload={"output": [{"type": "message", "content": []}], "status": "completed"},
         )
         self.calls = 0
+        self.responses = [
+            self.profiler_result,
+            self.planner_result,
+            self.executor_result,
+            self.writer_result,
+        ]
 
     def generate_json(self, **_: object) -> OpenAIResponseResult:
+        response = self.responses[self.calls]
         self.calls += 1
-        return self.workspace_result if self.calls == 1 else self.writer_result
+        return response
 
     def extract_container_ids(self, response: OpenAIResponseResult) -> list[str]:
-        assert response is self.workspace_result
+        assert response is self.executor_result
         return ["cntr_123"]
 
     def list_container_files(self, *, container_id: str) -> list[OpenAIContainerFile]:
@@ -145,6 +205,17 @@ class PipelineEngineTests(unittest.TestCase):
         self.assertEqual(payload["title"], "Example")
         self.assertEqual(payload["results"], "\\subsection*{Heading}")
 
+    def test_extract_json_object_accepts_python_literal_dicts(self) -> None:
+        raw = """analysis output:
+{'title': 'Example', 'results': ['ok'], 'flags': {'ready': True}}
+"""
+
+        payload = extract_json_object(raw)
+
+        self.assertEqual(payload["title"], "Example")
+        self.assertEqual(payload["results"], ["ok"])
+        self.assertEqual(payload["flags"]["ready"], True)
+
     def test_engine_execute_writes_local_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = pathlib.Path(tempdir)
@@ -166,6 +237,18 @@ class PipelineEngineTests(unittest.TestCase):
                 "dataset_hints": [],
                 "domain_guidance": "",
                 "must_use_sources": [],
+                "resolution": {
+                    "status": "resolved",
+                    "summary": "Selected the public CSV as the primary dataset.",
+                    "selected_candidate": {
+                        "dataset_id": "public-csv",
+                        "title": "Public CSV",
+                        "access_url": "https://example.org/data/table_1.csv",
+                        "download_urls": ["https://example.org/data/table_1.csv"],
+                        "primary_domain": "example.org",
+                        "provenance_note": "Resolved directly for the test payload.",
+                    },
+                },
             }
 
             with patch("bootstrap_service.pipeline_engine.compile_pdf", side_effect=_fake_compile):
@@ -181,7 +264,7 @@ class PipelineEngineTests(unittest.TestCase):
             self.assertEqual(outputs["validation"]["manuscript_kind"], "paper")
             self.assertEqual(outputs["bundle"]["pdf"]["ok"], True)
             self.assertGreaterEqual(len(statuses), 3)
-            self.assertGreaterEqual(len(metrics), 2)
+            self.assertGreaterEqual(len(metrics), 4)
 
     def test_workspace_blocks_when_empirical_resolution_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

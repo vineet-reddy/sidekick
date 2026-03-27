@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import hashlib
 import json
@@ -56,7 +57,7 @@ def write_json_file(path: Path, payload: dict[str, Any]) -> None:
 def extract_json_object(raw_text: str) -> dict[str, Any]:
     decoder = json.JSONDecoder()
     for index, character in enumerate(raw_text):
-        if character != "{":
+        if character not in {"{", "["}:
             continue
         try:
             payload, _ = decoder.raw_decode(raw_text[index:])
@@ -64,7 +65,7 @@ def extract_json_object(raw_text: str) -> dict[str, Any]:
             try:
                 payload, _ = decoder.raw_decode(_repair_json_like_text(raw_text[index:]))
             except json.JSONDecodeError:
-                continue
+                payload = _extract_python_literal(raw_text[index:])
         if isinstance(payload, dict):
             return payload
     raise ValueError("Model output did not contain a JSON object.")
@@ -108,6 +109,23 @@ def _repair_json_like_text(raw_text: str) -> str:
             in_string = False
         index += 1
     return "".join(repaired)
+
+
+def _extract_python_literal(raw_text: str) -> dict[str, Any] | None:
+    start = raw_text.find("{")
+    if start < 0:
+        return None
+    for end in range(len(raw_text), start, -1):
+        candidate = raw_text[start:end].strip()
+        if not candidate.endswith("}"):
+            continue
+        try:
+            payload = ast.literal_eval(candidate)
+        except (SyntaxError, ValueError):
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
 
 
 def normalize_text_list(value: Any) -> list[str]:
@@ -570,7 +588,9 @@ Rules:
                 experiment_summary=str(ledger.get("experiment_summary") or "").strip(),
                 validation=validation,
             )
-            if str(validation.get("status") or "").strip().lower() == "pass":
+            validation_status = str(validation.get("status") or "").strip().lower()
+            validation_kind = str(validation.get("manuscript_kind") or "").strip().lower()
+            if validation_status in {"pass", "paper"} or validation_kind == "paper":
                 return ledger, validation
             retries_remaining -= 1
             if retries_remaining < 0:
@@ -629,13 +649,130 @@ Rules:
         feedback_messages = feedback_messages or []
         prior_attempts = prior_attempts or []
         store = self._run_store(run_id)
+        store.set_stage(stage="2", agent="dataset-profiler", model=self._config.openai_workspace_model)
+        profiler_input = {
+            "title": request_payload.get("title"),
+            "theme": request_payload.get("theme"),
+            "research_question": search.get("research_question"),
+            "dataset": search.get("dataset"),
+            "attempt": attempt,
+            "validation_feedback": feedback_messages,
+        }
+        profile = self._run_dataset_profiler(
+            run_id=run_id,
+            profiler_input=profiler_input,
+        )
+        if not bool(profile.get("analyzable", True)):
+            reason = str(profile.get("blocking_reason") or profile.get("profile_summary") or "Dataset inspection could not find analyzable data.").strip()
+            store.fail_stage(stage="2", agent="dataset-profiler", reason=reason, retries_remaining=max(0, 3 - attempt))
+            raise PipelineExecutionError(reason, stage="2")
+
+        store.set_stage(stage="2", agent="experiment-planner", model=self._config.openai_workspace_model)
+        planner_input = {
+            "title": request_payload.get("title"),
+            "theme": request_payload.get("theme"),
+            "research_question": search.get("research_question"),
+            "dataset": search.get("dataset"),
+            "dataset_profile": profile,
+            "related_work": search.get("related_work") or [],
+            "attempt": attempt,
+            "validation_feedback": feedback_messages,
+            "prior_attempts": prior_attempts,
+        }
+        plan = self._run_experiment_planner(
+            run_id=run_id,
+            planner_input=planner_input,
+        )
+
         store.set_stage(stage="2", agent="data-analyst", model=self._config.openai_workspace_model)
+        analyst_input = {
+            "title": request_payload.get("title"),
+            "theme": request_payload.get("theme"),
+            "research_question": search.get("research_question"),
+            "dataset": search.get("dataset"),
+            "dataset_profile": profile,
+            "execution_plan": plan,
+            "related_work": search.get("related_work") or [],
+            "attempt": attempt,
+            "validation_feedback": feedback_messages,
+            "prior_attempts": prior_attempts,
+        }
+        response_payload = self._run_data_analyst_execution(
+            run_id=run_id,
+            analyst_input=analyst_input,
+        )
+        response = response_payload.pop("_response")
+        ledger = {
+            "title": str(request_payload.get("title") or "Research paper"),
+            "research_question": str(response_payload.get("research_question") or search.get("research_question") or "").strip(),
+            "dataset": search.get("dataset") or {},
+            "dataset_profile": profile,
+            "execution_plan": plan,
+            "experiment_summary": str(response_payload.get("experiment_summary") or "").strip(),
+            "experiments": normalize_text_list(response_payload.get("experiments")),
+            "findings": normalize_text_list(response_payload.get("findings")),
+            "limitations": normalize_text_list(response_payload.get("limitations")),
+            "code_summary": str(response_payload.get("code_summary") or "").strip(),
+            "sources": [_normalize_source(entry, index) for index, entry in enumerate(response_payload.get("sources") or [])],
+            "artifacts": [_normalize_artifact(entry, index) for index, entry in enumerate(response_payload.get("artifacts") or [])],
+            "figure_summaries": [
+                _normalize_figure_summary(entry, index) for index, entry in enumerate(response_payload.get("figure_summaries") or [])
+            ],
+            "results": response_payload.get("results") or [],
+            "search": search,
+            "attempt": attempt,
+        }
+        downloaded_files = self.materialize_workspace_files(
+            run_id=run_id,
+            ledger=ledger,
+            container_ids=self._openai_client.extract_container_ids(response),
+        )
+        self.apply_downloaded_files_to_ledger(ledger, downloaded_files)
+        if not ledger["sources"]:
+            ledger["sources"].append(
+                _normalize_source(
+                    {
+                        "source_id": "source_dataset",
+                        "label": search.get("dataset", {}).get("label") or "Primary dataset",
+                        "landing_page_url": search.get("dataset", {}).get("landing_page_url"),
+                        "download_url": search.get("dataset", {}).get("download_url"),
+                        "accession_id": search.get("dataset", {}).get("accession_id"),
+                        "notes": search.get("dataset", {}).get("notes"),
+                    },
+                    0,
+                )
+            )
+        if not ledger["dataset"]:
+            ledger["dataset"] = profile.get("dataset") or search.get("dataset") or {}
+        self._ensure_artifact_metadata(ledger)
+        write_json_file(self.run_directory(run_id) / "ledger.json", ledger)
+        for artifact in ledger.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            path = str(artifact.get("path") or "").strip()
+            if not path:
+                continue
+            store.record_artifact(
+                stage="2",
+                artifact_id=str(artifact.get("artifact_id") or Path(path).stem),
+                artifact_type=str(artifact.get("kind") or "artifact"),
+                path=path,
+                description=str(artifact.get("description") or "").strip(),
+            )
+        store.complete_stage(stage="2", agent="data-analyst", artifacts=[artifact.get("path") for artifact in ledger.get("artifacts", []) if artifact.get("path")])
+        return ledger
+
+    def _run_dataset_profiler(self, *, run_id: str, profiler_input: dict[str, Any]) -> dict[str, Any]:
         instructions = """
-You are Sidekick's data analyst.
-Download the dataset, research what experiments already exist in this area, design meaningful experiments, run them, and save reproducible analysis files in the compute sandbox.
-Return strict JSON only:
+You are Sidekick's dataset profiler.
+Inspect the dataset and return a bounded handoff for later agents.
+Download the dataset or the smallest relevant subset, inspect the available files/tables/columns, and report what is actually analyzable.
+Return a structured object as JSON. If needed, a Python dict literal is acceptable, but do not return prose outside the object.
 {
-  "research_question": "string",
+  "analyzable": true,
+  "blocking_reason": "string",
+  "profile_summary": "string",
+  "retrieval_summary": "string",
   "dataset": {
     "label": "string",
     "landing_page_url": "string",
@@ -643,6 +780,150 @@ Return strict JSON only:
     "accession_id": "string",
     "notes": "string"
   },
+  "available_assets": ["string"],
+  "constraints": ["string"],
+  "suggested_analysis_targets": ["string"],
+  "sources": [
+    {
+      "source_id": "source_1",
+      "label": "string",
+      "landing_page_url": "string",
+      "download_url": "string",
+      "accession_id": "string",
+      "api_endpoint": "string",
+      "api_query": "string or object",
+      "notes": "string"
+    }
+  ]
+}
+Rules:
+- Do not design experiments yet.
+- Focus only on acquisition, inspection, and what is analyzable.
+- Use the dataset from the task payload. Do not swap substrates.
+- If the dataset is unusable, set analyzable=false and explain why.
+"""
+        profile = self._run_model_json(
+            run_id=run_id,
+            stage="2",
+            agent="dataset-profiler",
+            model=self._config.openai_workspace_model,
+            instructions=instructions,
+            input_text=json.dumps(profiler_input, sort_keys=True),
+            use_code_interpreter=True,
+            use_web_search=True,
+            timeout_seconds=min(1800, self._config.backend_max_job_runtime_seconds),
+            reasoning_effort="medium",
+        )
+        profile.pop("_response", None)
+        normalized = {
+            "analyzable": bool(profile.get("analyzable", True)),
+            "blocking_reason": str(profile.get("blocking_reason") or "").strip(),
+            "profile_summary": str(profile.get("profile_summary") or "").strip(),
+            "retrieval_summary": str(profile.get("retrieval_summary") or "").strip(),
+            "dataset": {
+                "label": str(((profile.get("dataset") or {}) if isinstance(profile.get("dataset"), dict) else {}).get("label") or (profiler_input.get("dataset") or {}).get("label") or "").strip(),
+                "landing_page_url": str(((profile.get("dataset") or {}) if isinstance(profile.get("dataset"), dict) else {}).get("landing_page_url") or (profiler_input.get("dataset") or {}).get("landing_page_url") or "").strip(),
+                "download_url": str(((profile.get("dataset") or {}) if isinstance(profile.get("dataset"), dict) else {}).get("download_url") or (profiler_input.get("dataset") or {}).get("download_url") or "").strip(),
+                "accession_id": str(((profile.get("dataset") or {}) if isinstance(profile.get("dataset"), dict) else {}).get("accession_id") or (profiler_input.get("dataset") or {}).get("accession_id") or "").strip(),
+                "notes": str(((profile.get("dataset") or {}) if isinstance(profile.get("dataset"), dict) else {}).get("notes") or (profiler_input.get("dataset") or {}).get("notes") or "").strip(),
+            },
+            "available_assets": normalize_text_list(profile.get("available_assets")),
+            "constraints": normalize_text_list(profile.get("constraints")),
+            "suggested_analysis_targets": normalize_text_list(profile.get("suggested_analysis_targets")),
+            "sources": [_normalize_source(entry, index) for index, entry in enumerate(profile.get("sources") or [])],
+        }
+        path = "stage2_profile.json"
+        write_json_file(self.run_directory(run_id) / path, normalized)
+        self._run_store(run_id).record_artifact(
+            stage="2",
+            artifact_id="stage2_profile",
+            artifact_type="profile",
+            path=path,
+            description="Dataset inspection handoff for Stage 2.",
+        )
+        self._run_store(run_id).complete_stage(stage="2", agent="dataset-profiler", artifacts=[path])
+        return normalized
+
+    def _run_experiment_planner(self, *, run_id: str, planner_input: dict[str, Any]) -> dict[str, Any]:
+        instructions = """
+You are Sidekick's experiment planner.
+Given the research question, dataset profile, related work, and any validation feedback, propose a small execution plan for the analyst.
+Return a structured object as JSON. If needed, a Python dict literal is acceptable, but do not return prose outside the object.
+{
+  "plan_summary": "string",
+  "execution_focus": "string",
+  "selected_experiments": [
+    {
+      "experiment_id": "exp_1",
+      "title": "string",
+      "rationale": "string",
+      "method_summary": "string",
+      "expected_artifacts": ["string"],
+      "success_criteria": "string",
+      "fallback_if_blocked": "string"
+    }
+  ],
+  "deferred_experiments": ["string"]
+}
+Rules:
+- Propose at most 2 experiments to execute now.
+- The plan must stay anchored to the available dataset profile.
+- Keep this generic and dataset-specific; do not use canned paper-type recipes.
+- If validation feedback exists, directly address it.
+"""
+        plan = self._run_model_json(
+            run_id=run_id,
+            stage="2",
+            agent="experiment-planner",
+            model=self._config.openai_workspace_model,
+            instructions=instructions,
+            input_text=json.dumps(planner_input, sort_keys=True),
+            use_code_interpreter=False,
+            use_web_search=True,
+            timeout_seconds=min(900, self._config.backend_max_job_runtime_seconds),
+            reasoning_effort="medium",
+        )
+        plan.pop("_response", None)
+        selected_experiments = []
+        for index, entry in enumerate(plan.get("selected_experiments") or []):
+            if not isinstance(entry, dict):
+                continue
+            selected_experiments.append(
+                {
+                    "experiment_id": str(entry.get("experiment_id") or f"exp_{index + 1}").strip() or f"exp_{index + 1}",
+                    "title": str(entry.get("title") or f"Experiment {index + 1}").strip() or f"Experiment {index + 1}",
+                    "rationale": str(entry.get("rationale") or "").strip(),
+                    "method_summary": str(entry.get("method_summary") or "").strip(),
+                    "expected_artifacts": normalize_text_list(entry.get("expected_artifacts")),
+                    "success_criteria": str(entry.get("success_criteria") or "").strip(),
+                    "fallback_if_blocked": str(entry.get("fallback_if_blocked") or "").strip(),
+                }
+            )
+        normalized = {
+            "plan_summary": str(plan.get("plan_summary") or "").strip(),
+            "execution_focus": str(plan.get("execution_focus") or "").strip(),
+            "selected_experiments": selected_experiments,
+            "deferred_experiments": normalize_text_list(plan.get("deferred_experiments")),
+        }
+        path = "stage2_plan.json"
+        write_json_file(self.run_directory(run_id) / path, normalized)
+        self._run_store(run_id).record_artifact(
+            stage="2",
+            artifact_id="stage2_plan",
+            artifact_type="plan",
+            path=path,
+            description="Experiment plan handoff for Stage 2.",
+        )
+        self._run_store(run_id).complete_stage(stage="2", agent="experiment-planner", artifacts=[path])
+        return normalized
+
+    def _run_data_analyst_execution(self, *, run_id: str, analyst_input: dict[str, Any]) -> dict[str, Any]:
+        instructions = """
+You are Sidekick's data analyst.
+Use the dataset profile and execution plan to run the most relevant experiments in the compute sandbox and save reproducible artifacts.
+Return a structured object as JSON. If needed, a Python dict literal is acceptable, but do not return prose outside the object.
+{
+  "research_question": "string",
   "experiment_summary": "string",
   "experiments": ["string"],
   "findings": ["string"],
@@ -676,26 +957,25 @@ Return strict JSON only:
       "summary_markdown": "plain markdown description of what the figure shows"
     }
   ],
+  "results": [
+    {
+      "result_id": "result_1",
+      "text": "string",
+      "artifact_ids": ["artifact_1"],
+      "note_ids": ["note_1"]
+    }
+  ],
   "code_summary": "string"
 }
 Rules:
-- Use the dataset from the task payload. Do not swap in a different substrate.
-- Save executable code files, generated figures, and any key intermediate tables as real files.
+- Re-download the dataset or subset if needed; do not assume prior compute state exists.
+- Execute the selected experiments first.
+- Save executable code files, generated figures, and key tables as real files.
 - Figure summaries are mandatory and are the source of truth for the writer.
-- If validation feedback is provided, directly address it instead of repeating the same experiment.
-- Be honest. If a line of inquiry fails, say so and pivot to a better experiment on the same data.
+- If a selected experiment fails, say so honestly and pivot once on the same dataset.
+- Do not swap in a different substrate.
 """
-        analyst_input = {
-            "title": request_payload.get("title"),
-            "theme": request_payload.get("theme"),
-            "research_question": search.get("research_question"),
-            "dataset": search.get("dataset"),
-            "related_work": search.get("related_work") or [],
-            "attempt": attempt,
-            "validation_feedback": feedback_messages,
-            "prior_attempts": prior_attempts,
-        }
-        response_payload = self._run_model_json(
+        return self._run_model_json(
             run_id=run_id,
             stage="2",
             agent="data-analyst",
@@ -707,61 +987,6 @@ Rules:
             timeout_seconds=self._config.backend_max_job_runtime_seconds,
             reasoning_effort="medium",
         )
-        response = response_payload.pop("_response")
-        ledger = {
-            "title": str(request_payload.get("title") or "Research paper"),
-            "research_question": str(response_payload.get("research_question") or search.get("research_question") or "").strip(),
-            "dataset": search.get("dataset") or {},
-            "experiment_summary": str(response_payload.get("experiment_summary") or "").strip(),
-            "experiments": normalize_text_list(response_payload.get("experiments")),
-            "findings": normalize_text_list(response_payload.get("findings")),
-            "limitations": normalize_text_list(response_payload.get("limitations")),
-            "code_summary": str(response_payload.get("code_summary") or "").strip(),
-            "sources": [_normalize_source(entry, index) for index, entry in enumerate(response_payload.get("sources") or [])],
-            "artifacts": [_normalize_artifact(entry, index) for index, entry in enumerate(response_payload.get("artifacts") or [])],
-            "figure_summaries": [
-                _normalize_figure_summary(entry, index) for index, entry in enumerate(response_payload.get("figure_summaries") or [])
-            ],
-            "search": search,
-            "attempt": attempt,
-        }
-        downloaded_files = self.materialize_workspace_files(
-            run_id=run_id,
-            ledger=ledger,
-            container_ids=self._openai_client.extract_container_ids(response),
-        )
-        self.apply_downloaded_files_to_ledger(ledger, downloaded_files)
-        if not ledger["sources"]:
-            ledger["sources"].append(
-                _normalize_source(
-                    {
-                        "source_id": "source_dataset",
-                        "label": search.get("dataset", {}).get("label") or "Primary dataset",
-                        "landing_page_url": search.get("dataset", {}).get("landing_page_url"),
-                        "download_url": search.get("dataset", {}).get("download_url"),
-                        "accession_id": search.get("dataset", {}).get("accession_id"),
-                        "notes": search.get("dataset", {}).get("notes"),
-                    },
-                    0,
-                )
-            )
-        self._ensure_artifact_metadata(ledger)
-        write_json_file(self.run_directory(run_id) / "ledger.json", ledger)
-        for artifact in ledger.get("artifacts", []):
-            if not isinstance(artifact, dict):
-                continue
-            path = str(artifact.get("path") or "").strip()
-            if not path:
-                continue
-            store.record_artifact(
-                stage="2",
-                artifact_id=str(artifact.get("artifact_id") or Path(path).stem),
-                artifact_type=str(artifact.get("kind") or "artifact"),
-                path=path,
-                description=str(artifact.get("description") or "").strip(),
-            )
-        store.complete_stage(stage="2", agent="data-analyst", artifacts=[artifact.get("path") for artifact in ledger.get("artifacts", []) if artifact.get("path")])
-        return ledger
 
     def materialize_workspace_files(
         self,

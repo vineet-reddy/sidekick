@@ -124,14 +124,63 @@ Download the dataset, run experiments, and produce reproducible code and figures
   - Note: The GPT 5.4 API already supports this via a specific function call or parameter that provisions a compute storage box. Use whatever is already in the codebase for this.
 - Internet access: **YES** (so it can research what experiments have already been done and avoid redundant/random experiments)
 
+### Generic Research Protocol
+Stage 2 must use a bounded handoff workflow, similar to how frontier coding models handle large code changes:
+1. Inspect the current substrate
+2. Propose a bounded execution plan
+3. Execute the selected work
+4. Package outputs for the next stage
+
+This is a workflow constraint, not a science constraint. The protocol is generic; the experiments remain dataset-specific and question-specific.
+
 ### Behavior
-1. Download the dataset (or relevant subset if the dataset is very large) onto the compute storage box.
-2. Research what experiments have already been done in this area (using internet access).
-3. Design and run meaningful experiments on the data.
+Stage 2 consists of three generic substeps inside the same stage:
+
+#### Stage 2A — Dataset Profiler
+1. Download the dataset (or a relevant subset if the dataset is very large) onto the compute box.
+2. Inspect what files, tables, columns, and samples are actually available.
+3. Determine what is analyzable and what constraints exist.
+
+Output:
+- retrieval summary
+- dataset profile
+- available assets
+- constraints
+- suggested analysis targets
+
+This substep does **not** design experiments yet.
+
+#### Stage 2B — Experiment Planner
+1. Read the validated research question.
+2. Read the dataset profile.
+3. Research what experiments already exist in this area.
+4. Propose a small number of concrete candidate analyses.
+5. Select the best 1-2 experiments to run now.
+
+Output:
+- concise execution plan
+- rationale for the selected experiments
+- expected artifacts
+- fallback plan if a selected experiment fails
+
+Important:
+- This is not a library of pre-baked experiment templates by paper type.
+- The planner stays flexible and dataset-specific.
+
+#### Stage 2C — Data Analyst Execution
+1. Re-acquire the dataset or subset if needed inside the compute sandbox.
+2. Execute the selected experiments.
+3. Save real reproducible artifacts.
 4. Produce:
    - **Executable code** for all experiments (must be reproducible)
    - **Figures** (charts, plots, visualizations)
    - **Figure summaries in plain markdown** — for each figure, write a text description of what the figure shows. This is important: downstream agents should NOT need to use vision/image capabilities to understand the results. The markdown descriptions are the source of truth.
+   - findings / limitations / provenance
+
+If an experiment fails:
+- say so explicitly
+- pivot once to another reasonable experiment on the same dataset
+- do not fabricate success
 
 ### Output (handed off to Stage 3)
 - All experiment code
@@ -139,7 +188,15 @@ Download the dataset, run experiments, and produce reproducible code and figures
 - Markdown interpretations of every figure
 
 ### Note
-In practice, GPT 5.4 medium thinking does a great job at this with minimal instructions. Don't over-engineer the prompting here.
+The determinism comes from the handoff protocol, not from hardcoded experiment recipes. The system should never say "all papers of type X run Y and Z." The workflow is structured; the science is still open-ended.
+
+### Handoff Files
+Stage 2 should pass structured state via bounded files rather than one giant fragile blob:
+- `stage2_profile.json`
+- `stage2_plan.json`
+- `ledger.json`
+
+The backend should be tolerant to structured-output formatting quirks. Perfect JSON is ideal, but a Python-dict-style structured object is an acceptable fallback when needed. The goal is robust handoff, not serialization purism.
 
 ---
 
@@ -314,15 +371,18 @@ Every LLM API call made during the pipeline must be logged and inspectable after
 
 #### LLM Streaming
 
-When an LLM call is in progress, the CLI must be able to stream the response tokens as they arrive. This is essential for agents that need to monitor long-running model calls (especially the data analyst and paper writer stages which use medium-thinking GPT 5.4).
+When an LLM call is in progress, the CLI must expose the most useful live signal for that call. For plain-text stages this is usually token streaming. For long-running compute-sandbox stages this is usually lifecycle status and heartbeat events.
 
 | Command | Description |
 |---------|-------------|
-| `sidekick stream <run-id>` | Attach to the currently active LLM call and stream its response tokens to stdout in real time. |
+| `sidekick stream <run-id>` | Attach to the currently active LLM call and stream its live output or lifecycle events in real time. |
 | `sidekick stream <run-id> --stage <N>` | Attach to the active LLM call for a specific stage. |
-| `sidekick stream <run-id> --raw` | Stream raw delta tokens (for agent parsing) instead of assembled text. |
+| `sidekick stream <run-id> --raw` | Stream raw delta tokens or raw lifecycle events (for agent parsing) instead of assembled text. |
 
-Implementation note: The backend must use server-sent events (SSE) or a similar mechanism so that the CLI can consume streaming responses without polling. When calling the OpenAI API, always use `stream: true` and forward the stream to a local event bus that the CLI can tap into.
+Implementation note:
+- For plain text model calls, token streaming via SSE is preferred.
+- For long-running compute-sandbox calls, response ids, queued/in-progress/completed states, and heartbeat events are more important than token deltas.
+- The CLI must surface whichever live signal the backend can provide for that call type.
 
 #### Artifacts
 
@@ -342,6 +402,13 @@ Since Stage 2/2.5 has a feedback loop, the CLI must make the retry history fully
 | `sidekick retries <run-id>` | Show retry history: how many attempts, what feedback was given at each iteration, what changed. |
 | `sidekick retries <run-id> --attempt <N>` | Show detail for a specific attempt (the validation feedback, the data analyst's output, pass/fail result). |
 
+For Stage 2, the CLI must also expose which internal substep is active:
+- dataset profiling
+- experiment planning
+- data analyst execution
+
+An operator should be able to inspect the handoff files for each substep independently.
+
 ### Logging Architecture
 
 #### What Gets Logged
@@ -350,7 +417,7 @@ Every log entry must include:
 - **Timestamp** (ISO 8601, UTC)
 - **Run ID**
 - **Stage** (1, 2, 2.5, 3, 4)
-- **Agent** (e.g., `search-a`, `search-b`, `search-c`, `data-analyst`, `validation`, `paper-writer`, `github-push`)
+- **Agent** (e.g., `search-a`, `search-b`, `search-c`, `dataset-profiler`, `experiment-planner`, `data-analyst`, `validation`, `paper-writer`, `github-push`)
 - **Level** (`debug`, `info`, `warn`, `error`)
 - **Message** (human-readable string)
 - **Structured metadata** (JSON blob with stage-specific context — e.g., model name, token count, call ID, artifact path, retry attempt number)
@@ -477,7 +544,9 @@ The current codebase has a convoluted process with many disjointed moving parts.
 | 1 | Web Search A (allow-listed) | GPT 5.4 Mini/Nano | Default | Yes | No |
 | 1 | Web Search B (open internet) | GPT 5.4 Mini/Nano | Default | Yes | No |
 | 1 | Web Search C (retry, if needed) | GPT 5.4 | Medium | Yes | No |
-| 2 | Data Analyst | GPT 5.4 | Medium | Yes | Yes |
+| 2 | Dataset Profiler | GPT 5.4 | Medium | Yes | Yes |
+| 2 | Experiment Planner | GPT 5.4 | Medium | Yes | No |
+| 2 | Data Analyst Execution | GPT 5.4 | Medium | Yes | Yes |
 | 2.5 | Validation Gate | GPT 5.4 Mini/Nano | Default | No | No |
 | 3 | Paper Writer | GPT 5.4 | Medium | Yes | No |
 | 4 | GitHub Push | N/A (existing code) | N/A | Yes | No |
