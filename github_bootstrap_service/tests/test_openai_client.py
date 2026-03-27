@@ -46,6 +46,7 @@ class OpenAIClientTests(unittest.TestCase):
                 raise AssertionError(f"Unexpected request: {(method, path)}")
 
         client = StubOpenAIClient()
+        events: list[dict[str, object]] = []
         result = client.generate_json(
             instructions="Return JSON.",
             input_text="{}",
@@ -53,12 +54,13 @@ class OpenAIClientTests(unittest.TestCase):
             use_web_search=False,
             timeout_seconds=11,
             on_delta=lambda _: None,
-            on_event=lambda _: None,
+            on_event=lambda event: events.append(event),
         )
 
         self.assertEqual(result.response_id, "resp_123")
         self.assertEqual(result.output_text, "{\"ok\": true}")
         self.assertEqual(client.requests, [("POST", "/responses"), ("GET", "/responses/resp_123")])
+        self.assertEqual([event.get("event") for event in events], ["response.created", "response.polled"])
 
     def test_extracts_container_file_citations_from_output_annotations(self) -> None:
         client = OpenAIClient(_config())

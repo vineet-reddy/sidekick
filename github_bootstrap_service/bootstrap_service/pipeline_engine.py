@@ -1270,6 +1270,38 @@ Rules:
             progress_message=f"{agent} started.",
             status="running",
         )
+        seen_response_id = ""
+        seen_status = ""
+
+        def _handle_event(event: dict[str, Any]) -> None:
+            nonlocal seen_response_id, seen_status
+            store.append_call_delta(handle, "", raw_event=event)
+            response = event.get("response") if isinstance(event.get("response"), dict) else None
+            response_id = str(
+                event.get("id")
+                or event.get("response_id")
+                or (response.get("id") if response is not None else "")
+                or ""
+            ).strip()
+            status_value = str(event.get("status") or (response.get("status") if response is not None else "") or "").strip().lower()
+            should_emit = False
+            if response_id and response_id != seen_response_id:
+                seen_response_id = response_id
+                should_emit = True
+            if status_value and status_value not in {"completed", "failed", "cancelled", "incomplete", "expired"} and status_value != seen_status:
+                seen_status = status_value
+                should_emit = True
+            if not should_emit:
+                return
+            progress_message = f"{agent} {status_value.replace('_', ' ')}." if status_value else f"{agent} started."
+            self._emit_status(
+                run_id,
+                stage=stage,
+                progress_message=progress_message,
+                status="running",
+                openai_response_id=seen_response_id or None,
+            )
+
         started_ms = store.elapsed_ms()
         try:
             response = self._openai_client.generate_json(
@@ -1281,7 +1313,7 @@ Rules:
                 model=model,
                 reasoning_effort=reasoning_effort,
                 on_delta=lambda delta: store.append_call_delta(handle, delta),
-                on_event=lambda event: store.append_call_delta(handle, "", raw_event=event),
+                on_event=_handle_event,
             )
         except Exception as error:
             store.fail_call(handle, error=str(error), latency_ms=max(0, store.elapsed_ms() - started_ms))

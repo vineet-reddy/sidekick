@@ -103,6 +103,10 @@ class OpenAIClient:
         response_id = str(created.get("id") or "").strip()
         if not response_id:
             raise OpenAIClientError("OpenAI did not return a response id.")
+        if on_event is not None:
+            created_event = dict(created)
+            created_event.setdefault("event", "response.created")
+            on_event(created_event)
 
         deadline = time.monotonic() + timeout_seconds
         latest = created
@@ -121,6 +125,10 @@ class OpenAIClient:
 
             time.sleep(5)
             latest = self._request_json("GET", f"/responses/{response_id}", None)
+            if on_event is not None:
+                polled_event = dict(latest)
+                polled_event.setdefault("event", "response.polled")
+                on_event(polled_event)
 
         raise OpenAIClientError("OpenAI response exceeded the configured timeout.")
 
