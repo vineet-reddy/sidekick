@@ -527,6 +527,30 @@ class SidekickDatabase:
                     counts[status] = int(row["count"])
             return counts
 
+    def fail_stale_running_jobs(self, *, stale_before_iso: str, error_message: str) -> int:
+        now = iso_now()
+        with self._lock, self._connection() as connection:
+            result = connection.execute(
+                """
+                UPDATE paper_jobs
+                SET status = 'failed',
+                    progress_message = ?,
+                    error_message = ?,
+                    completed_at = ?,
+                    updated_at = ?
+                WHERE status = 'running'
+                  AND updated_at < ?
+                """,
+                (
+                    "The hosted worker stopped before this run completed.",
+                    error_message,
+                    now,
+                    now,
+                    stale_before_iso,
+                ),
+            )
+            return int(result.rowcount or 0)
+
     def claim_next_queued_job(self, max_concurrent_jobs_per_install: int) -> JobClaim | None:
         with self._lock, self._connection() as connection:
             queued_jobs = connection.execute(

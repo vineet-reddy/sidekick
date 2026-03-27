@@ -364,6 +364,13 @@ class JobProcessor(threading.Thread):
             try:
                 self._database.purge_expired_github_connect_sessions()
                 self._cleanup_expired_artifacts()
+                stale_before = (utc_now() - timedelta(seconds=self._config.backend_max_job_runtime_seconds + 300)).isoformat()
+                recovered = self._database.fail_stale_running_jobs(
+                    stale_before_iso=stale_before,
+                    error_message="The hosted worker stopped or restarted before the run finished.",
+                )
+                if recovered:
+                    print(f"[sidekick-backend] recovered {recovered} stale running job(s)")
 
                 if self._config.backend_kill_switch:
                     time.sleep(2)
