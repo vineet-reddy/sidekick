@@ -453,7 +453,7 @@ class JobProcessor(threading.Thread):
                 completed=True,
             )
 
-    def _record_response_metrics(self, *, job_id: str, model: str, input_tokens: int, output_tokens: int) -> None:
+    def _record_response_metrics(self, job_id: str, *, model: str, input_tokens: int, output_tokens: int) -> None:
         self._database.record_paper_job_metrics(
             job_id=job_id,
             model=model,
