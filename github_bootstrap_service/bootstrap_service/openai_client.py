@@ -96,14 +96,6 @@ class OpenAIClient:
         if tools:
             payload["tools"] = tools
 
-        if (on_delta is not None or on_event is not None) and not use_code_interpreter:
-            return self._generate_streaming_response(
-                payload=payload,
-                timeout_seconds=timeout_seconds,
-                on_delta=on_delta,
-                on_event=on_event,
-            )
-
         payload["background"] = True
         created = self._request_json("POST", "/responses", payload)
         response_id = str(created.get("id") or "").strip()

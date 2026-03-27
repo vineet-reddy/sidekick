@@ -63,6 +63,48 @@ class OpenAIClientTests(unittest.TestCase):
         self.assertEqual(client.requests, [("POST", "/responses"), ("GET", "/responses/resp_123")])
         self.assertEqual([event.get("event") for event in events], ["response.created", "response.polled"])
 
+    def test_non_code_interpreter_calls_also_use_background_polling_with_callbacks(self) -> None:
+        class StubOpenAIClient(OpenAIClient):
+            def __init__(self) -> None:
+                super().__init__(_config())
+                self.requests: list[tuple[str, str]] = []
+
+            def _generate_streaming_response(self, **_: object) -> OpenAIResponseResult:
+                raise AssertionError("streaming path should not be used")
+
+            def _request_json(self, method: str, path: str, body: dict[str, object] | None) -> dict[str, object]:
+                self.requests.append((method, path))
+                if (method, path) == ("POST", "/responses"):
+                    return {
+                        "id": "resp_456",
+                        "status": "queued",
+                    }
+                if (method, path) == ("GET", "/responses/resp_456"):
+                    return {
+                        "id": "resp_456",
+                        "status": "completed",
+                        "output_text": "{\"ok\": true}",
+                        "usage": {"input_tokens": 9, "output_tokens": 5},
+                    }
+                raise AssertionError(f"Unexpected request: {(method, path)}")
+
+        client = StubOpenAIClient()
+        events: list[dict[str, object]] = []
+        result = client.generate_json(
+            instructions="Return JSON.",
+            input_text="{}",
+            use_code_interpreter=False,
+            use_web_search=False,
+            timeout_seconds=11,
+            on_delta=lambda _: None,
+            on_event=lambda event: events.append(event),
+        )
+
+        self.assertEqual(result.response_id, "resp_456")
+        self.assertEqual(result.output_text, "{\"ok\": true}")
+        self.assertEqual(client.requests, [("POST", "/responses"), ("GET", "/responses/resp_456")])
+        self.assertEqual([event.get("event") for event in events], ["response.created", "response.polled"])
+
     def test_extracts_container_file_citations_from_output_annotations(self) -> None:
         client = OpenAIClient(_config())
         text = '{"artifacts":[{"path":"artifacts/table_1.csv"}]}'
