@@ -297,7 +297,11 @@ class PaperPipelineEngine:
         note_text = "\n\n".join(note["content"] for note in payload.get("notes", []))
         store.begin_run(note=note_text, title=str(payload.get("title") or "Research paper"))
         try:
-            search = self.run_stage_one(run_id=run_id, request_payload=payload)
+            search = self._resolved_stage_one_search(request_payload=payload)
+            if search is not None:
+                self._persist_resolved_stage_one_search(run_id=run_id, search=search)
+            else:
+                search = self.run_stage_one(run_id=run_id, request_payload=payload)
             ledger, validation = self.run_stage_two_loop(run_id=run_id, request_payload=payload, search=search)
             bundle = self.write_bundle(
                 run_id=run_id,
@@ -315,40 +319,10 @@ class PaperPipelineEngine:
 
     def run_stage_one(self, *, run_id: str, request_payload: dict[str, Any]) -> dict[str, Any]:
         store = self._run_store(run_id)
-        resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
-        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
-        if str(resolution.get("status") or "").strip().lower() == "resolved" and selected_candidate:
-            store.set_stage(stage="1", agent="resolver", model="resolver")
-            search = {
-                "research_question": str(request_payload.get("theme") or request_payload.get("title") or "").strip(),
-                "novelty_rationale": str(resolution.get("summary") or "").strip(),
-                "existing_work_gap": str(resolution.get("summary") or "").strip(),
-                "dataset": {
-                    "label": str(selected_candidate.get("title") or request_payload.get("title") or "Primary dataset").strip(),
-                    "landing_page_url": str(selected_candidate.get("access_url") or "").strip(),
-                    "download_url": (
-                        str((selected_candidate.get("download_urls") or [""])[0] or "").strip()
-                        if isinstance(selected_candidate.get("download_urls"), list)
-                        else ""
-                    ),
-                    "accession_id": str(selected_candidate.get("dataset_id") or "").strip(),
-                    "notes": str(selected_candidate.get("provenance_note") or resolution.get("summary") or "").strip(),
-                    "domain": str(selected_candidate.get("primary_domain") or "").strip(),
-                },
-                "related_work": [],
-                "selected_agent": "resolver",
-            }
-            write_json_file(self.run_directory(run_id) / "stage1.json", search)
-            store.record_artifact(
-                stage="1",
-                artifact_id="stage1-search",
-                artifact_type="search_record",
-                path="stage1.json",
-                description="Resolved dataset selection carried forward from the trusted source resolver.",
-            )
-            store.complete_stage(stage="1", agent="resolver", artifacts=["stage1.json"])
-            return search
-
+        resolved_search = self._resolved_stage_one_search(request_payload=request_payload)
+        if resolved_search is not None:
+            self._persist_resolved_stage_one_search(run_id=run_id, search=resolved_search)
+            return resolved_search
         allowlist = request_payload.get("allowed_domains") or [
             "nih.gov", "cdc.gov", "data.gov", "zenodo.org", "figshare.com",
             "dataverse.harvard.edu", "openneuro.org", "dandiarchive.org", "physionet.org",
@@ -493,6 +467,52 @@ Rules:
         )
         store.complete_stage(stage="1", agent=str(winner.get("agent") or "search"), artifacts=["stage1.json"])
         return search
+
+    def _resolved_stage_one_search(self, *, request_payload: dict[str, Any]) -> dict[str, Any] | None:
+        resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
+        if not resolution and self._source_resolver is not None and normalize_text_list(request_payload.get("dataset_ids")):
+            resolution = self._source_resolver.resolve(
+                title=str(request_payload.get("title") or "Research paper"),
+                theme=str(request_payload.get("theme") or request_payload.get("title") or ""),
+                notes=normalize_request_notes(request_payload.get("notes")),
+                dataset_hints=normalize_text_list(request_payload.get("dataset_hints")),
+                dataset_ids=normalize_text_list(request_payload.get("dataset_ids")),
+            ).as_dict()
+        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
+        if str(resolution.get("status") or "").strip().lower() != "resolved" or not selected_candidate:
+            return None
+        return {
+            "research_question": str(request_payload.get("theme") or request_payload.get("title") or "").strip(),
+            "novelty_rationale": str(resolution.get("summary") or "").strip(),
+            "existing_work_gap": str(resolution.get("summary") or "").strip(),
+            "dataset": {
+                "label": str(selected_candidate.get("title") or request_payload.get("title") or "Primary dataset").strip(),
+                "landing_page_url": str(selected_candidate.get("access_url") or "").strip(),
+                "download_url": (
+                    str((selected_candidate.get("download_urls") or [""])[0] or "").strip()
+                    if isinstance(selected_candidate.get("download_urls"), list)
+                    else ""
+                ),
+                "accession_id": str(selected_candidate.get("dataset_id") or "").strip(),
+                "notes": str(selected_candidate.get("provenance_note") or resolution.get("summary") or "").strip(),
+                "domain": str(selected_candidate.get("primary_domain") or "").strip(),
+            },
+            "related_work": [],
+            "selected_agent": "resolver",
+        }
+
+    def _persist_resolved_stage_one_search(self, *, run_id: str, search: dict[str, Any]) -> None:
+        store = self._run_store(run_id)
+        store.set_stage(stage="1", agent="resolver", model="resolver")
+        write_json_file(self.run_directory(run_id) / "stage1.json", search)
+        store.record_artifact(
+            stage="1",
+            artifact_id="stage1-search",
+            artifact_type="search_record",
+            path="stage1.json",
+            description="Resolved dataset selection carried forward from the trusted source resolver.",
+        )
+        store.complete_stage(stage="1", agent="resolver", artifacts=["stage1.json"])
 
     def run_stage_two_loop(
         self,
