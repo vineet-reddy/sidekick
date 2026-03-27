@@ -15,6 +15,10 @@ class OpenAIClientError(RuntimeError):
     pass
 
 
+class OpenAIClientTransientError(OpenAIClientError):
+    pass
+
+
 @dataclass(frozen=True)
 class OpenAIUsage:
     input_tokens: int
@@ -126,7 +130,19 @@ class OpenAIClient:
                 raise OpenAIClientError(error_message or f"OpenAI response ended with status {status}.")
 
             time.sleep(5)
-            latest = self._request_json("GET", f"/responses/{response_id}", None)
+            try:
+                latest = self._request_json("GET", f"/responses/{response_id}", None)
+            except OpenAIClientTransientError as error:
+                if on_event is not None:
+                    on_event(
+                        {
+                            "event": "response.poll_error",
+                            "id": response_id,
+                            "status": status or "in_progress",
+                            "error": str(error),
+                        }
+                    )
+                continue
             if on_event is not None:
                 polled_event = dict(latest)
                 polled_event.setdefault("event", "response.polled")
@@ -399,6 +415,9 @@ class OpenAIClient:
                     last_error = error
                     time.sleep(self._transient_retry_delay_seconds * attempt)
                     continue
+                if method.upper() == "GET" and self._is_retryable_http_error(error):
+                    detail = error.read().decode("utf-8", errors="replace")
+                    raise OpenAIClientTransientError(f"OpenAI request failed with HTTP {error.code}: {detail}") from error
                 detail = error.read().decode("utf-8", errors="replace")
                 raise OpenAIClientError(f"OpenAI request failed with HTTP {error.code}: {detail}") from error
             except URLError as error:
@@ -406,14 +425,20 @@ class OpenAIClient:
                     last_error = error
                     time.sleep(self._transient_retry_delay_seconds * attempt)
                     continue
+                if method.upper() == "GET":
+                    raise OpenAIClientTransientError(f"OpenAI request failed: {error.reason}") from error
                 raise OpenAIClientError(f"OpenAI request failed: {error.reason}") from error
             except (ConnectionResetError, TimeoutError, OSError) as error:
                 if method.upper() == "GET" and attempt < attempts:
                     last_error = error
                     time.sleep(self._transient_retry_delay_seconds * attempt)
                     continue
+                if method.upper() == "GET":
+                    raise OpenAIClientTransientError(f"OpenAI request failed: {error}") from error
                 raise OpenAIClientError(f"OpenAI request failed: {error}") from error
         if payload is None:
+            if method.upper() == "GET":
+                raise OpenAIClientTransientError(f"OpenAI request failed: {last_error or 'unknown error'}")
             raise OpenAIClientError(f"OpenAI request failed: {last_error or 'unknown error'}")
 
         if not expect_json:

@@ -6,7 +6,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bootstrap_service.config import BootstrapServiceConfig
-from bootstrap_service.openai_client import OpenAIClient, OpenAIResponseResult, OpenAIUsage
+from bootstrap_service.openai_client import OpenAIClient, OpenAIClientTransientError, OpenAIResponseResult, OpenAIUsage
 
 
 def _config() -> BootstrapServiceConfig:
@@ -202,6 +202,46 @@ class OpenAIClientTests(unittest.TestCase):
             payload = client._request_json("GET", "/responses/resp_123", None)
 
         self.assertEqual(payload, {"ok": True})
+
+    def test_generate_json_continues_after_transient_poll_error(self) -> None:
+        class StubOpenAIClient(OpenAIClient):
+            def __init__(self) -> None:
+                super().__init__(_config())
+                self.requests: list[tuple[str, str]] = []
+                self.poll_attempts = 0
+
+            def _request_json(self, method: str, path: str, body: dict[str, object] | None) -> dict[str, object]:
+                self.requests.append((method, path))
+                if (method, path) == ("POST", "/responses"):
+                    return {"id": "resp_123", "status": "queued"}
+                if (method, path) == ("GET", "/responses/resp_123"):
+                    self.poll_attempts += 1
+                    if self.poll_attempts == 1:
+                        raise OpenAIClientTransientError("OpenAI request failed: [Errno 104] Connection reset by peer")
+                    return {
+                        "id": "resp_123",
+                        "status": "completed",
+                        "output_text": "{\"ok\": true}",
+                        "usage": {"input_tokens": 11, "output_tokens": 7},
+                    }
+                raise AssertionError(f"Unexpected request: {(method, path)}")
+
+        client = StubOpenAIClient()
+        events: list[dict[str, object]] = []
+        with patch("bootstrap_service.openai_client.time.sleep", return_value=None):
+            result = client.generate_json(
+                instructions="Return JSON.",
+                input_text="{}",
+                use_code_interpreter=True,
+                use_web_search=False,
+                timeout_seconds=30,
+                on_event=lambda event: events.append(event),
+            )
+
+        self.assertEqual(result.response_id, "resp_123")
+        self.assertEqual(result.output_text, "{\"ok\": true}")
+        self.assertEqual(client.requests, [("POST", "/responses"), ("GET", "/responses/resp_123"), ("GET", "/responses/resp_123")])
+        self.assertIn("response.poll_error", [str(event.get("event") or "") for event in events])
 
 
 if __name__ == "__main__":
