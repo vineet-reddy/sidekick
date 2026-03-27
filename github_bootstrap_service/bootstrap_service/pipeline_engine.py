@@ -315,6 +315,40 @@ class PaperPipelineEngine:
 
     def run_stage_one(self, *, run_id: str, request_payload: dict[str, Any]) -> dict[str, Any]:
         store = self._run_store(run_id)
+        resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
+        selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
+        if str(resolution.get("status") or "").strip().lower() == "resolved" and selected_candidate:
+            store.set_stage(stage="1", agent="resolver", model="resolver")
+            search = {
+                "research_question": str(request_payload.get("theme") or request_payload.get("title") or "").strip(),
+                "novelty_rationale": str(resolution.get("summary") or "").strip(),
+                "existing_work_gap": str(resolution.get("summary") or "").strip(),
+                "dataset": {
+                    "label": str(selected_candidate.get("title") or request_payload.get("title") or "Primary dataset").strip(),
+                    "landing_page_url": str(selected_candidate.get("access_url") or "").strip(),
+                    "download_url": (
+                        str((selected_candidate.get("download_urls") or [""])[0] or "").strip()
+                        if isinstance(selected_candidate.get("download_urls"), list)
+                        else ""
+                    ),
+                    "accession_id": str(selected_candidate.get("dataset_id") or "").strip(),
+                    "notes": str(selected_candidate.get("provenance_note") or resolution.get("summary") or "").strip(),
+                    "domain": str(selected_candidate.get("primary_domain") or "").strip(),
+                },
+                "related_work": [],
+                "selected_agent": "resolver",
+            }
+            write_json_file(self.run_directory(run_id) / "stage1.json", search)
+            store.record_artifact(
+                stage="1",
+                artifact_id="stage1-search",
+                artifact_type="search_record",
+                path="stage1.json",
+                description="Resolved dataset selection carried forward from the trusted source resolver.",
+            )
+            store.complete_stage(stage="1", agent="resolver", artifacts=["stage1.json"])
+            return search
+
         allowlist = request_payload.get("allowed_domains") or [
             "nih.gov", "cdc.gov", "data.gov", "zenodo.org", "figshare.com",
             "dataverse.harvard.edu", "openneuro.org", "dandiarchive.org", "physionet.org",

@@ -216,6 +216,44 @@ class PipelineEngineTests(unittest.TestCase):
             self.assertEqual(context.exception.stage, "inspect")
             self.assertIn("No qualifying dataset found", str(context.exception))
 
+    def test_stage_one_uses_upstream_resolution_without_search_models(self) -> None:
+        class NoSearchOpenAIClient:
+            def generate_json(self, **_: object):
+                raise AssertionError("stage-one search models should not run when request_payload.resolution is already resolved")
+
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            engine = PaperPipelineEngine(
+                config=_config(root),
+                openai_client=NoSearchOpenAIClient(),
+            )
+
+            search = engine.run_stage_one(
+                run_id="resolved-run",
+                request_payload={
+                    "title": "Circadian disruption and breast cancer mechanistic coupling",
+                    "theme": "Circadian disruption and breast cancer mechanistic coupling",
+                    "notes": [{"id": "note_1", "title": "Circadian", "content": "Need a real circadian breast-cancer dataset."}],
+                    "resolution": {
+                        "status": "resolved",
+                        "summary": "Selected GSE76369 from NCBI GEO Functional Genomics as the primary empirical source.",
+                        "selected_candidate": {
+                            "dataset_id": "GSE76369",
+                            "title": "Identification of circadian-related gene expression profiles in entrained MCF10A",
+                            "access_url": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE76369",
+                            "download_urls": [],
+                            "primary_domain": "ncbi.nlm.nih.gov",
+                            "provenance_note": "Resolved directly from an explicit GEO accession.",
+                        },
+                    },
+                },
+            )
+
+            self.assertEqual(search["dataset"]["accession_id"], "GSE76369")
+            self.assertEqual(search["dataset"]["label"], "Identification of circadian-related gene expression profiles in entrained MCF10A")
+            self.assertEqual(search["selected_agent"], "resolver")
+            self.assertTrue((root / "artifacts" / "resolved-run" / "stage1.json").exists())
+
     def test_single_note_validation_falls_back_when_result_note_ids_are_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:
             root = pathlib.Path(tempdir)
