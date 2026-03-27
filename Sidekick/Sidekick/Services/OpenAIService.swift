@@ -339,6 +339,7 @@ final class OpenAIService: ObservableObject {
         theme: String,
         datasetIDs: [String]
     ) async throws -> ResearchRunPreparation {
+        _ = try? await github.ensureDeviceSession(forceRefresh: true)
         let combinedDatasetIDs = datasetIDs
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }

@@ -205,6 +205,16 @@ final class HeartbeatManager: ObservableObject {
             .lowercased() ?? ""
 
         switch normalized {
+        case "1":
+            return .inspect
+        case "2":
+            return .analyze
+        case "2.5":
+            return .verify
+        case "3":
+            return .write
+        case "4":
+            return .write
         case let value where value.contains("plan"):
             return .plan
         case let value where value.contains("inspect"):
