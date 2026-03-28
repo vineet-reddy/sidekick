@@ -195,6 +195,69 @@ class FakeOpenAIClient:
         return b"metric,value\nprevalence,0.18\n"
 
 
+class EmpiricalOpenAIClient(FakeOpenAIClient):
+    def __init__(self) -> None:
+        super().__init__()
+        self.acquisition_result = OpenAIResponseResult(
+            response_id="resp_acquisition",
+            output_text="""
+{
+  "status": "ready",
+  "summary": "Downloaded a compact numeric CSV and confirmed it is usable for analysis.",
+  "blocking_reason": "",
+  "substrate_class": "numeric",
+  "empirical_ready": true,
+  "download_manifest": [
+    {
+      "url": "https://example.org/data/table_1.csv",
+      "source_family": "generic_repository",
+      "retrieval_target": "processed_table",
+      "method": "http_get",
+      "status": "success",
+      "http_status": 200,
+      "latency_ms": 120,
+      "bytes_downloaded": 27,
+      "saved_path": "downloads/table_1.csv",
+      "saved_file_kind": "table",
+      "content_type": "text/csv",
+      "classification": "numeric",
+      "usable_for_analysis": true,
+      "notes": "Primary substrate acquired."
+    }
+  ],
+  "usable_saved_files": [
+    {
+      "path": "downloads/table_1.csv",
+      "bytes_downloaded": 27,
+      "classification": "numeric",
+      "retrieval_target": "processed_table"
+    }
+  ],
+  "metadata_only_saved_files": [],
+  "host_failures": [],
+  "sources": [
+    {
+      "source_id": "source_1",
+      "label": "Public CSV",
+      "download_url": "https://example.org/data/table_1.csv"
+    }
+  ]
+}
+""".strip(),
+            usage=OpenAIUsage(input_tokens=30, output_tokens=100),
+            payload={"output": [{"type": "message", "content": []}], "status": "completed"},
+        )
+        self.calls = 0
+        self.responses = [
+            self.acquisition_result,
+            self.profiler_result,
+            self.planner_result,
+            self.executor_result,
+            self.packager_result,
+            self.writer_result,
+        ]
+
+
 def _fake_compile(job_directory: pathlib.Path, *, tex_filename: str) -> dict[str, object]:
     pdf_path = job_directory / f"{pathlib.Path(tex_filename).stem}.pdf"
     pdf_path.write_bytes(b"%PDF-1.4\n")
@@ -292,6 +355,50 @@ class PipelineEngineTests(unittest.TestCase):
             self.assertEqual(outputs["bundle"]["pdf"]["ok"], True)
             self.assertGreaterEqual(len(statuses), 3)
             self.assertGreaterEqual(len(metrics), 5)
+
+    def test_empirical_execute_writes_acquisition_receipts(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            engine = PaperPipelineEngine(
+                config=_config(root),
+                openai_client=EmpiricalOpenAIClient(),
+            )
+            request_payload = {
+                "title": "Example prevalence study",
+                "theme": "Example prevalence study",
+                "notes": "Estimate the prevalence available in the public file.",
+                "dataset_ids": [],
+                "dataset_hints": [],
+                "domain_guidance": "",
+                "must_use_sources": [],
+                "resolution": {
+                    "paper_mode": "empirical_dataset",
+                    "status": "resolved",
+                    "summary": "Selected the public CSV as the primary dataset.",
+                    "selected_candidate": {
+                        "dataset_id": "public-csv",
+                        "title": "Public CSV",
+                        "access_url": "https://example.org/data/table_1.csv",
+                        "download_urls": ["https://example.org/data/table_1.csv"],
+                        "primary_domain": "example.org",
+                        "provenance_note": "Resolved directly for the test payload.",
+                    },
+                },
+            }
+
+            with patch("bootstrap_service.pipeline_engine.compile_pdf", side_effect=_fake_compile):
+                outputs = engine.execute(run_id="empirical-run", request_payload=request_payload)
+
+            run_dir = root / "artifacts" / "empirical-run"
+            self.assertTrue((run_dir / "data_access_report.json").exists())
+            self.assertTrue((run_dir / "download_manifest.json").exists())
+            self.assertTrue((run_dir / "network_attempts.tsv").exists())
+            self.assertEqual(outputs["validation"]["manuscript_kind"], "paper")
+            self.assertEqual(outputs["ledger"]["data_access"]["substrate_class"], "numeric")
+            artifact_ids = {entry["artifact_id"] for entry in outputs["ledger"]["artifacts"]}
+            self.assertIn("data_access_report", artifact_ids)
+            self.assertIn("download_manifest", artifact_ids)
+            self.assertIn("network_attempts", artifact_ids)
 
     def test_workspace_blocks_when_empirical_resolution_is_blocked(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

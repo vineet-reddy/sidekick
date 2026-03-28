@@ -219,6 +219,257 @@ def build_validation_error_message(validation: dict[str, Any]) -> str:
     return "Validation blocked the paper."
 
 
+def _is_http_url(value: str) -> bool:
+    lowered = value.strip().lower()
+    return lowered.startswith("https://") or lowered.startswith("http://")
+
+
+def _normalize_download_entry(entry: Any, index: int) -> dict[str, Any]:
+    if not isinstance(entry, dict):
+        entry = {}
+    status = str(entry.get("status") or entry.get("attempt_status") or "").strip().lower()
+    classification = str(entry.get("classification") or entry.get("substrate_class") or "").strip().lower()
+    saved_path = sanitize_relative_path(
+        str(entry.get("saved_path") or entry.get("path") or "").strip(),
+        fallback=f"downloads/entry_{index + 1}",
+    )
+    bytes_downloaded = entry.get("bytes_downloaded", entry.get("bytes"))
+    latency_ms = entry.get("latency_ms")
+    http_status = entry.get("http_status")
+    usable_for_analysis = entry.get("usable_for_analysis")
+    return {
+        "entry_id": str(entry.get("entry_id") or f"download_{index + 1}").strip() or f"download_{index + 1}",
+        "url": str(entry.get("url") or "").strip(),
+        "source_family": str(entry.get("source_family") or "").strip(),
+        "retrieval_target": str(entry.get("retrieval_target") or entry.get("target") or "").strip(),
+        "method": str(entry.get("method") or "http_get").strip() or "http_get",
+        "status": status or "unknown",
+        "http_status": int(http_status) if isinstance(http_status, int) else None,
+        "error_kind": str(entry.get("error_kind") or "").strip(),
+        "error_message": str(entry.get("error_message") or "").strip(),
+        "latency_ms": int(latency_ms) if isinstance(latency_ms, int | float) else None,
+        "bytes_downloaded": int(bytes_downloaded) if isinstance(bytes_downloaded, int | float) else 0,
+        "saved_path": saved_path,
+        "saved_file_kind": str(entry.get("saved_file_kind") or entry.get("file_kind") or "").strip(),
+        "content_type": str(entry.get("content_type") or "").strip(),
+        "classification": classification or "unknown",
+        "usable_for_analysis": bool(usable_for_analysis),
+        "notes": str(entry.get("notes") or "").strip(),
+    }
+
+
+def _network_attempts_tsv(entries: list[dict[str, Any]]) -> str:
+    header = [
+        "entry_id",
+        "url",
+        "source_family",
+        "retrieval_target",
+        "method",
+        "status",
+        "http_status",
+        "error_kind",
+        "latency_ms",
+        "bytes_downloaded",
+        "saved_path",
+        "saved_file_kind",
+        "classification",
+        "usable_for_analysis",
+        "notes",
+    ]
+    rows = ["\t".join(header)]
+    for entry in entries:
+        row = [
+            str(entry.get("entry_id") or ""),
+            str(entry.get("url") or ""),
+            str(entry.get("source_family") or ""),
+            str(entry.get("retrieval_target") or ""),
+            str(entry.get("method") or ""),
+            str(entry.get("status") or ""),
+            "" if entry.get("http_status") is None else str(entry.get("http_status")),
+            str(entry.get("error_kind") or ""),
+            "" if entry.get("latency_ms") is None else str(entry.get("latency_ms")),
+            str(entry.get("bytes_downloaded") or 0),
+            str(entry.get("saved_path") or ""),
+            str(entry.get("saved_file_kind") or ""),
+            str(entry.get("classification") or ""),
+            "true" if entry.get("usable_for_analysis") else "false",
+            str(entry.get("notes") or ""),
+        ]
+        rows.append("\t".join(value.replace("\t", " ").replace("\n", " ").strip() for value in row))
+    return "\n".join(rows) + "\n"
+
+
+def _source_family_strategy(dataset: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
+    resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
+    selected_candidate = resolution.get("selected_candidate") if isinstance(resolution.get("selected_candidate"), dict) else {}
+    family_id = str(selected_candidate.get("family_id") or "").strip()
+    trusted_domains = normalize_text_list(selected_candidate.get("trusted_domains"))
+    if family_id == "geo_functional_genomics" or str(dataset.get("accession_id") or "").strip().upper().startswith(("GSE", "GSM", "GPL")):
+        retrieval_order = [
+            "series_matrix",
+            "processed_sample_table",
+            "processed_supplementary_table",
+            "platform_annotation",
+            "raw_archive",
+        ]
+        return {
+            "family_id": "geo_functional_genomics",
+            "family_label": "NCBI GEO Functional Genomics",
+            "trusted_domains": trusted_domains or ["ncbi.nlm.nih.gov", "eutils.ncbi.nlm.nih.gov"],
+            "retrieval_order": retrieval_order,
+            "numeric_targets": ["series_matrix", "processed_sample_table", "processed_expression_table", "gpr", "raw_archive"],
+            "metadata_only_targets": ["series_html", "sample_html", "platform_html", "landing_page"],
+            "notes": (
+                "For GEO, prefer processed tables and series matrix files first. "
+                "Do not count sample HTML, platform HTML, or the series landing page as numeric substrate."
+            ),
+        }
+    return {
+        "family_id": family_id or "generic_repository",
+        "family_label": str(selected_candidate.get("family_label") or "Generic repository").strip() or "Generic repository",
+        "trusted_domains": trusted_domains,
+        "retrieval_order": ["processed_table", "compact_numeric_file", "supplementary_archive", "raw_archive"],
+        "numeric_targets": ["processed_table", "compact_numeric_file", "supplementary_archive", "raw_archive"],
+        "metadata_only_targets": ["landing_page", "html_page"],
+        "notes": "Prefer the smallest credible numeric or semi-numeric file before attempting larger raw archives.",
+    }
+
+
+def _acquisition_budgets(config: BootstrapServiceConfig) -> dict[str, int]:
+    return {
+        "max_total_bytes": int(config.data_access_max_total_bytes),
+        "max_file_bytes": int(config.data_access_max_file_bytes),
+        "max_files": int(config.data_access_max_files),
+        "max_seconds": int(config.data_access_max_seconds),
+    }
+
+
+def _normalize_data_access_report(
+    *,
+    raw_report: dict[str, Any],
+    dataset: dict[str, Any],
+    request_payload: dict[str, Any],
+    config: BootstrapServiceConfig,
+) -> dict[str, Any]:
+    budgets = _acquisition_budgets(config)
+    strategy = _source_family_strategy(dataset, request_payload)
+    manifest_entries = [
+        _normalize_download_entry(entry, index) for index, entry in enumerate(raw_report.get("download_manifest") or raw_report.get("downloads") or [])
+    ]
+    substrate_class = str(raw_report.get("substrate_class") or raw_report.get("retrieved_substrate_class") or "").strip().lower()
+    if substrate_class not in {"numeric", "semi_numeric", "metadata_only", "none"}:
+        if any(entry.get("usable_for_analysis") and entry.get("classification") == "numeric" for entry in manifest_entries):
+            substrate_class = "numeric"
+        elif any(entry.get("usable_for_analysis") and entry.get("classification") == "semi_numeric" for entry in manifest_entries):
+            substrate_class = "semi_numeric"
+        elif manifest_entries:
+            substrate_class = "metadata_only"
+        else:
+            substrate_class = "none"
+    usable_saved_files = []
+    metadata_only_saved_files = []
+    for entry in manifest_entries:
+        file_record = {
+            "path": str(entry.get("saved_path") or ""),
+            "bytes_downloaded": int(entry.get("bytes_downloaded") or 0),
+            "classification": str(entry.get("classification") or ""),
+            "retrieval_target": str(entry.get("retrieval_target") or ""),
+        }
+        if entry.get("usable_for_analysis"):
+            usable_saved_files.append(file_record)
+        elif file_record["path"]:
+            metadata_only_saved_files.append(file_record)
+    if not usable_saved_files:
+        usable_saved_files = [
+            {
+                "path": sanitize_relative_path(str(entry.get("path") or "").strip(), fallback=f"downloads/usable_{index + 1}"),
+                "bytes_downloaded": int(entry.get("bytes_downloaded") or 0),
+                "classification": str(entry.get("classification") or "numeric"),
+                "retrieval_target": str(entry.get("retrieval_target") or ""),
+            }
+            for index, entry in enumerate(raw_report.get("usable_saved_files") or [])
+            if isinstance(entry, dict) and str(entry.get("path") or "").strip()
+        ]
+    if not metadata_only_saved_files:
+        metadata_only_saved_files = [
+            {
+                "path": sanitize_relative_path(str(entry.get("path") or "").strip(), fallback=f"downloads/metadata_{index + 1}"),
+                "bytes_downloaded": int(entry.get("bytes_downloaded") or 0),
+                "classification": str(entry.get("classification") or "metadata_only"),
+                "retrieval_target": str(entry.get("retrieval_target") or ""),
+            }
+            for index, entry in enumerate(raw_report.get("metadata_only_saved_files") or [])
+            if isinstance(entry, dict) and str(entry.get("path") or "").strip()
+        ]
+    empirical_ready = bool(raw_report.get("empirical_ready"))
+    if not empirical_ready:
+        empirical_ready = substrate_class in {"numeric", "semi_numeric"} and bool(usable_saved_files)
+    return {
+        "status": str(raw_report.get("status") or ("ready" if empirical_ready else "blocked")).strip().lower() or ("ready" if empirical_ready else "blocked"),
+        "summary": str(raw_report.get("summary") or "").strip(),
+        "blocking_reason": str(raw_report.get("blocking_reason") or "").strip(),
+        "substrate_class": substrate_class,
+        "empirical_ready": empirical_ready,
+        "dataset": {
+            "label": str(dataset.get("label") or "").strip(),
+            "landing_page_url": str(dataset.get("landing_page_url") or "").strip(),
+            "download_url": str(dataset.get("download_url") or "").strip(),
+            "accession_id": str(dataset.get("accession_id") or "").strip(),
+            "notes": str(dataset.get("notes") or "").strip(),
+        },
+        "budgets": budgets,
+        "strategy": strategy,
+        "download_manifest": manifest_entries,
+        "usable_saved_files": usable_saved_files,
+        "metadata_only_saved_files": metadata_only_saved_files,
+        "host_failures": [
+            {
+                "host": str(entry.get("host") or "").strip(),
+                "failures": int(entry.get("failures") or 0),
+                "attempts": int(entry.get("attempts") or 0),
+                "error_kinds": normalize_text_list(entry.get("error_kinds")),
+            }
+            for entry in raw_report.get("host_failures") or []
+            if isinstance(entry, dict)
+        ],
+        "sources": [_normalize_source(entry, index) for index, entry in enumerate(raw_report.get("sources") or [])],
+        "receipts": {
+            "data_access_report_path": "data_access_report.json",
+            "download_manifest_path": "download_manifest.json",
+            "network_attempts_path": "network_attempts.tsv",
+        },
+    }
+
+
+def _data_access_receipt_artifacts() -> list[dict[str, Any]]:
+    return [
+        {
+            "artifact_id": "data_access_report",
+            "path": "data_access_report.json",
+            "kind": "log",
+            "mime_type": "application/json",
+            "description": "Structured acquisition summary with substrate classification and empirical-readiness decision.",
+            "source_ids": [],
+        },
+        {
+            "artifact_id": "download_manifest",
+            "path": "download_manifest.json",
+            "kind": "log",
+            "mime_type": "application/json",
+            "description": "Structured manifest of every acquisition attempt and saved file classification.",
+            "source_ids": [],
+        },
+        {
+            "artifact_id": "network_attempts",
+            "path": "network_attempts.tsv",
+            "kind": "log",
+            "mime_type": "text/tab-separated-values",
+            "description": "Tabular network-attempt receipt for acquisition debugging.",
+            "source_ids": [],
+        },
+    ]
+
+
 def _sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -605,6 +856,8 @@ Rules:
             validation_kind = str(validation.get("manuscript_kind") or "").strip().lower()
             if validation_status in {"pass", "paper"} or validation_kind == "paper":
                 return ledger, validation
+            last_ledger = ledger
+            last_validation = validation
             retries_remaining -= 1
             if retries_remaining < 0:
                 break
@@ -626,8 +879,8 @@ Rules:
                 feedback_from_previous=feedback,
             )
             attempt += 1
-            last_ledger = ledger
-            last_validation = validation
+        if last_ledger is not None and str((last_validation or {}).get("manuscript_kind") or "").strip().lower() == "memo":
+            return last_ledger, last_validation or {}
         reason = build_validation_error_message(last_validation or {})
         self._run_store(run_id).fail_stage(stage="2.5", agent="validation", reason=reason, retries_remaining=0)
         raise PipelineExecutionError(reason, stage="2.5")
@@ -662,12 +915,42 @@ Rules:
         feedback_messages = feedback_messages or []
         prior_attempts = prior_attempts or []
         store = self._run_store(run_id)
+        resolution = request_payload.get("resolution") if isinstance(request_payload.get("resolution"), dict) else {}
+        paper_mode = str(resolution.get("paper_mode") or "").strip().lower()
+        data_access: dict[str, Any] | None = None
+        if paper_mode == "empirical_dataset":
+            store.set_stage(stage="2", agent="data-acquisition", model=self._config.openai_workspace_model)
+            acquisition_input = {
+                "title": request_payload.get("title"),
+                "theme": request_payload.get("theme"),
+                "research_question": search.get("research_question"),
+                "dataset": search.get("dataset"),
+                "attempt": attempt,
+                "validation_feedback": feedback_messages,
+                "prior_attempts": prior_attempts,
+                "budgets": _acquisition_budgets(self._config),
+                "strategy": _source_family_strategy(search.get("dataset") if isinstance(search.get("dataset"), dict) else {}, request_payload),
+            }
+            data_access = self._run_data_acquisition(
+                run_id=run_id,
+                request_payload=request_payload,
+                acquisition_input=acquisition_input,
+            )
+            if not data_access.get("empirical_ready"):
+                return self._build_acquisition_failure_ledger(
+                    run_id=run_id,
+                    request_payload=request_payload,
+                    search=search,
+                    data_access=data_access,
+                    attempt=attempt,
+                )
         store.set_stage(stage="2", agent="dataset-profiler", model=self._config.openai_workspace_model)
         profiler_input = {
             "title": request_payload.get("title"),
             "theme": request_payload.get("theme"),
             "research_question": search.get("research_question"),
             "dataset": search.get("dataset"),
+            "data_access": data_access,
             "attempt": attempt,
             "validation_feedback": feedback_messages,
         }
@@ -687,6 +970,7 @@ Rules:
             "research_question": search.get("research_question"),
             "dataset": search.get("dataset"),
             "dataset_profile": profile,
+            "data_access": data_access,
             "related_work": search.get("related_work") or [],
             "attempt": attempt,
             "validation_feedback": feedback_messages,
@@ -704,6 +988,7 @@ Rules:
             "research_question": search.get("research_question"),
             "dataset": search.get("dataset"),
             "dataset_profile": profile,
+            "data_access": data_access,
             "execution_plan": plan,
             "related_work": search.get("related_work") or [],
             "attempt": attempt,
@@ -724,6 +1009,7 @@ Rules:
             "research_question": search.get("research_question"),
             "dataset": search.get("dataset"),
             "dataset_profile": profile,
+            "data_access": data_access,
             "execution_plan": plan,
             "execution_handoff": response_payload,
             "workspace_files": container_files,
@@ -737,6 +1023,7 @@ Rules:
             "title": str(packaged.get("title") or request_payload.get("title") or "Research paper"),
             "research_question": str(packaged.get("research_question") or response_payload.get("research_question") or search.get("research_question") or "").strip(),
             "dataset": search.get("dataset") or {},
+            "data_access": data_access or {},
             "dataset_profile": profile,
             "execution_plan": plan,
             "execution_handoff": response_payload,
@@ -795,6 +1082,7 @@ Rules:
                 if str(finding).strip()
             ]
         self._ensure_artifact_metadata(ledger)
+        self._attach_data_access_receipt_artifacts(ledger)
         write_json_file(self.run_directory(run_id) / "ledger.json", ledger)
         for artifact in ledger.get("artifacts", []):
             if not isinstance(artifact, dict):
@@ -817,6 +1105,204 @@ Rules:
             description="Packaged Stage 2 ledger for downstream writing.",
         )
         store.complete_stage(stage="2", agent="research-packager", artifacts=["ledger.json"])
+        return ledger
+
+    def _run_data_acquisition(
+        self,
+        *,
+        run_id: str,
+        request_payload: dict[str, Any],
+        acquisition_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        instructions = """
+You are Sidekick's data-acquisition gate for empirical runs.
+Acquire real numeric or semi-numeric substrate before any empirical analysis can proceed.
+Return strict JSON only:
+{
+  "status": "ready or blocked",
+  "summary": "string",
+  "blocking_reason": "string",
+  "substrate_class": "numeric or semi_numeric or metadata_only or none",
+  "empirical_ready": true,
+  "download_manifest": [
+    {
+      "url": "string",
+      "source_family": "string",
+      "retrieval_target": "string",
+      "method": "string",
+      "status": "success or http_error or timeout or dns_error or tls_error or blocked or metadata_only",
+      "http_status": 200,
+      "error_kind": "string",
+      "error_message": "string",
+      "latency_ms": 123,
+      "bytes_downloaded": 123,
+      "saved_path": "downloads/file.ext",
+      "saved_file_kind": "matrix or table or archive or html or json or txt",
+      "content_type": "string",
+      "classification": "numeric or semi_numeric or metadata_only or failed",
+      "usable_for_analysis": true,
+      "notes": "string"
+    }
+  ],
+  "usable_saved_files": [
+    {
+      "path": "downloads/file.ext",
+      "bytes_downloaded": 123,
+      "classification": "numeric",
+      "retrieval_target": "series_matrix"
+    }
+  ],
+  "metadata_only_saved_files": [
+    {
+      "path": "downloads/file.ext",
+      "bytes_downloaded": 123,
+      "classification": "metadata_only",
+      "retrieval_target": "sample_html"
+    }
+  ],
+  "host_failures": [
+    {
+      "host": "ncbi.nlm.nih.gov",
+      "attempts": 3,
+      "failures": 3,
+      "error_kinds": ["timeout"]
+    }
+  ],
+  "sources": [
+    {
+      "source_id": "source_1",
+      "label": "string",
+      "landing_page_url": "string",
+      "download_url": "string",
+      "accession_id": "string",
+      "api_endpoint": "string",
+      "api_query": "string or object",
+      "notes": "string"
+    }
+  ]
+}
+Rules:
+- Use the explicit budgets and retrieval order from the input.
+- Do not treat HTML landing pages, sample pages, or platform pages as numeric substrate.
+- For GEO, try series matrix or processed tables first; raw archives come later.
+- Save the smallest credible numeric or semi-numeric file you can obtain before spending budget on raw archives.
+- If you only recover metadata, set substrate_class=metadata_only and empirical_ready=false.
+- If no usable numeric or semi-numeric file is saved locally, block the empirical run.
+- Record every attempted URL in download_manifest, including failures.
+"""
+        report = self._run_model_json(
+            run_id=run_id,
+            stage="2",
+            agent="data-acquisition",
+            model=self._config.openai_workspace_model,
+            instructions=instructions,
+            input_text=json.dumps(acquisition_input, sort_keys=True),
+            use_code_interpreter=True,
+            use_web_search=False,
+            timeout_seconds=min(self._config.data_access_max_seconds, self._config.backend_max_job_runtime_seconds),
+            reasoning_effort="medium",
+        )
+        report.pop("_response", None)
+        normalized = _normalize_data_access_report(
+            raw_report=report,
+            dataset=acquisition_input.get("dataset") if isinstance(acquisition_input.get("dataset"), dict) else {},
+            request_payload=request_payload,
+            config=self._config,
+        )
+        run_directory = self.run_directory(run_id)
+        write_json_file(run_directory / "data_access_report.json", normalized)
+        write_json_file(run_directory / "download_manifest.json", {"entries": normalized["download_manifest"]})
+        (run_directory / "network_attempts.tsv").write_text(
+            _network_attempts_tsv(normalized["download_manifest"]),
+            encoding="utf-8",
+        )
+        store = self._run_store(run_id)
+        store.record_artifact(
+            stage="2",
+            artifact_id="data_access_report",
+            artifact_type="log",
+            path="data_access_report.json",
+            description="Structured acquisition summary with substrate classification.",
+        )
+        store.record_artifact(
+            stage="2",
+            artifact_id="download_manifest",
+            artifact_type="log",
+            path="download_manifest.json",
+            description="Structured manifest of acquisition attempts and saved files.",
+        )
+        store.record_artifact(
+            stage="2",
+            artifact_id="network_attempts",
+            artifact_type="log",
+            path="network_attempts.tsv",
+            description="TSV receipt of network attempts during acquisition.",
+        )
+        store.complete_stage(
+            stage="2",
+            agent="data-acquisition",
+            artifacts=["data_access_report.json", "download_manifest.json", "network_attempts.tsv"],
+        )
+        return normalized
+
+    def _build_acquisition_failure_ledger(
+        self,
+        *,
+        run_id: str,
+        request_payload: dict[str, Any],
+        search: dict[str, Any],
+        data_access: dict[str, Any],
+        attempt: int,
+    ) -> dict[str, Any]:
+        summary = str(data_access.get("summary") or "").strip()
+        blocking_reason = str(data_access.get("blocking_reason") or "").strip()
+        experiment_summary = (
+            summary
+            or blocking_reason
+            or "The empirical run could not acquire numeric or semi-numeric substrate within the configured acquisition budgets."
+        )
+        findings = [
+            f"Empirical acquisition stopped at substrate_class={str(data_access.get('substrate_class') or 'none')}.",
+        ]
+        if blocking_reason:
+            findings.append(blocking_reason)
+        if data_access.get("metadata_only_saved_files"):
+            findings.append("Only metadata-level files or pages were recovered; no usable numeric substrate was saved.")
+        limitations = [
+            "No empirical analysis was run because the acquisition gate did not materialize usable numeric or semi-numeric substrate.",
+            "See data_access_report.json, download_manifest.json, and network_attempts.tsv for acquisition details.",
+        ]
+        if blocking_reason:
+            limitations.append(blocking_reason)
+        ledger = {
+            "title": str(request_payload.get("title") or "Research memo"),
+            "research_question": str(search.get("research_question") or request_payload.get("theme") or request_payload.get("title") or "").strip(),
+            "dataset": search.get("dataset") or {},
+            "data_access": data_access,
+            "dataset_profile": {},
+            "execution_plan": {},
+            "execution_handoff": {},
+            "experiment_summary": experiment_summary,
+            "experiments": ["Data acquisition gate executed before empirical analysis."],
+            "findings": findings,
+            "limitations": limitations,
+            "code_summary": "",
+            "sources": [_normalize_source(entry, index) for index, entry in enumerate(data_access.get("sources") or [])],
+            "artifacts": _data_access_receipt_artifacts(),
+            "figure_summaries": [],
+            "results": [
+                {
+                    "result_id": "result_1",
+                    "text": experiment_summary,
+                    "artifact_ids": ["data_access_report", "download_manifest", "network_attempts"],
+                    "note_ids": [str(note.get("id") or "").strip() for note in request_payload.get("notes") or [] if str(note.get("id") or "").strip()],
+                }
+            ],
+            "search": search,
+            "attempt": attempt,
+        }
+        self._attach_data_access_receipt_artifacts(ledger)
+        write_json_file(self.run_directory(run_id) / "ledger.json", ledger)
         return ledger
 
     def _run_dataset_profiler(self, *, run_id: str, profiler_input: dict[str, Any]) -> dict[str, Any]:
@@ -855,9 +1341,10 @@ Return a structured object as JSON. If needed, a Python dict literal is acceptab
 }
 Rules:
 - Do not design experiments yet.
-- Focus only on acquisition, inspection, and what is analyzable.
+- Treat the provided data_access report as the source of truth for whether numeric substrate was actually acquired.
+- Focus only on inspection of the acquired substrate and what is analyzable.
 - Use the dataset from the task payload. Do not swap substrates.
-- If the dataset is unusable, set analyzable=false and explain why.
+- If only metadata was acquired, set analyzable=false and explain why.
 """
         profile = self._run_model_json(
             run_id=run_id,
@@ -925,6 +1412,7 @@ Return a structured object as JSON. If needed, a Python dict literal is acceptab
 Rules:
 - Propose at most 2 experiments to execute now.
 - The plan must stay anchored to the available dataset profile.
+- The plan must stay within the already acquired substrate and must not assume unavailable numeric files exist.
 - Keep this generic and dataset-specific; do not use canned paper-type recipes.
 - If validation feedback exists, directly address it.
 """
@@ -1009,7 +1497,8 @@ Return a structured object as JSON. If needed, a Python dict literal is acceptab
   "packaging_notes": "string"
 }
 Rules:
-- Re-download the dataset or subset if needed; do not assume prior compute state exists.
+- Use the acquisition report as a hard constraint. Do not pretend metadata pages are numeric substrate.
+- Re-download the dataset or subset only within the acquisition strategy and budgets when needed; do not assume prior compute state exists.
 - Execute the selected experiments first.
 - Save executable code files, generated figures, and key tables as real files.
 - Save a concise narrative handoff file named analysis_summary.md in the workspace.
@@ -1121,6 +1610,7 @@ Rules:
 - Use the provided workspace_files inventory as the source of truth for artifact paths.
 - Do not invent files that are not present in workspace_files.
 - Keep the ledger anchored to the provided dataset and execution handoff.
+- Preserve the acquisition receipts and do not describe metadata-only artifacts as empirical numeric substrate.
 - If no explicit artifact mapping is obvious, attach the most relevant saved files to the findings conservatively.
 """
         packaged = self._run_model_json(
@@ -1281,6 +1771,44 @@ Rules:
                 }
             )
         ledger["artifact_files"] = artifact_files
+
+    def _attach_data_access_receipt_artifacts(self, ledger: dict[str, Any]) -> None:
+        data_access = ledger.get("data_access") if isinstance(ledger.get("data_access"), dict) else {}
+        if not data_access:
+            return
+        source_ids = [entry.get("source_id") for entry in data_access.get("sources") or [] if isinstance(entry, dict) and entry.get("source_id")]
+        existing = {
+            str(artifact.get("artifact_id") or "").strip()
+            for artifact in ledger.get("artifacts", [])
+            if isinstance(artifact, dict)
+        }
+        for artifact in _data_access_receipt_artifacts():
+            artifact_id = str(artifact.get("artifact_id") or "").strip()
+            if artifact_id in existing:
+                continue
+            merged = dict(artifact)
+            merged["source_ids"] = source_ids
+            ledger.setdefault("artifacts", []).append(merged)
+            existing.add(artifact_id)
+        artifact_files = ledger.setdefault("artifact_files", [])
+        existing_paths = {
+            str(entry.get("path") or "").strip()
+            for entry in artifact_files
+            if isinstance(entry, dict)
+        }
+        for artifact in _data_access_receipt_artifacts():
+            path = str(artifact.get("path") or "").strip()
+            if not path or path in existing_paths:
+                continue
+            artifact_files.append(
+                {
+                    "artifact_id": str(artifact.get("artifact_id") or "").strip(),
+                    "path": path,
+                    "mime_type": str(artifact.get("mime_type") or "").strip(),
+                    "sha256": "",
+                }
+            )
+            existing_paths.add(path)
 
     def validate_ledger(
         self,
@@ -1443,6 +1971,31 @@ Rules:
         missing_note_ids = [note_id for note_id in expected_note_ids if note_id not in {note for result in approved_results for note in result.get("note_ids", [])}]
         methods_text = str(ledger.get("methods") or ledger.get("experiment_summary") or "").strip().lower()
         did_original_work = any(token in methods_text for token in ["downloaded", "cleaned", "computed", "analyzed", "calculated", "fit", "estimated", "processed"])
+        data_access = ledger.get("data_access") if isinstance(ledger.get("data_access"), dict) else {}
+        paper_mode = str(resolution.get("paper_mode") or "").strip().lower()
+        empirical_ready = bool(data_access.get("empirical_ready"))
+        substrate_class = str(data_access.get("substrate_class") or "").strip().lower()
+        has_real_substrate = substrate_class in {"numeric", "semi_numeric"} and empirical_ready
+        has_data_access_receipts = all((run_directory / path).exists() for path in [
+            "data_access_report.json",
+            "download_manifest.json",
+            "network_attempts.tsv",
+        ])
+        quantitative_result_pattern = re.compile(
+            r"(\b\d+(?:\.\d+)?\b|\bp\s*[<=>]\s*\d|\bcorrelation\b|\bauc\b|\blog2\b|\bfold\b|\bamplitude\b|\bphase\b|\bpercent\b|\brank\b)",
+            re.IGNORECASE,
+        )
+        has_quantitative_result = any(
+            quantitative_result_pattern.search(str(result.get("text") or ""))
+            for result in approved_results
+        )
+        if not has_quantitative_result and has_real_substrate:
+            has_quantitative_result = any(
+                str(valid_artifacts.get(artifact_id, {}).get("kind") or "").strip().lower() in {"table", "figure"}
+                or str(valid_artifacts.get(artifact_id, {}).get("mime_type") or "").strip().lower() in {"text/csv", "text/tab-separated-values"}
+                for result in approved_results
+                for artifact_id in result.get("artifact_ids", [])
+            )
         paper_checks = {
             "described_work_performed_here": did_original_work,
             "has_original_result": bool(ledger.get("results") or ledger.get("findings")),
@@ -1453,6 +2006,10 @@ Rules:
                 for result in approved_results for source_id in result.get("source_ids", [])
             ),
         }
+        if paper_mode == "empirical_dataset":
+            paper_checks["has_real_substrate"] = has_real_substrate
+            paper_checks["has_data_access_receipts"] = has_data_access_receipts
+            paper_checks["has_quantitative_result"] = has_quantitative_result
         manuscript_kind = "paper" if all(paper_checks.values()) else "memo"
         memo_reasons: list[str] = []
         if not paper_checks["described_work_performed_here"]:
@@ -1463,6 +2020,14 @@ Rules:
             memo_reasons.append("not every requested note is covered by a validated finding")
         if not paper_checks["uses_resolved_primary_dataset"]:
             memo_reasons.append("validated findings did not stay anchored to the resolved primary dataset")
+        if paper_mode == "empirical_dataset" and not paper_checks["has_real_substrate"]:
+            memo_reasons.append(
+                "empirical paper mode requires real numeric or semi-numeric substrate; metadata-only retrieval cannot clear the paper gate"
+            )
+        if paper_mode == "empirical_dataset" and not paper_checks["has_data_access_receipts"]:
+            memo_reasons.append("empirical paper mode requires data_access_report.json, download_manifest.json, and network_attempts.tsv")
+        if paper_mode == "empirical_dataset" and not paper_checks["has_quantitative_result"]:
+            memo_reasons.append("empirical paper mode requires at least one artifact-backed quantitative result produced in the run")
         validation = {
             "status": manuscript_kind,
             "manuscript_kind": manuscript_kind,
@@ -1476,6 +2041,11 @@ Rules:
             "reference_catalog": self._reference_catalog(ledger),
             "missing_note_ids": missing_note_ids,
             "resolution": resolution,
+            "data_access": {
+                "substrate_class": substrate_class or "none",
+                "empirical_ready": empirical_ready,
+                "has_receipts": has_data_access_receipts,
+            },
             "summary": (
                 f"Paper checks passed with {len(approved_results)} artifact-backed result(s)."
                 if manuscript_kind == "paper"
@@ -1495,7 +2065,8 @@ Rules:
     ) -> dict[str, Any]:
         validation_status = str(validation.get("status") or "").strip().lower()
         validation_kind = str(validation.get("manuscript_kind") or "").strip().lower()
-        if validation_status not in {"pass", "paper"} and validation_kind != "paper":
+        manuscript_kind = "memo" if validation_kind == "memo" else "paper"
+        if validation_status not in {"pass", "paper", "memo"} and validation_kind not in {"paper", "memo"}:
             raise PipelineExecutionError(build_validation_error_message(validation), stage="2.5")
         store = self._run_store(run_id)
         store.set_stage(stage="3", agent="paper-writer", model=self._config.openai_writer_model)
@@ -1519,16 +2090,19 @@ Return strict JSON only:
   "references": ["formatted reference string"]
 }
 Rules:
-- Use the research question, experiments, findings, figure summaries, and related work to write a conventional paper.
+- Use the research question, experiments, findings, figure summaries, and related work to write the requested manuscript.
 - The figure summaries are the source of truth for what each figure shows.
 - Use internet access to ground related work and references, but do not invent experiments or results beyond the validated analysis.
+- If the manuscript kind is memo, state clearly that the run did not clear the empirical paper gate and explain the failed acquisition or validation condition.
 - Keep the tone scientific and concrete.
 """
         writer_input = {
+            "manuscript_kind": manuscript_kind,
             "title": request_payload.get("title"),
             "theme": request_payload.get("theme"),
             "research_question": ledger.get("research_question"),
             "dataset": ledger.get("dataset"),
+            "data_access": ledger.get("data_access") or {},
             "experiment_summary": ledger.get("experiment_summary"),
             "experiments": ledger.get("experiments") or [],
             "findings": ledger.get("findings") or [],
@@ -1559,8 +2133,11 @@ Rules:
             ledger=ledger,
             validation=validation,
             sections=sections,
+            manuscript_kind=manuscript_kind,
         )
-        store.complete_stage(stage="3", agent="paper-writer", artifacts=["sections.json", "paper.tex", "paper.pdf"])
+        tex_name = "memo.tex" if manuscript_kind == "memo" else "paper.tex"
+        pdf_name = "memo.pdf" if manuscript_kind == "memo" else "paper.pdf"
+        store.complete_stage(stage="3", agent="paper-writer", artifacts=["sections.json", tex_name, pdf_name])
         return bundle
 
     def render_bundle(
@@ -1571,6 +2148,7 @@ Rules:
         ledger: dict[str, Any],
         validation: dict[str, Any],
         sections: dict[str, Any],
+        manuscript_kind: str,
     ) -> dict[str, Any]:
         run_directory = self.run_directory(run_id)
         written = normalize_manuscript_sections(
@@ -1588,10 +2166,10 @@ Rules:
             title=str(written.get("title") or ledger.get("title") or request_payload.get("title") or "Research paper"),
             sections=written,
             manifest=artifact_manifest,
-            manuscript_kind="paper",
+            manuscript_kind=manuscript_kind,
             reference_catalog=validation.get("reference_catalog") or [],
         )
-        tex_filename = "paper.tex"
+        tex_filename = "memo.tex" if manuscript_kind == "memo" else "paper.tex"
         (run_directory / tex_filename).write_text(latex, encoding="utf-8")
         (run_directory / "references.bib").write_text(references_bib, encoding="utf-8")
         write_json_file(run_directory / "sections.json", written)
@@ -1603,10 +2181,10 @@ Rules:
         if compile_log:
             (run_directory / "compile.log").write_text(compile_log, encoding="utf-8")
         figures = self.bundle_figures_from_ledger(run_id=run_id, ledger=ledger)
-        markdown_preview = results_to_markdown(written, manuscript_kind="paper")
+        markdown_preview = results_to_markdown(written, manuscript_kind=manuscript_kind)
         bundle = {
             "title": str(written.get("title") or request_payload.get("title") or "Research paper"),
-            "manuscript_kind": "paper",
+            "manuscript_kind": manuscript_kind,
             "sections": written,
             "latex": latex,
             "references_bib": references_bib,
@@ -1622,10 +2200,21 @@ Rules:
             "ledger": ledger,
             "validation": validation,
             "artifact_files": ledger.get("artifact_files", []),
+            "provenance": {
+                "research_question": str(ledger.get("research_question") or "").strip(),
+                "dataset_accession_id": str((ledger.get("dataset") or {}).get("accession_id") or "").strip(),
+                "substrate_class": str(((ledger.get("data_access") or {}) if isinstance(ledger.get("data_access"), dict) else {}).get("substrate_class") or "").strip(),
+            },
         }
         write_json_file(run_directory / "bundle.json", {"bundle": bundle, "publication": None})
-        self._run_store(run_id).record_artifact(stage="3", artifact_id="paper-tex", artifact_type="latex", path="paper.tex", description="Compiled manuscript source.")
-        self._run_store(run_id).record_artifact(stage="3", artifact_id="paper-pdf", artifact_type="pdf", path="paper.pdf", description="Compiled manuscript PDF.")
+        self._run_store(run_id).record_artifact(stage="3", artifact_id="manuscript-tex", artifact_type="latex", path=tex_filename, description="Compiled manuscript source.")
+        self._run_store(run_id).record_artifact(
+            stage="3",
+            artifact_id="manuscript-pdf",
+            artifact_type="pdf",
+            path=str(compile_result.get("pdf_path") or ("memo.pdf" if manuscript_kind == "memo" else "paper.pdf")),
+            description="Compiled manuscript PDF.",
+        )
         return bundle
 
     def bundle_figures_from_ledger(self, *, run_id: str, ledger: dict[str, Any]) -> list[dict[str, Any]]:

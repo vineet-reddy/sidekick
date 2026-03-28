@@ -49,6 +49,10 @@ class BootstrapServiceConfig:
     backend_max_job_runtime_seconds: int = 3600
     backend_max_concurrent_jobs_per_install: int = 4
     backend_artifact_ttl_seconds: int = 24 * 60 * 60
+    data_access_max_total_bytes: int = 250 * 1024 * 1024
+    data_access_max_file_bytes: int = 100 * 1024 * 1024
+    data_access_max_files: int = 12
+    data_access_max_seconds: int = 900
     openai_model: str = "gpt-5-nano"
     openai_search_model: str = "gpt-5-mini"
     openai_validation_model: str = "gpt-5-mini"
@@ -123,6 +127,10 @@ class BootstrapServiceConfig:
             backend_max_job_runtime_seconds=_int_env("SIDEKICK_BACKEND_MAX_JOB_RUNTIME_SECONDS", 3600),
             backend_max_concurrent_jobs_per_install=_int_env("SIDEKICK_BACKEND_MAX_CONCURRENT_JOBS_PER_INSTALL", 4),
             backend_artifact_ttl_seconds=_int_env("SIDEKICK_BACKEND_ARTIFACT_TTL_SECONDS", 24 * 60 * 60),
+            data_access_max_total_bytes=_int_env("SIDEKICK_DATA_ACCESS_MAX_TOTAL_BYTES", 250 * 1024 * 1024),
+            data_access_max_file_bytes=_int_env("SIDEKICK_DATA_ACCESS_MAX_FILE_BYTES", 100 * 1024 * 1024),
+            data_access_max_files=_int_env("SIDEKICK_DATA_ACCESS_MAX_FILES", 12),
+            data_access_max_seconds=_int_env("SIDEKICK_DATA_ACCESS_MAX_SECONDS", 900),
             openai_model=legacy_model,
             openai_search_model=os.getenv("SIDEKICK_OPENAI_SEARCH_MODEL", legacy_model).strip() or legacy_model,
             openai_validation_model=os.getenv("SIDEKICK_OPENAI_VALIDATION_MODEL", legacy_model).strip() or legacy_model,

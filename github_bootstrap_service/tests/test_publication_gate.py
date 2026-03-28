@@ -295,6 +295,76 @@ class PublicationGateTests(unittest.TestCase):
             self.assertFalse(validation["paper_checks"]["covers_requested_notes"])
             self.assertEqual(validation["missing_note_ids"], ["note_2"])
 
+    def test_empirical_validation_rejects_metadata_only_acquisition(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            processor = _processor(root)
+            job_id = "job-metadata-only"
+            artifact_root = root / "artifacts" / job_id
+            _write(artifact_root / "tables" / "sample_metadata.tsv", b"gsm\ttime_h\nGSM1982275\t0\n")
+            _write(artifact_root / "data_access_report.json", b"{}")
+            _write(artifact_root / "download_manifest.json", b"{\"entries\": []}")
+            _write(artifact_root / "network_attempts.tsv", b"url\tstatus\nhttps://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE76369\tblocked\n")
+
+            ledger = {
+                "title": "Metadata-only GEO run",
+                "research_question": "Can we recover empirical circadian results from GSE76369?",
+                "methods": _methods_text(),
+                "limitations": ["Numeric GEO substrate was unavailable."],
+                "data_access": {
+                    "substrate_class": "metadata_only",
+                    "empirical_ready": False,
+                },
+                "sources": [
+                    {
+                        "source_id": "source_1",
+                        "label": "GSE76369",
+                        "landing_page_url": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE76369",
+                        "accession_id": "GSE76369",
+                    }
+                ],
+                "artifacts": [
+                    {
+                        "artifact_id": "artifact_1",
+                        "path": "tables/sample_metadata.tsv",
+                        "kind": "table",
+                        "mime_type": "text/tab-separated-values",
+                        "source_ids": ["source_1"],
+                    }
+                ],
+                "results": [
+                    {
+                        "result_id": "result_1",
+                        "text": "A metadata-only sample schedule was reconstructed for the eight GEO samples.",
+                        "artifact_ids": ["artifact_1"],
+                        "note_ids": ["note_1"],
+                    }
+                ],
+            }
+            request_payload = {
+                "title": "Metadata-only GEO run",
+                "theme": "Metadata-only GEO run",
+                "notes": [{"id": "note_1", "title": "Study", "content": "Need real empirical circadian findings."}],
+                "resolution": {
+                    "paper_mode": "empirical_dataset",
+                    "status": "resolved",
+                    "summary": "Selected GSE76369.",
+                    "selected_candidate": {
+                        "dataset_id": "GSE76369",
+                        "access_url": "https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE76369",
+                        "primary_domain": "ncbi.nlm.nih.gov",
+                        "trusted_domains": ["ncbi.nlm.nih.gov"],
+                    },
+                },
+            }
+
+            validation = processor._validate_ledger(job_id, ledger, request_payload=request_payload)
+
+            self.assertEqual(validation["manuscript_kind"], "memo")
+            self.assertFalse(validation["paper_checks"]["has_real_substrate"])
+            self.assertFalse(validation["paper_checks"]["has_quantitative_result"])
+            self.assertIn("metadata-only retrieval", " ".join(validation["memo_reasons"]).lower())
+
     def test_render_latex_includes_sections_figures_tables_and_bibliography(self) -> None:
         sections = {
             "title": "Example manuscript",
