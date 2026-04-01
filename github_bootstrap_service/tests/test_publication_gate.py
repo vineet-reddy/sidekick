@@ -2,12 +2,14 @@ import base64
 import pathlib
 import subprocess
 import sys
+import tarfile
 import tempfile
 import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
+from bootstrap_service import manuscript
 from bootstrap_service.config import BootstrapServiceConfig
 from bootstrap_service.database import SidekickDatabase
 from bootstrap_service.manuscript import compile_pdf, render_latex
@@ -483,6 +485,29 @@ class PublicationGateTests(unittest.TestCase):
 
             self.assertTrue(result["ok"])
             self.assertIn("compiled", result["log"])
+
+    def test_ensure_tectonic_binary_uses_direct_release_asset_url(self) -> None:
+        with tempfile.TemporaryDirectory() as tempdir:
+            root = pathlib.Path(tempdir)
+            cache_dir = root / "_toolcache"
+            captured: dict[str, str] = {}
+
+            def fake_download(url: str, destination: pathlib.Path) -> None:
+                captured["url"] = url
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with tarfile.open(destination, "w:gz") as archive:
+                    binary = root / "tectonic"
+                    binary.write_text("#!/bin/sh\necho tectonic\n", encoding="utf-8")
+                    archive.add(binary, arcname="tectonic")
+
+            with patch("bootstrap_service.manuscript._download_file", side_effect=fake_download):
+                binary_path = manuscript._ensure_tectonic_binary(cache_dir)
+
+            self.assertTrue(binary_path.exists())
+            self.assertIn(
+                "/releases/download/tectonic%400.15.0/tectonic-0.15.0-",
+                captured["url"],
+            )
 
     def test_bundle_figures_use_saved_image_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tempdir:

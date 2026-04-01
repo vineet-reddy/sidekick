@@ -3,15 +3,22 @@ from __future__ import annotations
 import csv
 import math
 import json
+import os
 import platform
 import re
 import shutil
 import subprocess
 import tarfile
 import tempfile
+import time
+import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any
+
+
+TECTONIC_DEFAULT_VERSION = "0.15.0"
 
 
 def normalize_manuscript_sections(raw_sections: dict[str, Any], *, title_fallback: str) -> dict[str, Any]:
@@ -652,24 +659,15 @@ def _ensure_tectonic_binary(cache_directory: Path) -> Path:
     if binary_path.exists():
         return binary_path
 
-    release = _tectonic_latest_release()
-    asset_name = _tectonic_asset_name(str(release.get("tag_name") or "").strip())
-    asset_url = next(
-        (
-            str(asset.get("browser_download_url") or "").strip()
-            for asset in release.get("assets", [])
-            if str(asset.get("name") or "").strip() == asset_name
-        ),
-        "",
-    )
-    if not asset_url:
-        raise RuntimeError(f"Tectonic asset {asset_name} was not found in the latest release.")
+    version = (os.getenv("SIDEKICK_TECTONIC_VERSION", "").strip() or TECTONIC_DEFAULT_VERSION).removeprefix("tectonic@").strip()
+    asset_name = _tectonic_asset_name(version)
+    asset_url = _tectonic_asset_url(version, asset_name)
 
     archive_path = cache_directory / asset_name
-    urllib.request.urlretrieve(asset_url, archive_path)
+    _download_file(asset_url, archive_path)
     with tarfile.open(archive_path, "r:gz") as archive:
         with tempfile.TemporaryDirectory() as tempdir:
-            archive.extractall(tempdir)
+            _safe_extract_tar(archive, Path(tempdir))
             extracted = Path(tempdir)
             candidate = next(extracted.rglob(binary_name), None)
             if candidate is None:
@@ -680,8 +678,8 @@ def _ensure_tectonic_binary(cache_directory: Path) -> Path:
     return binary_path
 
 
-def _tectonic_asset_name(tag_name: str) -> str:
-    version = tag_name.removeprefix("tectonic@").strip() or tag_name.strip()
+def _tectonic_asset_name(version: str) -> str:
+    version = version.removeprefix("tectonic@").strip() or version.strip()
     if not version:
         raise RuntimeError("Unable to determine the latest Tectonic release version.")
     system_name = platform.system().lower()
@@ -697,10 +695,48 @@ def _tectonic_asset_name(tag_name: str) -> str:
     raise RuntimeError(f"Tectonic auto-install is not supported on {platform.system()} {platform.machine()}.")
 
 
-def _tectonic_latest_release() -> dict[str, Any]:
-    request = urllib.request.Request(
-        "https://api.github.com/repos/tectonic-typesetting/tectonic/releases/latest",
-        headers={"Accept": "application/vnd.github+json", "User-Agent": "sidekick-backend"},
-    )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        return json.loads(response.read().decode("utf-8"))
+def _tectonic_asset_url(version: str, asset_name: str) -> str:
+    encoded_tag = urllib.parse.quote(f"tectonic@{version}", safe="")
+    return f"https://github.com/tectonic-typesetting/tectonic/releases/download/{encoded_tag}/{asset_name}"
+
+
+def _download_file(url: str, destination: Path) -> None:
+    headers = {"User-Agent": "sidekick-backend"}
+    github_token = os.getenv("GH_TOKEN", "").strip() or os.getenv("GITHUB_TOKEN", "").strip()
+    if github_token and "github.com/" in url:
+        headers["Authorization"] = f"Bearer {github_token}"
+    request = urllib.request.Request(url, headers=headers)
+    last_error: Exception | None = None
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, 4):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response, destination.open("wb") as handle:
+                shutil.copyfileobj(response, handle)
+            return
+        except urllib.error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            if error.code in {403, 429} and attempt < 3:
+                time.sleep(2 * attempt)
+                last_error = RuntimeError(f"HTTP {error.code}: {detail or 'rate limited'}")
+                continue
+            raise RuntimeError(f"Failed to download {url}: HTTP {error.code}: {detail}") from error
+        except urllib.error.URLError as error:
+            if attempt < 3:
+                time.sleep(2 * attempt)
+                last_error = error
+                continue
+            raise RuntimeError(f"Failed to download {url}: {error.reason}") from error
+    if last_error is not None:
+        raise RuntimeError(f"Failed to download {url}: {last_error}")
+
+
+def _safe_extract_tar(archive: tarfile.TarFile, destination: Path) -> None:
+    destination = destination.resolve()
+    for member in archive.getmembers():
+        member_path = (destination / member.name).resolve()
+        if os.path.commonpath([str(destination), str(member_path)]) != str(destination):
+            raise RuntimeError(f"Refusing to extract archive member outside destination: {member.name}")
+    extract_kwargs: dict[str, Any] = {}
+    if "filter" in tarfile.TarFile.extractall.__code__.co_varnames:
+        extract_kwargs["filter"] = "data"
+    archive.extractall(destination, **extract_kwargs)
