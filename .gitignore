@@ -24,6 +24,7 @@ build/
 # Local runtime tooling state
 /.sidekick-runtime/
 /.tmp-sidekick-tests/
+/agent_memory/
 /relevantcode.md
 /paperlab/runs/*
 !/paperlab/runs/.gitkeep
