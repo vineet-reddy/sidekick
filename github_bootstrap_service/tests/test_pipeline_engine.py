@@ -9,7 +9,13 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from bootstrap_service.config import BootstrapServiceConfig
 from bootstrap_service.openai_client import OpenAIContainerFile, OpenAIResponseResult, OpenAIUsage
-from bootstrap_service.pipeline_engine import PaperPipelineEngine, PipelineExecutionError, extract_json_object
+from bootstrap_service.pipeline_engine import (
+    PaperPipelineEngine,
+    PipelineExecutionError,
+    _extract_geo_timepoint_hours,
+    _looks_like_named_gene,
+    extract_json_object,
+)
 
 
 def _config(root: pathlib.Path) -> BootstrapServiceConfig:
@@ -284,6 +290,17 @@ class FakeResolver:
 
 
 class PipelineEngineTests(unittest.TestCase):
+    def test_extract_geo_timepoint_hours_uses_characteristics_and_titles(self) -> None:
+        self.assertEqual(_extract_geo_timepoint_hours("time point: 8 hr"), "8")
+        self.assertEqual(_extract_geo_timepoint_hours("", "MCF10A_12hour"), "12")
+        self.assertEqual(_extract_geo_timepoint_hours("", "", "MCF-10A_24 hr time point"), "24")
+
+    def test_looks_like_named_gene_rejects_numeric_leading_symbols(self) -> None:
+        self.assertFalse(_looks_like_named_gene("15E1.2"))
+        self.assertFalse(_looks_like_named_gene("7A5"))
+        self.assertTrue(_looks_like_named_gene("CH25H"))
+        self.assertTrue(_looks_like_named_gene("C1orf43"))
+
     def test_extract_json_object_repairs_unescaped_latex_inside_strings(self) -> None:
         raw = (
             '{"title":"Example","results":"\\\\subsection*{Heading}"}'

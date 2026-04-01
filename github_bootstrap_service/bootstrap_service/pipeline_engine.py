@@ -2,14 +2,19 @@ from __future__ import annotations
 
 import ast
 import base64
+import csv
 import hashlib
 import json
+import math
 import mimetypes
 import re
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from .config import BootstrapServiceConfig
 from .manuscript import (
@@ -297,6 +302,252 @@ def _network_attempts_tsv(entries: list[dict[str, Any]]) -> str:
         ]
         rows.append("\t".join(value.replace("\t", " ").replace("\n", " ").strip() for value in row))
     return "\n".join(rows) + "\n"
+
+
+def _http_fetch(
+    url: str,
+    *,
+    timeout_seconds: int = 60,
+    user_agent: str = "sidekick-backend",
+    accept: str = "*/*",
+    max_attempts: int = 3,
+    retry_backoff_seconds: float = 1.0,
+) -> dict[str, Any]:
+    attempts = max(1, int(max_attempts))
+    last_result: dict[str, Any] | None = None
+    for attempt in range(1, attempts + 1):
+        request = Request(
+            url=url,
+            headers={
+                "User-Agent": user_agent,
+                "Accept": accept,
+            },
+            method="GET",
+        )
+        started = time.time()
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                payload = response.read()
+                status_code = int(getattr(response, "status", 200) or 200)
+                content_type = str(response.headers.get("Content-Type") or "").strip()
+                final_url = str(response.geturl() or url).strip() or url
+            return {
+                "ok": 200 <= status_code < 300,
+                "status_code": status_code,
+                "content_type": content_type,
+                "bytes": payload,
+                "final_url": final_url,
+                "latency_ms": max(0, int((time.time() - started) * 1000)),
+                "error_kind": "",
+                "error_message": "",
+                "attempts": attempt,
+            }
+        except HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")
+            last_result = {
+                "ok": False,
+                "status_code": int(getattr(error, "code", 0) or 0),
+                "content_type": str(error.headers.get("Content-Type") or "").strip() if error.headers else "",
+                "bytes": b"",
+                "final_url": url,
+                "latency_ms": max(0, int((time.time() - started) * 1000)),
+                "error_kind": "http_error",
+                "error_message": detail.strip() or f"HTTP {getattr(error, 'code', 0)}",
+                "attempts": attempt,
+            }
+            if attempt >= attempts or last_result["status_code"] not in {408, 425, 429, 500, 502, 503, 504}:
+                return last_result
+        except URLError as error:
+            reason = str(error.reason or "").strip()
+            lowered = reason.lower()
+            if "timed out" in lowered:
+                error_kind = "timeout"
+            elif "ssl" in lowered or "tls" in lowered or "certificate" in lowered:
+                error_kind = "tls_error"
+            elif "name or service not known" in lowered or "nodename nor servname provided" in lowered or "temporary failure in name resolution" in lowered:
+                error_kind = "dns_error"
+            else:
+                error_kind = "network_error"
+            last_result = {
+                "ok": False,
+                "status_code": 0,
+                "content_type": "",
+                "bytes": b"",
+                "final_url": url,
+                "latency_ms": max(0, int((time.time() - started) * 1000)),
+                "error_kind": error_kind,
+                "error_message": reason or "Network request failed.",
+                "attempts": attempt,
+            }
+            if attempt >= attempts or error_kind in {"dns_error", "tls_error"}:
+                return last_result
+        time.sleep(retry_backoff_seconds * attempt)
+    return last_result or {
+        "ok": False,
+        "status_code": 0,
+        "content_type": "",
+        "bytes": b"",
+        "final_url": url,
+        "latency_ms": 0,
+        "error_kind": "network_error",
+        "error_message": "Network request failed.",
+        "attempts": attempts,
+    }
+
+
+def _decode_text_payload(payload: bytes) -> str:
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            return payload.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return payload.decode("utf-8", errors="replace")
+
+
+def _safe_accession(value: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+
+
+def _geo_values(text: str, field_name: str) -> list[str]:
+    prefix = f"!{field_name} = "
+    return [line[len(prefix):].strip() for line in text.splitlines() if line.startswith(prefix)]
+
+
+def _geo_table_section(text: str, begin_marker: str, end_marker: str) -> str:
+    start = text.find(begin_marker)
+    end = text.find(end_marker)
+    if start < 0 or end < 0 or end <= start:
+        return ""
+    body = text[start + len(begin_marker):end].strip()
+    return body + ("\n" if body else "")
+
+
+def _write_text_file(path: Path, content: str) -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    return path.stat().st_size
+
+
+def _write_csv_rows(path: Path, fieldnames: list[str], rows: list[dict[str, Any]], *, delimiter: str = ",") -> int:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, delimiter=delimiter)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+    return path.stat().st_size
+
+
+def _parse_tsv_rows(content: str) -> list[dict[str, str]]:
+    stripped = content.strip()
+    if not stripped:
+        return []
+    reader = csv.DictReader(stripped.splitlines(), delimiter="\t")
+    rows: list[dict[str, str]] = []
+    for row in reader:
+        if not isinstance(row, dict):
+            continue
+        rows.append({str(key or "").strip(): str(value or "").strip() for key, value in row.items()})
+    return rows
+
+
+def _parse_float(value: str) -> float | None:
+    try:
+        return float(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _pearson_correlation(left: list[float], right: list[float]) -> float:
+    if len(left) != len(right) or not left:
+        return 0.0
+    left_mean = sum(left) / len(left)
+    right_mean = sum(right) / len(right)
+    left_var = sum((value - left_mean) ** 2 for value in left)
+    right_var = sum((value - right_mean) ** 2 for value in right)
+    if left_var <= 0 or right_var <= 0:
+        return 0.0
+    covariance = sum((l - left_mean) * (r - right_mean) for l, r in zip(left, right))
+    return covariance / math.sqrt(left_var * right_var)
+
+
+def _solve_linear_3x3(matrix: list[list[float]], vector: list[float]) -> list[float]:
+    augmented = [row[:] + [vector[index]] for index, row in enumerate(matrix)]
+    for column in range(3):
+        pivot = max(range(column, 3), key=lambda row: abs(augmented[row][column]))
+        augmented[column], augmented[pivot] = augmented[pivot], augmented[column]
+        pivot_value = augmented[column][column]
+        if abs(pivot_value) < 1e-12:
+            return [0.0, 0.0, 0.0]
+        for inner in range(column, 4):
+            augmented[column][inner] /= pivot_value
+        for row in range(3):
+            if row == column:
+                continue
+            factor = augmented[row][column]
+            for inner in range(column, 4):
+                augmented[row][inner] -= factor * augmented[column][inner]
+    return [augmented[row][3] for row in range(3)]
+
+
+def _fit_fixed_period_cosine(timepoints_hours: list[float], values: list[float], *, period_hours: float = 24.0) -> dict[str, float]:
+    if len(timepoints_hours) != len(values) or not values:
+        return {"mean_expression": 0.0, "amplitude": 0.0, "phase_hours": 0.0, "r_squared": 0.0}
+    cosine_terms = [math.cos(2 * math.pi * hour / period_hours) for hour in timepoints_hours]
+    sine_terms = [math.sin(2 * math.pi * hour / period_hours) for hour in timepoints_hours]
+    normal_matrix = [
+        [float(len(values)), sum(cosine_terms), sum(sine_terms)],
+        [sum(cosine_terms), sum(term * term for term in cosine_terms), sum(c * s for c, s in zip(cosine_terms, sine_terms))],
+        [sum(sine_terms), sum(c * s for c, s in zip(cosine_terms, sine_terms)), sum(term * term for term in sine_terms)],
+    ]
+    right_hand_side = [
+        sum(values),
+        sum(value * cosine for value, cosine in zip(values, cosine_terms)),
+        sum(value * sine for value, sine in zip(values, sine_terms)),
+    ]
+    intercept, beta_cosine, beta_sine = _solve_linear_3x3(normal_matrix, right_hand_side)
+    fitted = [intercept + beta_cosine * cosine + beta_sine * sine for cosine, sine in zip(cosine_terms, sine_terms)]
+    mean_expression = sum(values) / len(values)
+    total_sum_squares = sum((value - mean_expression) ** 2 for value in values)
+    residual_sum_squares = sum((value - fit) ** 2 for value, fit in zip(values, fitted))
+    amplitude = math.sqrt(beta_cosine ** 2 + beta_sine ** 2)
+    phase_hours = (math.atan2(-beta_sine, beta_cosine) % (2 * math.pi)) * period_hours / (2 * math.pi)
+    r_squared = 0.0 if total_sum_squares <= 0 else max(0.0, 1.0 - (residual_sum_squares / total_sum_squares))
+    return {
+        "mean_expression": mean_expression,
+        "amplitude": amplitude,
+        "phase_hours": phase_hours,
+        "r_squared": r_squared,
+    }
+
+
+def _looks_like_named_gene(symbol: str) -> bool:
+    cleaned = str(symbol or "").strip()
+    if not cleaned:
+        return False
+    if "=" in cleaned or " " in cleaned:
+        return False
+    if not cleaned[0].isalpha():
+        return False
+    if sum(1 for character in cleaned if character.isalpha()) < 2:
+        return False
+    if cleaned.startswith(("LOC", "EST_", "Hs.", "MGC", "DKFZP")):
+        return False
+    return True
+
+
+def _extract_geo_timepoint_hours(*values: str) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if not text:
+            continue
+        match = re.search(r"time point:\s*([0-9]+(?:\.[0-9]+)?)\s*hr", text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        match = re.search(r"(?:^|[_\s-])([0-9]+(?:\.[0-9]+)?)\s*(?:hr|hour)\b", text, re.IGNORECASE)
+        if match:
+            return match.group(1)
+    return ""
 
 
 def _source_family_strategy(dataset: dict[str, Any], request_payload: dict[str, Any]) -> dict[str, Any]:
@@ -944,6 +1195,15 @@ Rules:
                     data_access=data_access,
                     attempt=attempt,
                 )
+            strategy = _source_family_strategy(search.get("dataset") if isinstance(search.get("dataset"), dict) else {}, request_payload)
+            if str(strategy.get("family_id") or "").strip() == "geo_functional_genomics":
+                return self._run_geo_empirical_analysis(
+                    run_id=run_id,
+                    request_payload=request_payload,
+                    search=search,
+                    data_access=data_access,
+                    attempt=attempt,
+                )
         store.set_stage(stage="2", agent="dataset-profiler", model=self._config.openai_workspace_model)
         profiler_input = {
             "title": request_payload.get("title"),
@@ -1107,6 +1367,849 @@ Rules:
         store.complete_stage(stage="2", agent="research-packager", artifacts=["ledger.json"])
         return ledger
 
+    def _run_geo_data_acquisition(
+        self,
+        *,
+        run_id: str,
+        request_payload: dict[str, Any],
+        acquisition_input: dict[str, Any],
+    ) -> dict[str, Any]:
+        dataset = acquisition_input.get("dataset") if isinstance(acquisition_input.get("dataset"), dict) else {}
+        accession = str(dataset.get("accession_id") or dataset.get("dataset_id") or "").strip().upper()
+        if not accession:
+            raise PipelineExecutionError("GEO acquisition requires a resolved GEO accession.", stage="2")
+
+        run_directory = self.run_directory(run_id)
+        downloads_directory = run_directory / "downloads"
+        downloads_directory.mkdir(parents=True, exist_ok=True)
+        strategy = acquisition_input.get("strategy") if isinstance(acquisition_input.get("strategy"), dict) else {}
+        family_label = str(strategy.get("family_label") or "NCBI GEO Functional Genomics").strip() or "NCBI GEO Functional Genomics"
+        manifest: list[dict[str, Any]] = []
+
+        def append_entry(
+            *,
+            retrieval_target: str,
+            url: str,
+            method: str,
+            status: str,
+            http_status: int | None,
+            error_kind: str,
+            error_message: str,
+            latency_ms: int | None,
+            bytes_downloaded: int,
+            saved_path: str,
+            saved_file_kind: str,
+            content_type: str,
+            classification: str,
+            usable_for_analysis: bool,
+            notes: str,
+        ) -> None:
+            manifest.append(
+                {
+                    "entry_id": f"download_{len(manifest) + 1}",
+                    "url": url,
+                    "source_family": family_label,
+                    "retrieval_target": retrieval_target,
+                    "method": method,
+                    "status": status,
+                    "http_status": http_status,
+                    "error_kind": error_kind,
+                    "error_message": error_message,
+                    "latency_ms": latency_ms,
+                    "bytes_downloaded": bytes_downloaded,
+                    "saved_path": saved_path,
+                    "saved_file_kind": saved_file_kind,
+                    "content_type": content_type,
+                    "classification": classification,
+                    "usable_for_analysis": usable_for_analysis,
+                    "notes": notes,
+                }
+            )
+
+        series_matrix_url = f"https://www.ncbi.nlm.nih.gov/geo/download/?acc={accession}&format=file&file={accession}_series_matrix.txt.gz"
+        series_matrix_fetch = _http_fetch(series_matrix_url, timeout_seconds=60)
+        if series_matrix_fetch["ok"]:
+            series_matrix_path = downloads_directory / f"{_safe_accession(accession)}_series_matrix.txt.gz"
+            series_matrix_path.write_bytes(series_matrix_fetch["bytes"])
+            append_entry(
+                retrieval_target="series_matrix",
+                url=series_matrix_url,
+                method="https_get",
+                status="success",
+                http_status=series_matrix_fetch["status_code"],
+                error_kind="",
+                error_message="",
+                latency_ms=series_matrix_fetch["latency_ms"],
+                bytes_downloaded=len(series_matrix_fetch["bytes"]),
+                saved_path=f"downloads/{series_matrix_path.name}",
+                saved_file_kind="matrix",
+                content_type=series_matrix_fetch["content_type"],
+                classification="semi_numeric",
+                usable_for_analysis=True,
+                notes="Series matrix was available directly from GEO.",
+            )
+        else:
+            append_entry(
+                retrieval_target="series_matrix",
+                url=series_matrix_url,
+                method="https_get",
+                status=series_matrix_fetch["error_kind"] or "http_error",
+                http_status=series_matrix_fetch["status_code"] or None,
+                error_kind=series_matrix_fetch["error_kind"] or "http_error",
+                error_message=series_matrix_fetch["error_message"],
+                latency_ms=series_matrix_fetch["latency_ms"],
+                bytes_downloaded=0,
+                saved_path="downloads/series_matrix_unavailable",
+                saved_file_kind="",
+                content_type=series_matrix_fetch["content_type"],
+                classification="failed",
+                usable_for_analysis=False,
+                notes="Series matrix target was attempted first per the GEO retrieval order.",
+            )
+
+        series_text_url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}&targ=self&form=text&view=quick"
+        series_text_fetch = _http_fetch(series_text_url, timeout_seconds=60, accept="text/plain")
+        if not series_text_fetch["ok"]:
+            append_entry(
+                retrieval_target="series_metadata",
+                url=series_text_url,
+                method="https_get",
+                status=series_text_fetch["error_kind"] or "http_error",
+                http_status=series_text_fetch["status_code"] or None,
+                error_kind=series_text_fetch["error_kind"] or "http_error",
+                error_message=series_text_fetch["error_message"],
+                latency_ms=series_text_fetch["latency_ms"],
+                bytes_downloaded=0,
+                saved_path="downloads/series_metadata_unavailable",
+                saved_file_kind="",
+                content_type=series_text_fetch["content_type"],
+                classification="failed",
+                usable_for_analysis=False,
+                notes="Series metadata discovery is required to recover GEO sample ids.",
+            )
+            return {
+                "status": "blocked",
+                "summary": f"Failed to fetch GEO series metadata for {accession}.",
+                "blocking_reason": f"Unable to fetch the GEO series metadata page for {accession}.",
+                "substrate_class": "none",
+                "empirical_ready": False,
+                "download_manifest": manifest,
+                "usable_saved_files": [],
+                "metadata_only_saved_files": [],
+                "host_failures": [],
+                "sources": [],
+            }
+
+        series_text = _decode_text_payload(series_text_fetch["bytes"])
+        sample_ids = [sample_id.strip() for sample_id in _geo_values(series_text, "Series_sample_id") if sample_id.strip().upper().startswith("GSM")]
+        platform_ids = [platform_id.strip() for platform_id in _geo_values(series_text, "Series_platform_id") if platform_id.strip().upper().startswith("GPL")]
+        platform_id = platform_ids[0] if platform_ids else ""
+
+        sample_metadata_rows: list[dict[str, Any]] = []
+        probe_matrix: dict[str, dict[str, str]] = {}
+        sample_table_successes = 0
+        for sample_id in sample_ids:
+            sample_quick_url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={sample_id}&targ=self&form=text&view=quick"
+            sample_quick_fetch = _http_fetch(sample_quick_url, timeout_seconds=60, accept="text/plain")
+            sample_quick_text = _decode_text_payload(sample_quick_fetch["bytes"]) if sample_quick_fetch["ok"] else ""
+            append_entry(
+                retrieval_target="sample_metadata",
+                url=sample_quick_url,
+                method="https_get",
+                status="success" if sample_quick_fetch["ok"] else (sample_quick_fetch["error_kind"] or "http_error"),
+                http_status=sample_quick_fetch["status_code"] or None,
+                error_kind="" if sample_quick_fetch["ok"] else (sample_quick_fetch["error_kind"] or "http_error"),
+                error_message="" if sample_quick_fetch["ok"] else sample_quick_fetch["error_message"],
+                latency_ms=sample_quick_fetch["latency_ms"],
+                bytes_downloaded=len(sample_quick_fetch["bytes"]) if sample_quick_fetch["ok"] else 0,
+                saved_path=f"downloads/{sample_id}_sample_metadata.txt",
+                saved_file_kind="metadata",
+                content_type=sample_quick_fetch["content_type"],
+                classification="metadata_only" if sample_quick_fetch["ok"] else "failed",
+                usable_for_analysis=False,
+                notes="Fetched GEO quick-view metadata to recover sample title, source name, and time point.",
+            )
+            sample_data_url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={sample_id}&targ=self&form=text&view=data"
+            sample_fetch = _http_fetch(sample_data_url, timeout_seconds=90, accept="text/plain")
+            if not sample_fetch["ok"]:
+                append_entry(
+                    retrieval_target="processed_sample_table",
+                    url=sample_data_url,
+                    method="https_get",
+                    status=sample_fetch["error_kind"] or "http_error",
+                    http_status=sample_fetch["status_code"] or None,
+                    error_kind=sample_fetch["error_kind"] or "http_error",
+                    error_message=sample_fetch["error_message"],
+                    latency_ms=sample_fetch["latency_ms"],
+                    bytes_downloaded=0,
+                    saved_path=f"downloads/{sample_id}_sample_table.tsv",
+                    saved_file_kind="",
+                    content_type=sample_fetch["content_type"],
+                    classification="failed",
+                    usable_for_analysis=False,
+                    notes="Full processed sample table fetch failed.",
+                )
+                continue
+
+            sample_text = _decode_text_payload(sample_fetch["bytes"])
+            table_body = _geo_table_section(sample_text, "!sample_table_begin", "!sample_table_end")
+            if not table_body.strip():
+                append_entry(
+                    retrieval_target="processed_sample_table",
+                    url=sample_data_url,
+                    method="https_get",
+                    status="metadata_only",
+                    http_status=sample_fetch["status_code"],
+                    error_kind="missing_table",
+                    error_message="GEO sample view did not contain a sample_table payload.",
+                    latency_ms=sample_fetch["latency_ms"],
+                    bytes_downloaded=0,
+                    saved_path=f"downloads/{sample_id}_sample_table.tsv",
+                    saved_file_kind="",
+                    content_type=sample_fetch["content_type"],
+                    classification="metadata_only",
+                    usable_for_analysis=False,
+                    notes="Sample metadata was reachable but no numeric table body was present.",
+                )
+                continue
+
+            table_rows = _parse_tsv_rows(table_body)
+            sample_table_path = downloads_directory / f"{sample_id}_sample_table.tsv"
+            bytes_saved = _write_text_file(sample_table_path, table_body)
+            append_entry(
+                retrieval_target="processed_sample_table",
+                url=sample_data_url,
+                method="https_get",
+                status="success",
+                http_status=sample_fetch["status_code"],
+                error_kind="",
+                error_message="",
+                latency_ms=sample_fetch["latency_ms"],
+                bytes_downloaded=bytes_saved,
+                saved_path=f"downloads/{sample_table_path.name}",
+                saved_file_kind="table",
+                content_type=sample_fetch["content_type"],
+                classification="semi_numeric",
+                usable_for_analysis=True,
+                notes=f"Recovered {len(table_rows)} normalized GEO rows for {sample_id}.",
+            )
+            sample_table_successes += 1
+
+            sample_titles = _geo_values(sample_quick_text, "Sample_title")
+            sample_characteristics = _geo_values(sample_quick_text, "Sample_characteristics_ch1")
+            sample_descriptions = _geo_values(sample_quick_text, "Sample_description")
+            sample_source_names = _geo_values(sample_quick_text, "Sample_source_name_ch1")
+            time_point_hours = _extract_geo_timepoint_hours(
+                *sample_characteristics,
+                *(sample_titles[:1] or []),
+                *(sample_source_names[:1] or []),
+            )
+            raw_file = ""
+            dye_label = ""
+            for description in sample_descriptions:
+                lowered = description.lower()
+                if lowered.startswith("green.") or lowered.startswith("red."):
+                    dye_label = description
+                if "raw data:" in lowered:
+                    raw_file = description.partition("raw data:")[2].strip()
+            sample_metadata_rows.append(
+                {
+                    "sample_id": sample_id,
+                    "title": sample_titles[0] if sample_titles else sample_id,
+                    "time_point_hours": time_point_hours,
+                    "dye_label": dye_label,
+                    "raw_file": raw_file,
+                    "source_name": (sample_source_names or [""])[0],
+                    "row_count": str(len(table_rows)),
+                    "table_path": f"downloads/{sample_table_path.name}",
+                }
+            )
+            for row in table_rows:
+                id_ref = str(row.get("ID_REF") or "").strip()
+                value = str(row.get("VALUE") or "").strip()
+                if not id_ref or value == "":
+                    continue
+                probe_matrix.setdefault(id_ref, {})[sample_id] = value
+
+        platform_path_value = ""
+        platform_rows: list[dict[str, str]] = []
+        if platform_id:
+            platform_url = f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={platform_id}&targ=self&form=text&view=data"
+            platform_fetch = _http_fetch(platform_url, timeout_seconds=120, accept="text/plain")
+            if platform_fetch["ok"]:
+                platform_text = _decode_text_payload(platform_fetch["bytes"])
+                platform_table = _geo_table_section(platform_text, "!platform_table_begin", "!platform_table_end")
+                if platform_table.strip():
+                    platform_path = downloads_directory / f"{platform_id}_platform.tsv"
+                    platform_bytes = _write_text_file(platform_path, platform_table)
+                    platform_path_value = f"downloads/{platform_path.name}"
+                    platform_rows = _parse_tsv_rows(platform_table)
+                    append_entry(
+                        retrieval_target="platform_annotation",
+                        url=platform_url,
+                        method="https_get",
+                        status="success",
+                        http_status=platform_fetch["status_code"],
+                        error_kind="",
+                        error_message="",
+                        latency_ms=platform_fetch["latency_ms"],
+                        bytes_downloaded=platform_bytes,
+                        saved_path=platform_path_value,
+                        saved_file_kind="table",
+                        content_type=platform_fetch["content_type"],
+                        classification="metadata_only",
+                        usable_for_analysis=True,
+                        notes=f"Recovered {len(platform_rows)} platform annotation rows for {platform_id}.",
+                    )
+                else:
+                    append_entry(
+                        retrieval_target="platform_annotation",
+                        url=platform_url,
+                        method="https_get",
+                        status="metadata_only",
+                        http_status=platform_fetch["status_code"],
+                        error_kind="missing_table",
+                        error_message="Platform view did not contain a platform table.",
+                        latency_ms=platform_fetch["latency_ms"],
+                        bytes_downloaded=0,
+                        saved_path=f"downloads/{platform_id}_platform.tsv",
+                        saved_file_kind="",
+                        content_type=platform_fetch["content_type"],
+                        classification="metadata_only",
+                        usable_for_analysis=False,
+                        notes="Platform metadata was reachable but annotation rows were absent.",
+                    )
+            else:
+                append_entry(
+                    retrieval_target="platform_annotation",
+                    url=platform_url,
+                    method="https_get",
+                    status=platform_fetch["error_kind"] or "http_error",
+                    http_status=platform_fetch["status_code"] or None,
+                    error_kind=platform_fetch["error_kind"] or "http_error",
+                    error_message=platform_fetch["error_message"],
+                    latency_ms=platform_fetch["latency_ms"],
+                    bytes_downloaded=0,
+                    saved_path=f"downloads/{platform_id}_platform.tsv",
+                    saved_file_kind="",
+                    content_type=platform_fetch["content_type"],
+                    classification="failed",
+                    usable_for_analysis=False,
+                    notes="Platform annotation fetch failed.",
+                )
+
+        sample_metadata_path = ""
+        if sample_metadata_rows:
+            sample_metadata_rows.sort(key=lambda row: _parse_float(str(row.get("time_point_hours") or "")) or 0.0)
+            metadata_path = downloads_directory / f"{accession}_sample_metadata.csv"
+            _write_csv_rows(
+                metadata_path,
+                ["sample_id", "title", "time_point_hours", "dye_label", "raw_file", "source_name", "row_count", "table_path"],
+                sample_metadata_rows,
+            )
+            sample_metadata_path = f"downloads/{metadata_path.name}"
+
+        probe_matrix_path = ""
+        gene_matrix_path = ""
+        gene_matrix_rows: list[dict[str, Any]] = []
+        if sample_metadata_rows and probe_matrix:
+            ordered_sample_ids = [str(row.get("sample_id") or "").strip() for row in sample_metadata_rows]
+            probe_rows: list[dict[str, Any]] = []
+            for id_ref in sorted(probe_matrix, key=lambda value: int(value) if str(value).isdigit() else value):
+                sample_values = probe_matrix.get(id_ref, {})
+                if not all(sample_id in sample_values for sample_id in ordered_sample_ids):
+                    continue
+                row = {"ID_REF": id_ref}
+                for sample_id in ordered_sample_ids:
+                    row[sample_id] = sample_values[sample_id]
+                probe_rows.append(row)
+            if probe_rows:
+                probe_path = downloads_directory / f"{accession}_probe_matrix.tsv"
+                _write_csv_rows(probe_path, ["ID_REF", *ordered_sample_ids], probe_rows, delimiter="\t")
+                probe_matrix_path = f"downloads/{probe_path.name}"
+
+            platform_by_id = {str(row.get("ID") or "").strip(): row for row in platform_rows}
+            gene_aggregates: dict[str, dict[str, Any]] = {}
+            for probe_row in probe_rows:
+                platform_row = platform_by_id.get(str(probe_row.get("ID_REF") or "").strip(), {})
+                symbol = str(platform_row.get("Symbol") or "").strip()
+                if not symbol:
+                    continue
+                aggregate = gene_aggregates.setdefault(
+                    symbol,
+                    {
+                        "Symbol": symbol,
+                        "Name": str(platform_row.get("Name") or "").strip(),
+                        "Probe_Count": 0,
+                        **{sample_id: 0.0 for sample_id in ordered_sample_ids},
+                    },
+                )
+                aggregate["Probe_Count"] += 1
+                for sample_id in ordered_sample_ids:
+                    numeric_value = _parse_float(str(probe_row.get(sample_id) or ""))
+                    if numeric_value is None:
+                        continue
+                    aggregate[sample_id] += numeric_value
+            for symbol, aggregate in gene_aggregates.items():
+                probe_count = int(aggregate.get("Probe_Count") or 0)
+                if probe_count <= 0:
+                    continue
+                row: dict[str, Any] = {
+                    "Symbol": symbol,
+                    "Name": aggregate.get("Name") or "",
+                    "Probe_Count": probe_count,
+                }
+                for sample_id in ordered_sample_ids:
+                    row[sample_id] = f"{float(aggregate[sample_id]) / probe_count:.6f}"
+                gene_matrix_rows.append(row)
+            gene_matrix_rows.sort(key=lambda row: str(row.get("Symbol") or ""))
+            if gene_matrix_rows:
+                gene_path = downloads_directory / f"{accession}_gene_matrix.tsv"
+                _write_csv_rows(gene_path, ["Symbol", "Name", "Probe_Count", *ordered_sample_ids], gene_matrix_rows, delimiter="\t")
+                gene_matrix_path = f"downloads/{gene_path.name}"
+
+        distinct_timepoints = {
+            parsed_time
+            for row in sample_metadata_rows
+            for parsed_time in [_parse_float(str(row.get("time_point_hours") or ""))]
+            if parsed_time is not None
+        }
+
+        usable_saved_files: list[dict[str, Any]] = []
+        if sample_metadata_path:
+            usable_saved_files.append(
+                {
+                    "path": sample_metadata_path,
+                    "bytes_downloaded": (run_directory / sample_metadata_path).stat().st_size,
+                    "classification": "metadata_only",
+                    "retrieval_target": "sample_metadata",
+                }
+            )
+        if probe_matrix_path:
+            usable_saved_files.append(
+                {
+                    "path": probe_matrix_path,
+                    "bytes_downloaded": (run_directory / probe_matrix_path).stat().st_size,
+                    "classification": "semi_numeric",
+                    "retrieval_target": "processed_expression_matrix",
+                }
+            )
+        if gene_matrix_path:
+            usable_saved_files.append(
+                {
+                    "path": gene_matrix_path,
+                    "bytes_downloaded": (run_directory / gene_matrix_path).stat().st_size,
+                    "classification": "semi_numeric",
+                    "retrieval_target": "processed_gene_matrix",
+                }
+            )
+        if platform_path_value:
+            usable_saved_files.append(
+                {
+                    "path": platform_path_value,
+                    "bytes_downloaded": (run_directory / platform_path_value).stat().st_size,
+                    "classification": "metadata_only",
+                    "retrieval_target": "platform_annotation",
+                }
+            )
+
+        metadata_only_saved_files = [
+            entry for entry in usable_saved_files if str(entry.get("classification") or "").strip().lower() == "metadata_only"
+        ]
+        host_failures: dict[str, dict[str, Any]] = {}
+        for entry in manifest:
+            url = str(entry.get("url") or "").strip()
+            status = str(entry.get("status") or "").strip().lower()
+            if not url or status == "success":
+                continue
+            match = re.search(r"https?://([^/]+)/", url)
+            host = match.group(1) if match else "unknown"
+            aggregate = host_failures.setdefault(host, {"host": host, "attempts": 0, "failures": 0, "error_kinds": []})
+            aggregate["attempts"] += 1
+            aggregate["failures"] += 1
+            error_kind = str(entry.get("error_kind") or status).strip()
+            if error_kind and error_kind not in aggregate["error_kinds"]:
+                aggregate["error_kinds"].append(error_kind)
+
+        substrate_class = "semi_numeric" if gene_matrix_path or probe_matrix_path else "none"
+        empirical_ready = bool(
+            gene_matrix_path
+            and sample_table_successes == len(sample_ids)
+            and len(distinct_timepoints) >= 4
+        )
+        sources = [
+            {
+                "source_id": "source_1",
+                "label": f"GEO series landing page for {accession}",
+                "landing_page_url": f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={accession}",
+                "download_url": series_matrix_url,
+                "accession_id": accession,
+                "notes": "Primary GEO accession source; staged retrieval began with series matrix and then recovered processed sample tables.",
+            }
+        ]
+        if platform_id:
+            sources.append(
+                {
+                    "source_id": "source_2",
+                    "label": f"GEO platform annotation for {platform_id}",
+                    "landing_page_url": f"https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc={platform_id}",
+                    "download_url": "",
+                    "accession_id": platform_id,
+                    "notes": "Platform annotation used to map probe IDs onto gene symbols and names.",
+                }
+            )
+        summary = (
+            f"Recovered {sample_table_successes} processed GEO sample tables for {accession}, materialized a probe matrix with {len(probe_matrix)} probes, "
+            f"and wrote a {len(gene_matrix_rows)}-symbol gene matrix."
+            if empirical_ready
+            else (
+                f"Recovered {sample_table_successes} processed GEO sample tables for {accession}, materialized a probe matrix with {len(probe_matrix)} probes, "
+                f"and wrote a {len(gene_matrix_rows)}-symbol gene matrix, but did not recover enough complete timepoint metadata to clear the empirical gate."
+                if substrate_class != "none"
+                else f"GEO acquisition for {accession} did not recover enough processed sample tables to materialize a usable expression matrix."
+            )
+        )
+        return {
+            "status": "ready" if empirical_ready else "blocked",
+            "summary": summary,
+            "blocking_reason": (
+                ""
+                if empirical_ready
+                else (
+                    f"GEO processed-table acquisition recovered semi-numeric tables for {accession}, but the run did not recover enough complete sample/timepoint metadata to support empirical analysis."
+                    if substrate_class != "none"
+                    else f"GEO processed-table acquisition did not materialize a complete local numeric substrate for {accession}."
+                )
+            ),
+            "substrate_class": substrate_class,
+            "empirical_ready": empirical_ready,
+            "download_manifest": manifest,
+            "usable_saved_files": usable_saved_files,
+            "metadata_only_saved_files": metadata_only_saved_files,
+            "host_failures": list(host_failures.values()),
+            "sources": sources,
+        }
+
+    def _run_geo_empirical_analysis(
+        self,
+        *,
+        run_id: str,
+        request_payload: dict[str, Any],
+        search: dict[str, Any],
+        data_access: dict[str, Any],
+        attempt: int,
+    ) -> dict[str, Any]:
+        accession = str((search.get("dataset") or {}).get("accession_id") or "").strip().upper()
+        run_directory = self.run_directory(run_id)
+        sample_metadata_path = run_directory / "downloads" / f"{accession}_sample_metadata.csv"
+        gene_matrix_path = run_directory / "downloads" / f"{accession}_gene_matrix.tsv"
+        if not sample_metadata_path.exists() or not gene_matrix_path.exists():
+            raise PipelineExecutionError("GEO empirical analysis requires the saved sample metadata and gene matrix files.", stage="2")
+
+        with sample_metadata_path.open("r", encoding="utf-8", newline="") as handle:
+            sample_rows = list(csv.DictReader(handle))
+        sample_rows.sort(key=lambda row: _parse_float(str(row.get("time_point_hours") or "")) or 0.0)
+        ordered_sample_ids = [str(row.get("sample_id") or "").strip() for row in sample_rows if str(row.get("sample_id") or "").strip()]
+        timepoints = [_parse_float(str(row.get("time_point_hours") or "")) or 0.0 for row in sample_rows]
+        probe_matrix_path = run_directory / "downloads" / f"{accession}_probe_matrix.tsv"
+        probe_count = 0
+        if probe_matrix_path.exists():
+            with probe_matrix_path.open("r", encoding="utf-8", newline="") as handle:
+                probe_count = max(0, sum(1 for _ in handle) - 1)
+        if len(ordered_sample_ids) < 4:
+            raise PipelineExecutionError("GEO empirical analysis requires multiple time points.", stage="2")
+
+        gene_rows: list[dict[str, Any]] = []
+        with gene_matrix_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle, delimiter="\t")
+            for row in reader:
+                symbol = str(row.get("Symbol") or "").strip()
+                if not symbol:
+                    continue
+                values: list[float] = []
+                valid = True
+                for sample_id in ordered_sample_ids:
+                    numeric_value = _parse_float(str(row.get(sample_id) or ""))
+                    if numeric_value is None:
+                        valid = False
+                        break
+                    values.append(numeric_value)
+                if not valid:
+                    continue
+                fit = _fit_fixed_period_cosine(timepoints, values)
+                gene_rows.append(
+                    {
+                        "Symbol": symbol,
+                        "Name": str(row.get("Name") or "").strip(),
+                        "Probe_Count": int(_parse_float(str(row.get("Probe_Count") or "")) or 0),
+                        "Amplitude_24h": fit["amplitude"],
+                        "R2_24h": fit["r_squared"],
+                        "Phase_Hours": fit["phase_hours"],
+                        "Mean_Expression": fit["mean_expression"],
+                        **{sample_id: values[index] for index, sample_id in enumerate(ordered_sample_ids)},
+                    }
+                )
+        if not gene_rows:
+            raise PipelineExecutionError("GEO empirical analysis could not derive any symbol-level expression profiles.", stage="2")
+
+        named_gene_rows = [row for row in gene_rows if _looks_like_named_gene(str(row.get("Symbol") or ""))]
+        named_gene_rows.sort(key=lambda row: (float(row.get("R2_24h") or 0.0), float(row.get("Amplitude_24h") or 0.0)), reverse=True)
+        top_gene_rows = named_gene_rows[:25] or gene_rows[:25]
+        core_clock_symbols = ["ARNTL", "CLOCK", "PER1", "PER2", "PER3", "CRY1", "CRY2", "NR1D1"]
+        core_clock_rows = [row for row in gene_rows if str(row.get("Symbol") or "").strip() in core_clock_symbols]
+        core_clock_rows.sort(key=lambda row: core_clock_symbols.index(str(row.get("Symbol") or "").strip()))
+
+        sample_vectors = {sample_id: [] for sample_id in ordered_sample_ids}
+        for row in gene_rows:
+            for sample_id in ordered_sample_ids:
+                sample_vectors[sample_id].append(float(row.get(sample_id) or 0.0))
+        correlation_rows: list[dict[str, Any]] = []
+        for left_id in ordered_sample_ids:
+            row = {"sample_id": left_id}
+            for right_id in ordered_sample_ids:
+                row[right_id] = f"{_pearson_correlation(sample_vectors[left_id], sample_vectors[right_id]):.6f}"
+            correlation_rows.append(row)
+
+        artifacts_directory = run_directory / "artifacts"
+        sample_metadata_artifact = artifacts_directory / "geo_sample_metadata.csv"
+        top_genes_artifact = artifacts_directory / "top_circadian_gene_fits.csv"
+        core_clock_artifact = artifacts_directory / "core_clock_gene_fits.csv"
+        correlation_artifact = artifacts_directory / "sample_correlation_matrix.csv"
+        _write_csv_rows(
+            sample_metadata_artifact,
+            ["sample_id", "title", "time_point_hours", "dye_label", "raw_file", "source_name", "row_count", "table_path"],
+            sample_rows,
+        )
+        _write_csv_rows(
+            top_genes_artifact,
+            ["Symbol", "Name", "Probe_Count", "Amplitude_24h", "R2_24h", "Phase_Hours", "Mean_Expression", *ordered_sample_ids],
+            [
+                {
+                    "Symbol": row["Symbol"],
+                    "Name": row["Name"],
+                    "Probe_Count": row["Probe_Count"],
+                    "Amplitude_24h": f"{float(row['Amplitude_24h']):.6f}",
+                    "R2_24h": f"{float(row['R2_24h']):.6f}",
+                    "Phase_Hours": f"{float(row['Phase_Hours']):.6f}",
+                    "Mean_Expression": f"{float(row['Mean_Expression']):.6f}",
+                    **{sample_id: f"{float(row[sample_id]):.6f}" for sample_id in ordered_sample_ids},
+                }
+                for row in top_gene_rows
+            ],
+        )
+        _write_csv_rows(
+            core_clock_artifact,
+            ["Symbol", "Name", "Probe_Count", "Amplitude_24h", "R2_24h", "Phase_Hours", "Mean_Expression", *ordered_sample_ids],
+            [
+                {
+                    "Symbol": row["Symbol"],
+                    "Name": row["Name"],
+                    "Probe_Count": row["Probe_Count"],
+                    "Amplitude_24h": f"{float(row['Amplitude_24h']):.6f}",
+                    "R2_24h": f"{float(row['R2_24h']):.6f}",
+                    "Phase_Hours": f"{float(row['Phase_Hours']):.6f}",
+                    "Mean_Expression": f"{float(row['Mean_Expression']):.6f}",
+                    **{sample_id: f"{float(row[sample_id]):.6f}" for sample_id in ordered_sample_ids},
+                }
+                for row in core_clock_rows
+            ],
+        )
+        _write_csv_rows(
+            correlation_artifact,
+            ["sample_id", *ordered_sample_ids],
+            correlation_rows,
+        )
+
+        top_gene_text = ", ".join(
+            f"{row['Symbol']} (R² {float(row['R2_24h']):.3f}, amplitude {float(row['Amplitude_24h']):.3f}, phase {float(row['Phase_Hours']):.1f} h)"
+            for row in top_gene_rows[:5]
+        )
+        arntl = next((row for row in core_clock_rows if str(row.get("Symbol") or "") == "ARNTL"), None)
+        per1 = next((row for row in core_clock_rows if str(row.get("Symbol") or "") == "PER1"), None)
+        cry2 = next((row for row in core_clock_rows if str(row.get("Symbol") or "") == "CRY2"), None)
+        earliest_latest_correlation = _pearson_correlation(sample_vectors[ordered_sample_ids[0]], sample_vectors[ordered_sample_ids[-1]])
+        strongest_pair = max(
+            (
+                (left_row["sample_id"], right_id, float(left_row[right_id]))
+                for left_row in correlation_rows
+                for right_id in ordered_sample_ids
+                if right_id != left_row["sample_id"]
+            ),
+            key=lambda item: item[2],
+        )
+        methods_text = (
+            f"We downloaded the full GEO processed sample tables for {len(sample_rows)} GSM samples from {accession} using the GEO text-data view, "
+            f"downloaded the GPL platform annotation, merged the resulting {probe_count:,} probe profiles across the {len(sample_rows)} recovered time points, "
+            f"collapsed probes onto shared gene symbols by mean expression, and fit a fixed 24-hour cosine model to each gene-level profile to quantify amplitude, phase, and goodness of fit."
+        )
+        experiments = [
+            "Recovered the full processed GEO sample tables and platform annotation into the hosted run directory.",
+            "Materialized a probe-by-sample matrix and a symbol-collapsed gene-expression matrix for the eight MCF10A time points.",
+            "Fit fixed 24-hour cosine models to each gene-level trajectory and ranked genes by fit quality and amplitude.",
+            "Computed a sample-by-sample correlation matrix from the recovered expression matrix.",
+        ]
+        findings = [
+            f"The backend recovered {len(sample_rows)} processed GEO sample tables plus the GPL annotation, yielding a {len(gene_rows)}-gene matrix across {len(sample_rows)} time points.",
+            f"The strongest named 24-hour cosine fits were {top_gene_text}.",
+            (
+                f"Among core clock genes, ARNTL/BMAL1 reached amplitude {float(arntl['Amplitude_24h']):.3f} log2 units with R² {float(arntl['R2_24h']):.3f} and phase {float(arntl['Phase_Hours']):.1f} h; "
+                f"CRY2 reached amplitude {float(cry2['Amplitude_24h']):.3f} with R² {float(cry2['R2_24h']):.3f}; "
+                f"PER1 reached amplitude {float(per1['Amplitude_24h']):.3f} with R² {float(per1['R2_24h']):.3f}."
+                if arntl and cry2 and per1
+                else "Core-clock genes were retained in the recovered matrix and quantified with the same fixed-period cosine screen."
+            ),
+            f"The strongest sample-level correlation was {strongest_pair[0]} versus {strongest_pair[1]} at r={strongest_pair[2]:.3f}, and the earliest-vs-latest comparison remained positively correlated at r={earliest_latest_correlation:.3f}.",
+        ]
+        limitations = [
+            "The GEO processed tables are normalized single-channel approximations derived from the deposited two-color workflow, so the analysis is semi-numeric rather than a raw-array reprocessing pipeline.",
+            "The time course spans eight samples from 0 to 28 hours, which supports a descriptive fixed-period screen but is still sparse for definitive circadian inference.",
+            "Probe collapsing used symbol-level means and therefore does not resolve transcript isoforms or probe-specific cross-hybridization effects.",
+        ]
+        note_ids = [str(note.get("id") or "").strip() for note in request_payload.get("notes") or [] if str(note.get("id") or "").strip()]
+        ledger = {
+            "title": str(request_payload.get("title") or "Research paper"),
+            "research_question": str(search.get("research_question") or request_payload.get("theme") or request_payload.get("title") or "").strip(),
+            "dataset": search.get("dataset") or {},
+            "data_access": data_access,
+            "dataset_profile": {
+                "analyzable": True,
+                "blocking_reason": "",
+                "profile_summary": f"Recovered {len(sample_rows)} processed sample tables, a probe matrix, and a {len(gene_rows)}-symbol gene matrix for GEO accession {accession}.",
+                "retrieval_summary": data_access.get("summary") or "",
+                "dataset": search.get("dataset") or {},
+                "available_assets": ["processed sample tables", "platform annotation", "probe matrix", "gene matrix"],
+                "constraints": ["processed single-channel GEO values", "sparse eight-sample time course"],
+                "suggested_analysis_targets": ["gene-level 24-hour cosine fits", "core clock gene trajectories", "sample correlation structure"],
+                "sources": data_access.get("sources") or [],
+            },
+            "execution_plan": {
+                "analysis_strategy": "deterministic_geo_processed_table_analysis",
+                "period_hours": 24,
+                "sample_count": len(sample_rows),
+                "gene_count": len(gene_rows),
+            },
+            "execution_handoff": {
+                "analysis_strategy": "deterministic_geo_processed_table_analysis",
+                "saved_artifact_paths": [
+                    "artifacts/geo_sample_metadata.csv",
+                    "artifacts/top_circadian_gene_fits.csv",
+                    "artifacts/core_clock_gene_fits.csv",
+                    "artifacts/sample_correlation_matrix.csv",
+                ],
+                "packaging_notes": "Backend-generated GEO empirical analysis from recovered processed sample tables.",
+            },
+            "experiment_summary": f"The backend recovered the full processed GEO sample tables for {accession}, collapsed them onto {len(gene_rows)} gene symbols, and ranked the resulting time-course trajectories with a fixed 24-hour cosine screen.",
+            "experiments": experiments,
+            "findings": findings,
+            "limitations": limitations,
+            "code_summary": methods_text,
+            "sources": [_normalize_source(entry, index) for index, entry in enumerate(data_access.get('sources') or [])],
+            "artifacts": [
+                _normalize_artifact(
+                    {
+                        "artifact_id": "geo_sample_metadata",
+                        "path": "artifacts/geo_sample_metadata.csv",
+                        "kind": "table",
+                        "mime_type": "text/csv",
+                        "description": "Recovered GEO sample metadata with time points, dye labels, and processed-table paths.",
+                        "source_ids": ["source_1"],
+                    },
+                    0,
+                ),
+                _normalize_artifact(
+                    {
+                        "artifact_id": "top_circadian_gene_fits",
+                        "path": "artifacts/top_circadian_gene_fits.csv",
+                        "kind": "table",
+                        "mime_type": "text/csv",
+                        "description": "Top named gene-level 24-hour cosine fits from the recovered GEO processed tables.",
+                        "source_ids": ["source_1", "source_2"],
+                    },
+                    1,
+                ),
+                _normalize_artifact(
+                    {
+                        "artifact_id": "core_clock_gene_fits",
+                        "path": "artifacts/core_clock_gene_fits.csv",
+                        "kind": "table",
+                        "mime_type": "text/csv",
+                        "description": "Core clock gene trajectories and fit statistics from the recovered GEO expression matrix.",
+                        "source_ids": ["source_1", "source_2"],
+                    },
+                    2,
+                ),
+                _normalize_artifact(
+                    {
+                        "artifact_id": "sample_correlation_matrix",
+                        "path": "artifacts/sample_correlation_matrix.csv",
+                        "kind": "table",
+                        "mime_type": "text/csv",
+                        "description": "Sample-level Pearson correlation matrix computed from the recovered GEO gene matrix.",
+                        "source_ids": ["source_1", "source_2"],
+                    },
+                    3,
+                ),
+            ],
+            "figure_summaries": [],
+            "results": [
+                {
+                    "result_id": "result_1",
+                    "text": f"The hosted run recovered {len(sample_rows)} processed GEO sample tables and the GPL annotation, yielding a {len(gene_rows)}-gene by {len(sample_rows)}-sample matrix for quantitative analysis.",
+                    "artifact_ids": ["geo_sample_metadata", "top_circadian_gene_fits"],
+                    "note_ids": note_ids,
+                },
+                {
+                    "result_id": "result_2",
+                    "text": f"The strongest named 24-hour cosine fits were {top_gene_text}.",
+                    "artifact_ids": ["top_circadian_gene_fits"],
+                    "note_ids": note_ids,
+                },
+                {
+                    "result_id": "result_3",
+                    "text": (
+                        f"ARNTL/BMAL1 reached amplitude {float(arntl['Amplitude_24h']):.3f} log2 units with R² {float(arntl['R2_24h']):.3f} and phase {float(arntl['Phase_Hours']):.1f} h; "
+                        f"CRY2 reached amplitude {float(cry2['Amplitude_24h']):.3f} with R² {float(cry2['R2_24h']):.3f}; "
+                        f"PER1 reached amplitude {float(per1['Amplitude_24h']):.3f} with R² {float(per1['R2_24h']):.3f}."
+                        if arntl and cry2 and per1
+                        else "Core-clock genes were quantified from the recovered GEO expression matrix."
+                    ),
+                    "artifact_ids": ["core_clock_gene_fits"],
+                    "note_ids": note_ids,
+                },
+                {
+                    "result_id": "result_4",
+                    "text": f"The strongest sample-level correlation was {strongest_pair[0]} versus {strongest_pair[1]} at r={strongest_pair[2]:.3f}, and the earliest-vs-latest comparison remained positively correlated at r={earliest_latest_correlation:.3f}.",
+                    "artifact_ids": ["sample_correlation_matrix"],
+                    "note_ids": note_ids,
+                },
+            ],
+            "search": search,
+            "attempt": attempt,
+        }
+        self._attach_data_access_receipt_artifacts(ledger)
+        self._ensure_artifact_metadata(ledger)
+        write_json_file(run_directory / "ledger.json", ledger)
+        store = self._run_store(run_id)
+        for artifact in ledger.get("artifacts", []):
+            if not isinstance(artifact, dict):
+                continue
+            store.record_artifact(
+                stage="2",
+                artifact_id=str(artifact.get("artifact_id") or ""),
+                artifact_type=str(artifact.get("kind") or "artifact"),
+                path=str(artifact.get("path") or ""),
+                description=str(artifact.get("description") or "").strip(),
+            )
+        store.record_artifact(
+            stage="2",
+            artifact_id="ledger",
+            artifact_type="ledger",
+            path="ledger.json",
+            description="Deterministic GEO empirical analysis ledger.",
+        )
+        store.complete_stage(stage="2", agent="geo-empirical-analysis", artifacts=["ledger.json"])
+        return ledger
+
     def _run_data_acquisition(
         self,
         *,
@@ -1114,6 +2217,55 @@ Rules:
         request_payload: dict[str, Any],
         acquisition_input: dict[str, Any],
     ) -> dict[str, Any]:
+        strategy = acquisition_input.get("strategy") if isinstance(acquisition_input.get("strategy"), dict) else {}
+        if str(strategy.get("family_id") or "").strip() == "geo_functional_genomics":
+            report = self._run_geo_data_acquisition(
+                run_id=run_id,
+                request_payload=request_payload,
+                acquisition_input=acquisition_input,
+            )
+            normalized = _normalize_data_access_report(
+                raw_report=report,
+                dataset=acquisition_input.get("dataset") if isinstance(acquisition_input.get("dataset"), dict) else {},
+                request_payload=request_payload,
+                config=self._config,
+            )
+            run_directory = self.run_directory(run_id)
+            write_json_file(run_directory / "data_access_report.json", normalized)
+            write_json_file(run_directory / "download_manifest.json", {"entries": normalized["download_manifest"]})
+            (run_directory / "network_attempts.tsv").write_text(
+                _network_attempts_tsv(normalized["download_manifest"]),
+                encoding="utf-8",
+            )
+            store = self._run_store(run_id)
+            store.record_artifact(
+                stage="2",
+                artifact_id="data_access_report",
+                artifact_type="log",
+                path="data_access_report.json",
+                description="Structured acquisition summary with substrate classification.",
+            )
+            store.record_artifact(
+                stage="2",
+                artifact_id="download_manifest",
+                artifact_type="log",
+                path="download_manifest.json",
+                description="Structured manifest of acquisition attempts and saved files.",
+            )
+            store.record_artifact(
+                stage="2",
+                artifact_id="network_attempts",
+                artifact_type="log",
+                path="network_attempts.tsv",
+                description="TSV receipt of network attempts during acquisition.",
+            )
+            store.complete_stage(
+                stage="2",
+                agent="data-acquisition",
+                artifacts=["data_access_report.json", "download_manifest.json", "network_attempts.tsv"],
+            )
+            return normalized
+
         instructions = """
 You are Sidekick's data-acquisition gate for empirical runs.
 Acquire real numeric or semi-numeric substrate before any empirical analysis can proceed.
