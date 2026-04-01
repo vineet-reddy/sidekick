@@ -29,6 +29,15 @@ from github_bootstrap_service.bootstrap_service.pipeline_runtime import (
     load_sidekick_config,
     save_sidekick_config,
 )
+from paperlab.autoresearch import (
+    DEFAULT_AUTORESEARCH_ROOT,
+    DEFAULT_PROGRAM_PATH,
+    AutoResearchConfig,
+    AutoResearchError,
+    AutoResearchSession,
+    load_session_attempts,
+    load_session_summary,
+)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = DEFAULT_RUN_ROOT
@@ -45,6 +54,9 @@ def main(argv: list[str] | None = None) -> int:
         print(str(error), file=sys.stderr)
         return exit_code_for_stage(error.stage)
     except FileNotFoundError as error:
+        print(str(error), file=sys.stderr)
+        return 1
+    except AutoResearchError as error:
         print(str(error), file=sys.stderr)
         return 1
     except ValueError as error:
@@ -230,7 +242,52 @@ def build_parser() -> argparse.ArgumentParser:
     hosted_artifacts.add_argument("--json", action="store_true")
     hosted_artifacts.set_defaults(func=hosted_artifacts_command)
 
+    add_autorepair_parser(subparsers, name="autorepair", help_text="Run overnight repair loops in isolated git worktrees.")
+    add_autorepair_parser(subparsers, name="autoresearch", help_text="Compatibility alias for `autorepair`.")
+
     return parser
+
+
+def add_autorepair_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], *, name: str, help_text: str) -> None:
+    autoresearch_parser = subparsers.add_parser(name, help=help_text)
+    autoresearch_subparsers = autoresearch_parser.add_subparsers(dest="action", required=True)
+
+    autoresearch_run = autoresearch_subparsers.add_parser("run", help="Start an autorepair session.")
+    autoresearch_run.add_argument("--objective", required=True, help="High-level repair goal given to Codex.")
+    autoresearch_run.add_argument("--verify", required=True, help="Shell command that must exit 0 before the session is considered solved.")
+    autoresearch_run.add_argument("--program", default=str(DEFAULT_PROGRAM_PATH), help="Path to the autorepair program markdown.")
+    autoresearch_run.add_argument("--session-root", default=str(DEFAULT_AUTORESEARCH_ROOT), help="Directory where autorepair session state is stored.")
+    autoresearch_run.add_argument("--repo-root", default=str(REPO_ROOT), help="Repository root used for git worktree orchestration.")
+    autoresearch_run.add_argument("--source-worktree", default=os.getcwd(), help="Clean git worktree that receives successful fixes.")
+    autoresearch_run.add_argument("--max-attempts", type=int, default=12, help="Maximum number of Codex repair attempts.")
+    autoresearch_run.add_argument("--time-budget-minutes", type=int, default=480, help="Wall-clock budget for the session.")
+    autoresearch_run.add_argument("--codex-bin", default="codex", help="Codex executable to invoke.")
+    autoresearch_run.add_argument("--model", help="Optional Codex model override.")
+    autoresearch_run.add_argument("--search", action="store_true", help="Enable Codex web search for repair attempts.")
+    autoresearch_run.add_argument("--yolo", action="store_true", help="Pass full computer access through to Codex attempts.")
+    autoresearch_run.add_argument("--allow-dirty", action="store_true", help="Allow the source worktree to start dirty.")
+    autoresearch_run.add_argument("--run-tag", help="Run tag used for the advancing autorepair branch.")
+    autoresearch_run.add_argument("--branch", help="Explicit branch name for the advancing best-known branch.")
+    autoresearch_run.add_argument("--no-create-branch", action="store_true", help="Do not create or switch the source worktree branch automatically.")
+    autoresearch_run.add_argument("--verifier-timeout-seconds", type=int, default=1800, help="Kill verifier runs that exceed this timeout.")
+    autoresearch_run.add_argument("--score-regex", help="Optional regex with one capture group for a numeric score to optimize.")
+    autoresearch_run.add_argument("--score-direction", choices=["lower", "higher"], default="lower", help="Whether lower or higher scores are better.")
+    autoresearch_run.add_argument("--scope-file", action="append", default=[], dest="scope_files", help="Repeatable list of in-scope files or directories.")
+    autoresearch_run.add_argument("--continue-on-pass", action="store_true", help="Keep searching for improvements even after the verifier passes once.")
+    autoresearch_run.add_argument("--json", action="store_true", help="Print the final session summary as JSON.")
+    autoresearch_run.set_defaults(func=autoresearch_run_command)
+
+    autoresearch_status = autoresearch_subparsers.add_parser("status", help="Show autorepair session state.")
+    autoresearch_status.add_argument("session_ref", help="Session id, path, or 'latest'.")
+    autoresearch_status.add_argument("--session-root", default=str(DEFAULT_AUTORESEARCH_ROOT))
+    autoresearch_status.add_argument("--json", action="store_true")
+    autoresearch_status.set_defaults(func=autoresearch_status_command)
+
+    autoresearch_attempts = autoresearch_subparsers.add_parser("attempts", help="Show autorepair attempt history.")
+    autoresearch_attempts.add_argument("session_ref", help="Session id, path, or 'latest'.")
+    autoresearch_attempts.add_argument("--session-root", default=str(DEFAULT_AUTORESEARCH_ROOT))
+    autoresearch_attempts.add_argument("--json", action="store_true")
+    autoresearch_attempts.set_defaults(func=autoresearch_attempts_command)
 
 
 def add_run_ref_argument(parser: argparse.ArgumentParser) -> None:
@@ -702,6 +759,86 @@ def hosted_artifacts_command(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2, sort_keys=True))
     else:
         print(json.dumps(payload, indent=2, sort_keys=True))
+    return 0
+
+
+def autoresearch_run_command(args: argparse.Namespace) -> int:
+    config = AutoResearchConfig(
+        objective=str(args.objective).strip(),
+        verify_command=str(args.verify).strip(),
+        repo_root=Path(args.repo_root).expanduser().resolve(),
+        source_worktree=Path(args.source_worktree).expanduser().resolve(),
+        session_root=Path(args.session_root).expanduser().resolve(),
+        program_path=Path(args.program).expanduser().resolve(),
+        codex_bin=str(args.codex_bin).strip() or "codex",
+        model=str(args.model).strip() if args.model else None,
+        search_enabled=bool(args.search),
+        yolo=bool(args.yolo),
+        max_attempts=int(args.max_attempts),
+        time_budget_minutes=max(1, int(args.time_budget_minutes)),
+        allow_dirty=bool(args.allow_dirty),
+        run_tag=str(args.run_tag).strip() if args.run_tag else None,
+        branch_name=str(args.branch).strip() if args.branch else None,
+        create_branch=not bool(args.no_create_branch),
+        verifier_timeout_seconds=max(1, int(args.verifier_timeout_seconds)),
+        score_regex=str(args.score_regex).strip() if args.score_regex else None,
+        score_direction=str(args.score_direction or "lower").strip(),
+        scope_files=tuple(str(entry).strip() for entry in (args.scope_files or []) if str(entry).strip()),
+        continue_on_pass=bool(args.continue_on_pass),
+    )
+    session = AutoResearchSession(config)
+    summary = session.run()
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(f"session_id: {summary.get('session_id')}")
+        print(f"status: {summary.get('status')}")
+        print(f"attempts_completed: {summary.get('attempts_completed')}")
+        print(f"successful_attempt: {summary.get('successful_attempt')}")
+        print(f"run_tag: {summary.get('run_tag')}")
+        print(f"branch_name: {summary.get('branch_name')}")
+        print(f"best_score: {summary.get('best_score')}")
+        print(f"session_dir: {session.session_dir}")
+        print(f"last_error: {summary.get('last_error')}")
+    return 0 if str(summary.get("status") or "").strip() == "completed" else 1
+
+
+def autoresearch_status_command(args: argparse.Namespace) -> int:
+    summary = load_session_summary(Path(args.session_root), args.session_ref)
+    if args.json:
+        print(json.dumps(summary, indent=2, sort_keys=True))
+    else:
+        print(f"session_id: {summary.get('session_id')}")
+        print(f"status: {summary.get('status')}")
+        print(f"objective: {summary.get('objective')}")
+        print(f"verify_command: {summary.get('verify_command')}")
+        print(f"attempts_completed: {summary.get('attempts_completed')}")
+        print(f"successful_attempt: {summary.get('successful_attempt')}")
+        print(f"run_tag: {summary.get('run_tag')}")
+        print(f"branch_name: {summary.get('branch_name')}")
+        print(f"best_score: {summary.get('best_score')}")
+        print(f"started_at: {summary.get('started_at')}")
+        print(f"completed_at: {summary.get('completed_at')}")
+        print(f"last_error: {summary.get('last_error')}")
+    return 0
+
+
+def autoresearch_attempts_command(args: argparse.Namespace) -> int:
+    attempts = load_session_attempts(Path(args.session_root), args.session_ref)
+    if args.json:
+        print(json.dumps(attempts, indent=2, sort_keys=True))
+        return 0
+    for entry in attempts:
+        print(
+            " | ".join(
+                [
+                    f"attempt {entry.get('attempt')}",
+                    str(entry.get("status") or "-"),
+                    str(((entry.get("verifier") or {}).get("score_text") if isinstance(entry.get("verifier"), dict) else "-") or "-"),
+                    str(entry.get("description") or "-"),
+                ]
+            )
+        )
     return 0
 
 

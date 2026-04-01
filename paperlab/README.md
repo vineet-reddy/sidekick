@@ -28,3 +28,37 @@ Saved run artifacts live under `paperlab/runs/<run_id>/` and include:
 - `events.jsonl`
 - `metrics.jsonl`
 - `artifacts/`, `figures/`, `tables/`
+
+## Autorepair
+
+`sidekick autorepair` adds a Karpathy-inspired overnight repair loop on top of the CLI harness.
+
+It expects you to launch it from a clean git worktree, then it will:
+
+- run a verifier command against that worktree
+- record a baseline score and treat the current worktree branch as the best-known branch
+- create a fresh child git worktree for each repair attempt
+- invoke `codex exec` inside the child worktree
+- keep only attempts that measurably improve the verifier
+- discard non-improving attempts and continue until the budget expires
+
+Example:
+
+```bash
+python3 -m paperlab.cli autorepair run \
+  --objective "Make the local Sidekick pipeline complete end to end." \
+  --verify "python3 -m unittest github_bootstrap_service.tests.test_paperlab_cli -v" \
+  --source-worktree "$PWD" \
+  --run-tag overnight-pipeline \
+  --search \
+  --yolo
+```
+
+Session state is written under `~/.sidekick/autoresearch/`. Use:
+
+```bash
+python3 -m paperlab.cli autorepair status latest --json
+python3 -m paperlab.cli autorepair attempts latest --json
+```
+
+`sidekick autoresearch` remains available as a compatibility alias.
