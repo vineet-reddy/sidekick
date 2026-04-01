@@ -38,6 +38,7 @@ from paperlab.autoresearch import (
     load_session_attempts,
     load_session_summary,
 )
+from paperlab.paper_quality import PaperQualityVerifier
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 RUNS_ROOT = DEFAULT_RUN_ROOT
@@ -244,8 +245,24 @@ def build_parser() -> argparse.ArgumentParser:
 
     add_autorepair_parser(subparsers, name="autorepair", help_text="Run overnight repair loops in isolated git worktrees.")
     add_autorepair_parser(subparsers, name="autoresearch", help_text="Compatibility alias for `autorepair`.")
+    add_paper_quality_parser(subparsers)
 
     return parser
+
+
+def add_paper_quality_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser]) -> None:
+    paper_quality_parser = subparsers.add_parser("paper-quality", help="Verify manuscript quality for a generated paper.")
+    paper_quality_subparsers = paper_quality_parser.add_subparsers(dest="action", required=True)
+
+    verify_parser = paper_quality_subparsers.add_parser("verify", help="Run deterministic and LLM paper-quality verification.")
+    verify_parser.add_argument("target_ref", help="Run id, run directory, path to paper.tex/memo.tex, or 'latest'.")
+    verify_parser.add_argument("--skip-llm", action="store_true", help="Skip the LLM manuscript judge and run deterministic checks only.")
+    verify_parser.add_argument("--golden-root", default="/Users/vineetreddy/Documents/GitHub/test_sidekickdata", help="Golden dataset root used for paper-quality judging.")
+    verify_parser.add_argument("--max-golden-examples", type=int, default=3, help="Maximum number of golden examples to include in the LLM judge context.")
+    verify_parser.add_argument("--model", help="Optional model override for the LLM manuscript judge.")
+    verify_parser.add_argument("--timeout-seconds", type=int, default=300, help="Timeout for the LLM manuscript judge.")
+    verify_parser.add_argument("--json", action="store_true", help="Print JSON output.")
+    verify_parser.set_defaults(func=paper_quality_verify_command)
 
 
 def add_autorepair_parser(subparsers: argparse._SubParsersAction[argparse.ArgumentParser], *, name: str, help_text: str) -> None:
@@ -760,6 +777,39 @@ def hosted_artifacts_command(args: argparse.Namespace) -> int:
     else:
         print(json.dumps(payload, indent=2, sort_keys=True))
     return 0
+
+
+def paper_quality_verify_command(args: argparse.Namespace) -> int:
+    target = PaperQualityVerifier.resolve_target_from_ref(target_ref=args.target_ref, runs_root=RUNS_ROOT)
+    openai_client = None
+    model = str(args.model).strip() if args.model else None
+    if not args.skip_llm:
+        try:
+            config = build_local_config(require_openai=True)
+        except ValueError:
+            config = None
+        if config is not None:
+            openai_client = OpenAIClient(config)
+            if model is None:
+                model = config.openai_validation_model
+    verifier = PaperQualityVerifier(
+        openai_client=openai_client,
+        llm_model=model,
+        llm_timeout_seconds=max(30, int(args.timeout_seconds)),
+        golden_root=Path(args.golden_root).expanduser().resolve(),
+        max_golden_examples=max(1, int(args.max_golden_examples)),
+    )
+    payload = verifier.verify_target(target, skip_llm=bool(args.skip_llm))
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+    else:
+        print(f"target: {payload['target']['tex_path']}")
+        print(f"overall_status: {payload.get('overall_status')}")
+        print(f"score: {payload.get('score')}")
+        print(f"deterministic_passed: {(payload.get('deterministic') or {}).get('passed')}")
+        print(f"llm_verdict: {(payload.get('llm_review') or {}).get('verdict')}")
+        print(f"summary: {payload.get('summary')}")
+    return 0 if bool(payload.get("passed")) else 1
 
 
 def autoresearch_run_command(args: argparse.Namespace) -> int:

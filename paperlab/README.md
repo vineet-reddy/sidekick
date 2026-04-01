@@ -9,6 +9,7 @@ Quick start:
 ```bash
 python3 -m paperlab.cli run --notes-file prompt.txt --title "My study"
 python3 -m paperlab.cli inspect latest
+python3 -m paperlab.cli paper-quality verify latest --golden-root /Users/vineetreddy/Documents/GitHub/test_sidekickdata --json
 python3 -m paperlab.cli render latest
 python3 -m paperlab.cli open latest --target pdf
 python3 -m paperlab.cli render-status
@@ -28,6 +29,25 @@ Saved run artifacts live under `paperlab/runs/<run_id>/` and include:
 - `events.jsonl`
 - `metrics.jsonl`
 - `artifacts/`, `figures/`, `tables/`
+
+## Paper Quality
+
+`sidekick paper-quality verify` is the canonical verifier for overnight manuscript repair loops.
+
+It combines:
+
+- deterministic manuscript checks for compile health, section structure, placeholders, bibliography/citation hygiene, artifact presence, and basic ledger grounding
+- an LLM manuscript judge that reads the actual paper, ledger, validation payload, artifact manifest, and the golden dataset
+
+Example:
+
+```bash
+python3 -m paperlab.cli paper-quality verify latest \
+  --golden-root /Users/vineetreddy/Documents/GitHub/test_sidekickdata \
+  --json
+```
+
+Use `--skip-llm` only when debugging the deterministic layer locally. A paper is not fully verified until the LLM judge also passes.
 
 ## Autorepair
 
