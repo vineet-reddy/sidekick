@@ -1,0 +1,130 @@
+{
+  "approved_result_ids": [],
+  "approved_results": [],
+  "data_access": {
+    "empirical_ready": false,
+    "has_receipts": true,
+    "substrate_class": "none"
+  },
+  "dropped_results": [
+    {
+      "reasons": [
+        "result does not resolve to reproducible source provenance",
+        "result does not resolve to the required primary dataset"
+      ],
+      "result_id": "result_1"
+    }
+  ],
+  "final_format": "memo",
+  "manuscript_kind": "memo",
+  "memo_reasons": [
+    "no original result resolved to a real saved artifact",
+    "not every requested note is covered by a validated finding",
+    "validated findings did not stay anchored to the resolved primary dataset",
+    "empirical paper mode requires real numeric or semi-numeric substrate; metadata-only retrieval cannot clear the paper gate",
+    "empirical paper mode requires at least one artifact-backed quantitative result produced in the run"
+  ],
+  "missing_note_ids": [
+    "1B8E9C9F-1B18-441C-B106-A41AB4544CD8"
+  ],
+  "paper_checks": {
+    "covers_requested_notes": false,
+    "described_work_performed_here": true,
+    "has_artifact_backed_result": false,
+    "has_data_access_receipts": true,
+    "has_original_result": true,
+    "has_quantitative_result": false,
+    "has_real_substrate": false,
+    "uses_resolved_primary_dataset": false
+  },
+  "reference_catalog": [
+    {
+      "key": "ref1",
+      "source_id": "source_1",
+      "text": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study. zenodo:11208039. https://doi.org/10.1016/S2214-109X(23)00248-6"
+    }
+  ],
+  "resolution": {
+    "acceptable_units": [
+      "patient",
+      "row",
+      "subject"
+    ],
+    "blocking_reason": null,
+    "candidates": [
+      {
+        "access_url": "https://doi.org/10.1016/S2214-109X(23)00248-6",
+        "api_url": "https://zenodo.org/api/records/11208039",
+        "dataset_id": "zenodo:11208039",
+        "download_urls": [
+          "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+          "https://zenodo.org/api/records/11208039/files/Epilepsy patients22.xlsx/content"
+        ],
+        "evidence_count": 2,
+        "family_id": "zenodo_open_research",
+        "family_label": "Zenodo Open Research",
+        "modalities": [
+          "general_empirical",
+          "neurophysiology",
+          "gene_expression",
+          "tabular",
+          "imaging",
+          "signal_processing"
+        ],
+        "primary_domain": "zenodo.org",
+        "provenance_note": "Resolved directly from an explicit Zenodo dataset id.",
+        "qualifies_as_primary_data": true,
+        "score": 128.95,
+        "summary": "Zenodo record 11208039 | data files: 2",
+        "title": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study",
+        "trusted_domains": [
+          "zenodo.org"
+        ],
+        "unit_of_analysis": "dataset_or_file"
+      }
+    ],
+    "incompatible_primary_family_ids": [
+      "openalex_literature",
+      "pubmed_literature"
+    ],
+    "inferred_modalities": [
+      "clinical_cohort"
+    ],
+    "paper_mode": "empirical_dataset",
+    "selected_candidate": {
+      "access_url": "https://doi.org/10.1016/S2214-109X(23)00248-6",
+      "api_url": "https://zenodo.org/api/records/11208039",
+      "dataset_id": "zenodo:11208039",
+      "download_urls": [
+        "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+        "https://zenodo.org/api/records/11208039/files/Epilepsy patients22.xlsx/content"
+      ],
+      "evidence_count": 2,
+      "family_id": "zenodo_open_research",
+      "family_label": "Zenodo Open Research",
+      "modalities": [
+        "general_empirical",
+        "neurophysiology",
+        "gene_expression",
+        "tabular",
+        "imaging",
+        "signal_processing"
+      ],
+      "primary_domain": "zenodo.org",
+      "provenance_note": "Resolved directly from an explicit Zenodo dataset id.",
+      "qualifies_as_primary_data": true,
+      "score": 128.95,
+      "summary": "Zenodo record 11208039 | data files: 2",
+      "title": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study",
+      "trusted_domains": [
+        "zenodo.org"
+      ],
+      "unit_of_analysis": "dataset_or_file"
+    },
+    "status": "resolved",
+    "summary": "Selected Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study from Zenodo Open Research as the primary empirical source."
+  },
+  "status": "memo",
+  "summary": "Routing to a research memo because the run did not clear the paper gate.",
+  "validation_issues": []
+}
