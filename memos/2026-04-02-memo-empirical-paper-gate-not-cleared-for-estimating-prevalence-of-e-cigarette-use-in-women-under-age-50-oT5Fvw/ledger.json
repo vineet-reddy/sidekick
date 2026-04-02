@@ -1,0 +1,286 @@
+{
+  "artifact_files": [
+    {
+      "artifact_id": "data_access_report",
+      "mime_type": "application/json",
+      "path": "data_access_report.json",
+      "sha256": ""
+    },
+    {
+      "artifact_id": "download_manifest",
+      "mime_type": "application/json",
+      "path": "download_manifest.json",
+      "sha256": ""
+    },
+    {
+      "artifact_id": "network_attempts",
+      "mime_type": "text/tab-separated-values",
+      "path": "network_attempts.tsv",
+      "sha256": ""
+    }
+  ],
+  "artifacts": [
+    {
+      "artifact_id": "data_access_report",
+      "description": "Structured acquisition summary with substrate classification and empirical-readiness decision.",
+      "kind": "log",
+      "mime_type": "application/json",
+      "path": "data_access_report.json",
+      "source_ids": []
+    },
+    {
+      "artifact_id": "download_manifest",
+      "description": "Structured manifest of every acquisition attempt and saved file classification.",
+      "kind": "log",
+      "mime_type": "application/json",
+      "path": "download_manifest.json",
+      "source_ids": []
+    },
+    {
+      "artifact_id": "network_attempts",
+      "description": "Tabular network-attempt receipt for acquisition debugging.",
+      "kind": "log",
+      "mime_type": "text/tab-separated-values",
+      "path": "network_attempts.tsv",
+      "source_ids": []
+    }
+  ],
+  "attempt": 3,
+  "code_summary": "",
+  "data_access": {
+    "blocking_reason": "No usable numeric or semi-numeric substrate was saved locally because zenodo.org could not be resolved via DNS during this run.",
+    "budgets": {
+      "max_file_bytes": 104857600,
+      "max_files": 12,
+      "max_seconds": 900,
+      "max_total_bytes": 262144000
+    },
+    "dataset": {
+      "accession_id": "zenodo:11208039",
+      "download_url": "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+      "label": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study",
+      "landing_page_url": "https://doi.org/10.1016/S2214-109X(23)00248-6",
+      "notes": "Resolved directly from an explicit Zenodo dataset id."
+    },
+    "download_manifest": [
+      {
+        "bytes_downloaded": 0,
+        "classification": "failed",
+        "content_type": "",
+        "entry_id": "download_1",
+        "error_kind": "dns_error",
+        "error_message": "HTTPSConnectionPool(host='zenodo.org', port=443): Max retries exceeded with url: /api/records/11208039/files/MaridiIndividuals22.xlsx/content (Caused by NameResolutionError(\"HTTPSConnection(host='zenodo.org', port=443): Failed to resolve 'zenodo.org' ([Errno -3] Temporary failure in name resolution)\"))",
+        "http_status": 0,
+        "latency_ms": 2,
+        "method": "GET",
+        "notes": "Primary explicit processed-table target; failed before any response due to DNS resolution error.",
+        "retrieval_target": "processed_table",
+        "saved_file_kind": "table",
+        "saved_path": "downloads/MaridiIndividuals22.xlsx",
+        "source_family": "zenodo_open_research",
+        "status": "dns_error",
+        "url": "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+        "usable_for_analysis": false
+      },
+      {
+        "bytes_downloaded": 0,
+        "classification": "failed",
+        "content_type": "",
+        "entry_id": "download_2",
+        "error_kind": "dns_error",
+        "error_message": "HTTPSConnectionPool(host='zenodo.org', port=443): Max retries exceeded with url: /api/records/11208039 (Caused by NameResolutionError(\"HTTPSConnection(host='zenodo.org', port=443): Failed to resolve 'zenodo.org' ([Errno -3] Temporary failure in name resolution)\"))",
+        "http_status": 0,
+        "latency_ms": 1,
+        "method": "GET",
+        "notes": "Metadata/API fallback attempt after processed-table failure; no response due to the same host-level DNS failure.",
+        "retrieval_target": "compact_numeric_file",
+        "saved_file_kind": "json",
+        "saved_path": "downloads/zenodo_11208039_record.json",
+        "source_family": "zenodo_open_research",
+        "status": "dns_error",
+        "url": "https://zenodo.org/api/records/11208039",
+        "usable_for_analysis": false
+      },
+      {
+        "bytes_downloaded": 0,
+        "classification": "failed",
+        "content_type": "",
+        "entry_id": "download_3",
+        "error_kind": "dns_error",
+        "error_message": "HTTPSConnectionPool(host='zenodo.org', port=443): Max retries exceeded with url: /records/11208039 (Caused by NameResolutionError(\"HTTPSConnection(host='zenodo.org', port=443): Failed to resolve 'zenodo.org' ([Errno -3] Temporary failure in name resolution)\"))",
+        "http_status": 0,
+        "latency_ms": 0,
+        "method": "GET",
+        "notes": "Zenodo record-page fallback attempt also failed at DNS resolution; later supplementary/raw archive attempts were not credible once the host was unreachable across endpoints.",
+        "retrieval_target": "landing_page",
+        "saved_file_kind": "html",
+        "saved_path": "downloads/zenodo_11208039_landing.html",
+        "source_family": "zenodo_open_research",
+        "status": "dns_error",
+        "url": "https://zenodo.org/records/11208039",
+        "usable_for_analysis": false
+      }
+    ],
+    "empirical_ready": false,
+    "host_failures": [
+      {
+        "attempts": 3,
+        "error_kinds": [
+          "dns_error"
+        ],
+        "failures": 3,
+        "host": "zenodo.org"
+      }
+    ],
+    "metadata_only_saved_files": [
+      {
+        "bytes_downloaded": 0,
+        "classification": "failed",
+        "path": "downloads/MaridiIndividuals22.xlsx",
+        "retrieval_target": "processed_table"
+      },
+      {
+        "bytes_downloaded": 0,
+        "classification": "failed",
+        "path": "downloads/zenodo_11208039_record.json",
+        "retrieval_target": "compact_numeric_file"
+      },
+      {
+        "bytes_downloaded": 0,
+        "classification": "failed",
+        "path": "downloads/zenodo_11208039_landing.html",
+        "retrieval_target": "landing_page"
+      }
+    ],
+    "receipts": {
+      "data_access_report_path": "data_access_report.json",
+      "download_manifest_path": "download_manifest.json",
+      "network_attempts_path": "network_attempts.tsv"
+    },
+    "sources": [
+      {
+        "accession_id": "zenodo:11208039",
+        "api_endpoint": "https://zenodo.org/api/records/11208039",
+        "api_query": "",
+        "authors": [],
+        "doi": "",
+        "download_url": "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+        "issue": "",
+        "journal": "",
+        "label": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study",
+        "landing_page_url": "https://doi.org/10.1016/S2214-109X(23)00248-6",
+        "notes": "Explicit Zenodo dataset id and direct file URL were supplied in the task input. No remote content could be retrieved because zenodo.org failed DNS resolution.",
+        "pages": "",
+        "pubmed_id": "",
+        "source_id": "source_1",
+        "volume": "",
+        "year": ""
+      }
+    ],
+    "status": "blocked",
+    "strategy": {
+      "family_id": "zenodo_open_research",
+      "family_label": "Zenodo Open Research",
+      "metadata_only_targets": [
+        "landing_page",
+        "html_page"
+      ],
+      "notes": "Prefer the smallest credible numeric or semi-numeric file before attempting larger raw archives.",
+      "numeric_targets": [
+        "processed_table",
+        "compact_numeric_file",
+        "supplementary_archive",
+        "raw_archive"
+      ],
+      "retrieval_order": [
+        "processed_table",
+        "compact_numeric_file",
+        "supplementary_archive",
+        "raw_archive"
+      ],
+      "trusted_domains": [
+        "zenodo.org"
+      ]
+    },
+    "substrate_class": "none",
+    "summary": "Attempted acquisition from zenodo.org using the provided retrieval order, starting with the explicit processed-table XLSX target and then a minimal Zenodo record API fallback plus the Zenodo record page. All requests failed at DNS resolution for zenodo.org, so no numeric, semi-numeric, or metadata file could be downloaded or saved locally.",
+    "usable_saved_files": []
+  },
+  "dataset": {
+    "accession_id": "zenodo:11208039",
+    "domain": "zenodo.org",
+    "download_url": "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+    "label": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study",
+    "landing_page_url": "https://doi.org/10.1016/S2214-109X(23)00248-6",
+    "notes": "Resolved directly from an explicit Zenodo dataset id."
+  },
+  "dataset_profile": {},
+  "execution_handoff": {},
+  "execution_plan": {},
+  "experiment_summary": "Attempted acquisition from zenodo.org using the provided retrieval order, starting with the explicit processed-table XLSX target and then a minimal Zenodo record API fallback plus the Zenodo record page. All requests failed at DNS resolution for zenodo.org, so no numeric, semi-numeric, or metadata file could be downloaded or saved locally.",
+  "experiments": [
+    "Data acquisition gate executed before empirical analysis."
+  ],
+  "figure_summaries": [],
+  "findings": [
+    "Empirical acquisition stopped at substrate_class=none.",
+    "No usable numeric or semi-numeric substrate was saved locally because zenodo.org could not be resolved via DNS during this run.",
+    "Only metadata-level files or pages were recovered; no usable numeric substrate was saved."
+  ],
+  "limitations": [
+    "No empirical analysis was run because the acquisition gate did not materialize usable numeric or semi-numeric substrate.",
+    "See data_access_report.json, download_manifest.json, and network_attempts.tsv for acquisition details.",
+    "No usable numeric or semi-numeric substrate was saved locally because zenodo.org could not be resolved via DNS during this run."
+  ],
+  "research_question": "Prevalence of ecig use in women unde te age or 50. Also any link",
+  "results": [
+    {
+      "artifact_ids": [
+        "data_access_report",
+        "download_manifest",
+        "network_attempts"
+      ],
+      "note_ids": [
+        "1B8E9C9F-1B18-441C-B106-A41AB4544CD8"
+      ],
+      "result_id": "result_1",
+      "text": "Attempted acquisition from zenodo.org using the provided retrieval order, starting with the explicit processed-table XLSX target and then a minimal Zenodo record API fallback plus the Zenodo record page. All requests failed at DNS resolution for zenodo.org, so no numeric, semi-numeric, or metadata file could be downloaded or saved locally."
+    }
+  ],
+  "search": {
+    "dataset": {
+      "accession_id": "zenodo:11208039",
+      "domain": "zenodo.org",
+      "download_url": "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+      "label": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study",
+      "landing_page_url": "https://doi.org/10.1016/S2214-109X(23)00248-6",
+      "notes": "Resolved directly from an explicit Zenodo dataset id."
+    },
+    "existing_work_gap": "Selected Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study from Zenodo Open Research as the primary empirical source.",
+    "novelty_rationale": "Selected Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study from Zenodo Open Research as the primary empirical source.",
+    "related_work": [],
+    "research_question": "Prevalence of ecig use in women unde te age or 50. Also any link",
+    "selected_agent": "resolver"
+  },
+  "sources": [
+    {
+      "accession_id": "zenodo:11208039",
+      "api_endpoint": "https://zenodo.org/api/records/11208039",
+      "api_query": "",
+      "authors": [],
+      "doi": "",
+      "download_url": "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+      "issue": "",
+      "journal": "",
+      "label": "Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study",
+      "landing_page_url": "https://doi.org/10.1016/S2214-109X(23)00248-6",
+      "notes": "Explicit Zenodo dataset id and direct file URL were supplied in the task input. No remote content could be retrieved because zenodo.org failed DNS resolution.",
+      "pages": "",
+      "pubmed_id": "",
+      "source_id": "source_1",
+      "volume": "",
+      "year": ""
+    }
+  ],
+  "title": "Prevalence of ecig use in women unde te age or 50. Also any link"
+}
