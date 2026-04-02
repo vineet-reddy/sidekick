@@ -1,0 +1,112 @@
+\documentclass[11pt]{article}
+
+\usepackage[T1]{fontenc}
+
+\usepackage[utf8]{inputenc}
+
+\usepackage[margin=1in]{geometry}
+
+\usepackage{graphicx}
+
+\usepackage{amsmath}
+
+\usepackage{amssymb}
+
+\usepackage{booktabs}
+
+\usepackage{array}
+
+\usepackage{tabularx}
+
+\usepackage{caption}
+
+\usepackage{float}
+
+\usepackage{tikz}
+
+\usepackage{pgfplots}
+
+\usepackage{microtype}
+
+\usepackage{lmodern}
+
+\usepackage[hidelinks]{hyperref}
+
+\pgfplotsset{compat=1.18}
+
+\captionsetup{font=small,labelfont=bf}
+
+\setlength{\parindent}{1.25em}
+
+\setlength{\parskip}{0pt}
+
+\title{Memo: Empirical paper gate not cleared for estimating prevalence of e-cigarette use in women under age 50}
+
+\author{Maya Chen$^{1}$ and Daniel Ortiz$^{2}$\\$^{1}$Open Data Systems Laboratory\\$^{2}$Center for Quantitative Discovery}
+
+\date{}
+
+\begin{document}
+
+\maketitle
+
+\begin{center}\small\textit{Research Memo}\end{center}
+
+\begin{abstract}
+
+This run is reported as a memo rather than an empirical manuscript because the empirical paper gate was not cleared. The acquisition step failed before analysis: the only supplied accession pointed to Zenodo, and zenodo.org could not be resolved via DNS, leaving substrate\_class=none and no usable numeric or semi-numeric file for analysis. In addition, the supplied accession maps to an onchocerciasis/epilepsy study in Maridi, South Sudan rather than to a tobacco or e-cigarette dataset, so the source itself was not aligned with the stated research question. As external context only, recent U.S. surveillance indicates that current e-cigarette use among all adult women was 5.5\% in 2023, and 2021 NHIS estimates were 10.3\% for women aged 18–24 and 5.1\% for women aged 25–44; however, these published tables do not directly provide a single estimate for women younger than 50 years. ([cdc.gov](https://www.cdc.gov/nchs/products/databriefs/db524.htm))
+
+\end{abstract}
+
+\section{Introduction}
+The stated question was interpreted as: what is the prevalence of e-cigarette use among women under age 50, and is there any relevant link to health or behavioral outcomes? This is a clinically and public-health relevant question because U.S. adult e-cigarette use has increased in recent years, and burden is concentrated in younger adults. Nationally, NHIS reported that overall adult e-cigarette use rose from 4.5\% in 2019 to 6.5\% in 2023; among women specifically, prevalence rose from 3.5\% in 2019 to 5.5\% in 2023. Age remains a major gradient: in 2023, overall prevalence was 15.5\% among ages 21–24, 12.6\% among ages 25–34, and 7.3\% among ages 35–49. ([cdc.gov](https://www.cdc.gov/nchs/products/databriefs/db524.htm))
+
+Among women of reproductive age, published studies further suggest that e-cigarette use is measurable and clinically relevant. In 2021 NHIS, women aged 18–24 had 10.3\% current use and women aged 25–44 had 5.1\% current use. In a PATH-based study of women aged 18–44, past-30-day e-cigarette use increased across 2013–2016. In pregnancy-related surveillance, PRAMS-based studies found nontrivial use before and during pregnancy, and CDC states that e-cigarettes are not safe in pregnancy because nicotine can harm fetal brain and lung development. ([cdc.gov](https://www.cdc.gov/nchs/products/databriefs/db475.htm))
+
+\section{Data And Methods}
+No empirical estimation was possible because the run failed at the acquisition gate. The provided data access report documents three failed retrieval attempts against zenodo.org, including the explicit XLSX target and API/page fallbacks, all terminating in DNS resolution failure and leaving no usable local substrate. Separately, source validation showed that the supplied accession corresponds to a Lancet Global Health article on onchocerciasis elimination and epilepsy incidence in Maridi, South Sudan, not to an e-cigarette prevalence dataset. Therefore, the run did not satisfy either the acquisition condition or the topic-alignment condition required for an empirical paper. ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/37474232/))
+
+Because no validated local data were available, this memo limits itself to a non-empirical synthesis of authoritative external literature relevant to the intended question. Contextual benchmarks were taken from CDC/NCHS NHIS briefs for adult prevalence by sex and age, from a PATH study on reproductive-age women, and from pregnancy-focused CDC/PRAMS literature on prevalence and associated outcomes. These sources are used only to frame what is currently known and to identify what an aligned future empirical run would need to estimate directly. ([cdc.gov](https://www.cdc.gov/nchs/products/databriefs/db524.htm))
+
+\section{Results}
+Validated study results from this run: none. No figures were validated, no statistical models were fit, and no prevalence estimate for women under age 50 was computed from local data because no usable numeric substrate was acquired.
+
+As contextual benchmarks from external literature, NHIS shows that adult women overall had 5.5\% current e-cigarette use in 2023, up from 3.5\% in 2019. NHIS 2021 sex-by-age tables show 10.3\% for women aged 18–24 and 5.1\% for women aged 25–44. However, the cited CDC tables do not directly report a single combined estimate for women younger than 50 years; 2023 tables separate age and sex margins, while 2021 tables provide sex-by-age categories only through 45 and older as the upper grouped category. Therefore, the exact requested prevalence remains unresolved in this run. ([cdc.gov](https://www.cdc.gov/nchs/products/databriefs/db524.htm))
+
+For the user's request for 'any link,' the strongest contextual links in the literature concern reproductive health and pregnancy. A PRAMS study across 38 states reported 3.6\% e-cigarette use before pregnancy and 1.1\% during the last 3 months of pregnancy, with conventional cigarette smoking the strongest predictor of use. A CDC-supported Obstetrics \& Gynecology analysis found that e-cigarette use during pregnancy, particularly daily use among women not concurrently smoking combustible cigarettes, was associated with higher prevalence of low birth weight and preterm birth. CDC guidance also states that e-cigarettes are not safe during pregnancy. These are external literature findings, not outputs of the present run. ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/33693836/))
+
+\section{Discussion}
+The main conclusion of the run is procedural rather than epidemiologic: the study cannot answer the stated question empirically because the only supplied accession neither materialized into analyzable data nor matched the topic of interest. The accession resolves to an onchocerciasis/epilepsy study in South Sudan, which is unrelated to estimating e-cigarette prevalence in women under age 50. That mismatch matters because even perfect recovery of the Maridi data would not have produced a valid answer to the tobacco question. ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/37474232/))
+
+Even so, the external literature helps define a credible target for a future aligned analysis. The most defensible immediate benchmark is that adult women overall had 5.5\% current e-cigarette use in 2023, while women 18–24 and 25–44 had 10.3\% and 5.1\%, respectively, in 2021 NHIS. These numbers imply that prevalence in women under 50 is unlikely to be trivial and is probably driven upward by younger-adult use, but producing a single under-50 estimate would require microdata or an official cross-tabulation rather than interpolation from published margins. That statement is an inference from the available surveillance tables, not a direct published estimate. ([cdc.gov](https://www.cdc.gov/nchs/products/databriefs/db524.htm))
+
+The literature also supports why a future analysis should not stop at prevalence alone. In reproductive-age and pregnancy-related populations, e-cigarette use co-occurs with combustible cigarette use and other substance-use or mental-health correlates, and observational evidence links prenatal e-cigarette exposure with adverse birth outcomes. Because the user's question asks for 'any link,' these reproductive-health associations are the most policy-relevant links identified in the grounded literature. ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/35258396/))
+
+\section{Conclusion}
+This run did not clear the empirical paper gate. The immediate failure condition was inability to retrieve any usable substrate from zenodo.org because of DNS failure; the deeper validation problem was that the supplied accession targeted an unrelated onchocerciasis/epilepsy study rather than an e-cigarette dataset. Consequently, no original prevalence estimate for women under age 50 can be reported from this run. As literature context only, the closest authoritative U.S. benchmarks identified here are 5.5\% current use among adult women in 2023 and, in 2021, 10.3\% among women aged 18–24 and 5.1\% among women aged 25–44. ([pubmed.ncbi.nlm.nih.gov](https://pubmed.ncbi.nlm.nih.gov/37474232/))
+
+\section{Limitations}
+No empirical analysis was run because acquisition did not materialize usable numeric or semi-numeric substrate. The supplied data source was topically misaligned with the stated question. No figure summaries were provided, so there were no validated figure-level results to narrate. The contextual prevalence and risk statements reported here come from external literature and should not be interpreted as outputs of the blocked run. An exact prevalence for women under age 50 was not directly recoverable from the cited published tables without microdata or an official cross-tabulation.
+
+\begin{thebibliography}{99}
+\bibitem{ref1}
+Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study. zenodo:11208039. https://doi.org/10.1016/S2214-109X(23)00248-6
+
+\bibitem{ref2}
+National Center for Health Statistics. Current Electronic Cigarette Use Among Adults in the United States. NCHS Data Brief No. 475. 2023.
+
+\bibitem{ref3}
+Kondracki AJ, Li W, Kalan ME, Ben Taleb Z, Ibrahimou B, Bursac Z. Changes in the National Prevalence of Current E-Cigarette, Cannabis, and Dual Use among Reproductive Age Women (18–44 Years Old) in the United States, 2013–2016. Substance Use \& Misuse. 2022;57(6):833-840. doi:10.1080/10826084.2022.2046092.
+
+\bibitem{ref4}
+Regan AK, Bombard JM, O'Hegarty MM, Smith RA, Tong VT. Adverse Birth Outcomes Associated With Prepregnancy and Prenatal Electronic Cigarette Use. Obstetrics \& Gynecology. 2021;138(1):85-94.
+
+\bibitem{ref5}
+Centers for Disease Control and Prevention. E-Cigarettes and Pregnancy. Maternal and Infant Health. Updated May 15, 2024.
+
+\bibitem{ref6}
+Jada SR, Amaral LJ, Lakwo T, Carter JY, Rovarini J, Bol YY, et al. Effect of onchocerciasis elimination measures on the incidence of epilepsy in Maridi, South Sudan: a 3-year longitudinal, prospective, population-based study. The Lancet Global Health. 2023;11(8):e1260-e1268. doi:10.1016/S2214-109X(23)00248-6.
+
+\end{thebibliography}
+
+\end{document}
