@@ -1,0 +1,61 @@
+{
+  "entries": [
+    {
+      "bytes_downloaded": 0,
+      "classification": "failed",
+      "content_type": "",
+      "entry_id": "download_1",
+      "error_kind": "dns_error",
+      "error_message": "HTTPSConnectionPool(host='zenodo.org', port=443): Max retries exceeded with url: /api/records/11208039/files/MaridiIndividuals22.xlsx/content (Caused by NameResolutionError(\"HTTPSConnection(host='zenodo.org', port=443): Failed to resolve 'zenodo.org' ([Errno -3] Temporary failure in name resolution)\"))",
+      "http_status": 0,
+      "latency_ms": 2,
+      "method": "GET",
+      "notes": "Primary explicit processed-table target; failed before any response due to DNS resolution error.",
+      "retrieval_target": "processed_table",
+      "saved_file_kind": "table",
+      "saved_path": "downloads/MaridiIndividuals22.xlsx",
+      "source_family": "zenodo_open_research",
+      "status": "dns_error",
+      "url": "https://zenodo.org/api/records/11208039/files/MaridiIndividuals22.xlsx/content",
+      "usable_for_analysis": false
+    },
+    {
+      "bytes_downloaded": 0,
+      "classification": "failed",
+      "content_type": "",
+      "entry_id": "download_2",
+      "error_kind": "dns_error",
+      "error_message": "HTTPSConnectionPool(host='zenodo.org', port=443): Max retries exceeded with url: /api/records/11208039 (Caused by NameResolutionError(\"HTTPSConnection(host='zenodo.org', port=443): Failed to resolve 'zenodo.org' ([Errno -3] Temporary failure in name resolution)\"))",
+      "http_status": 0,
+      "latency_ms": 1,
+      "method": "GET",
+      "notes": "Metadata/API fallback attempt after processed-table failure; no response due to the same host-level DNS failure.",
+      "retrieval_target": "compact_numeric_file",
+      "saved_file_kind": "json",
+      "saved_path": "downloads/zenodo_11208039_record.json",
+      "source_family": "zenodo_open_research",
+      "status": "dns_error",
+      "url": "https://zenodo.org/api/records/11208039",
+      "usable_for_analysis": false
+    },
+    {
+      "bytes_downloaded": 0,
+      "classification": "failed",
+      "content_type": "",
+      "entry_id": "download_3",
+      "error_kind": "dns_error",
+      "error_message": "HTTPSConnectionPool(host='zenodo.org', port=443): Max retries exceeded with url: /records/11208039 (Caused by NameResolutionError(\"HTTPSConnection(host='zenodo.org', port=443): Failed to resolve 'zenodo.org' ([Errno -3] Temporary failure in name resolution)\"))",
+      "http_status": 0,
+      "latency_ms": 0,
+      "method": "GET",
+      "notes": "Zenodo record-page fallback attempt also failed at DNS resolution; later supplementary/raw archive attempts were not credible once the host was unreachable across endpoints.",
+      "retrieval_target": "landing_page",
+      "saved_file_kind": "html",
+      "saved_path": "downloads/zenodo_11208039_landing.html",
+      "source_family": "zenodo_open_research",
+      "status": "dns_error",
+      "url": "https://zenodo.org/records/11208039",
+      "usable_for_analysis": false
+    }
+  ]
+}
