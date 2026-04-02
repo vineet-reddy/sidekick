@@ -97,7 +97,15 @@ final class HeartbeatManager: ObservableObject {
             try await resolveInFlightPapers(modelContext: modelContext)
             try await reconsiderHeldResearchRunsIfNeeded(modelContext: modelContext)
             try await admitQueuedResearchRunsIfPossible(modelContext: modelContext)
+            try modelContext.save()
+        } catch {
+            persistModelChangesIfPossible(in: modelContext, context: "heartbeat in-flight reconciliation")
+            lastError = error.localizedDescription
+            phase = .idle
+            return
+        }
 
+        do {
             phase = .assessingNotes
             let submitted = try await discoverNewPaperCandidates(modelContext: modelContext)
             try await admitQueuedResearchRunsIfPossible(modelContext: modelContext)
@@ -112,6 +120,7 @@ final class HeartbeatManager: ObservableObject {
                 }
             }
         } catch {
+            persistModelChangesIfPossible(in: modelContext, context: "heartbeat note assessment")
             lastError = error.localizedDescription
             phase = .idle
         }
@@ -126,6 +135,8 @@ final class HeartbeatManager: ObservableObject {
         )
         let runsByPaperID = runs.latestRunsByPaperID()
 
+        repairInterruptedHostedRuns(papersByID: Dictionary(uniqueKeysWithValues: papers.map { ($0.id, $0) }), runs: runs)
+
         for paper in papers where paper.status == .generating {
             guard let run = runsByPaperID[paper.id] else {
                 continue
@@ -135,17 +146,24 @@ final class HeartbeatManager: ObservableObject {
                 continue
             }
 
-            let result = try await openAI.checkTask(run.runID)
+            guard let taskID = canonicalHostedTaskID(for: run, paper: paper) else {
+                continue
+            }
+
+            let result = try await openAI.checkTask(taskID)
             switch result {
             case let .waiting(snapshot):
                 persistTaskProgress(snapshot)
+                syncHostedTaskID(snapshot.taskID, run: run, paper: paper)
                 apply(snapshot: snapshot, to: run)
             case let .completed(snapshot, artifacts):
                 persistTaskProgress(snapshot)
+                syncHostedTaskID(snapshot.taskID, run: run, paper: paper)
                 apply(snapshot: snapshot, to: run)
                 try await applyCompletedArtifacts(artifacts, to: paper, run: run)
             case let .failed(snapshot, message):
                 persistTaskProgress(snapshot)
+                syncHostedTaskID(snapshot.taskID, run: run, paper: paper)
                 apply(snapshot: snapshot, to: run)
                 markResearchRunFailed(run, paper: paper, message: message)
             }
@@ -157,7 +175,7 @@ final class HeartbeatManager: ObservableObject {
             }
 
             guard run.status == .completed,
-                  !run.runID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                  canonicalHostedTaskID(for: run, paper: paper) != nil else {
                 continue
             }
 
@@ -165,12 +183,17 @@ final class HeartbeatManager: ObservableObject {
                 continue
             }
 
-            let result = try await openAI.checkTask(run.runID)
+            guard let taskID = canonicalHostedTaskID(for: run, paper: paper) else {
+                continue
+            }
+
+            let result = try await openAI.checkTask(taskID)
             switch result {
             case .waiting:
                 continue
             case let .completed(snapshot, artifacts):
                 persistTaskProgress(snapshot)
+                syncHostedTaskID(snapshot.taskID, run: run, paper: paper)
                 apply(snapshot: snapshot, to: run)
                 try await applyCompletedArtifacts(artifacts, to: paper, run: run)
             case .failed:
@@ -191,8 +214,85 @@ final class HeartbeatManager: ObservableObject {
                 backendStageRaw: snapshot.backendStage,
                 backendMessage: snapshot.latestEventText
             ),
-            message: snapshot.latestEventText
+            message: snapshot.latestEventText,
+            activeTaskID: snapshot.taskID
         )
+    }
+
+    private func repairInterruptedHostedRuns(
+        papersByID: [UUID: Paper],
+        runs: [ResearchRun]
+    ) {
+        for run in runs {
+            guard let paper = papersByID[run.paperID] else {
+                continue
+            }
+
+            if let taskID = canonicalHostedTaskID(for: run, paper: paper) {
+                syncHostedTaskID(taskID, run: run, paper: paper)
+                continue
+            }
+
+            guard run.status == .running, isLocalQueuedPlaceholder(run.runID) else {
+                continue
+            }
+
+            run.schedulingDisposition = github.isConnected ? .autoStart : .hold
+            run.markQueued(
+                message: github.isConnected
+                    ? "Recovered a queued research run after an interrupted submission. Sidekick will resubmit it on the next pass."
+                    : "Connect GitHub to start this paper. Sidekick requires a public user-owned repo for every run.",
+                queueState: github.isConnected ? .queued : .held
+            )
+            if paper.codexTaskID.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                paper.codexTaskID = run.runID
+            }
+            if paper.status == .ready {
+                continue
+            }
+            paper.status = .generating
+        }
+    }
+
+    private func canonicalHostedTaskID(for run: ResearchRun, paper: Paper) -> String? {
+        let candidates = [
+            run.runID,
+            run.activeTaskID ?? "",
+            paper.codexTaskID,
+        ]
+
+        for candidate in candidates {
+            let trimmed = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, !isLocalQueuedPlaceholder(trimmed) else {
+                continue
+            }
+            return trimmed
+        }
+
+        return nil
+    }
+
+    private func syncHostedTaskID(_ taskID: String, run: ResearchRun, paper: Paper) {
+        let trimmed = taskID.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return
+        }
+
+        if run.runID != trimmed {
+            run.runID = trimmed
+        }
+        if run.activeTaskID != trimmed {
+            run.activeTaskID = trimmed
+        }
+        if paper.codexTaskID != trimmed {
+            paper.codexTaskID = trimmed
+        }
+    }
+
+    private func isLocalQueuedPlaceholder(_ taskID: String) -> Bool {
+        taskID.trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .hasPrefix("queued-")
     }
 
     private func stage(
@@ -465,7 +565,10 @@ final class HeartbeatManager: ObservableObject {
     ) async throws {
         run.executionBackend = .sidekickHosted
         paper.status = .generating
-        run.markRunning(stage: .plan, message: "Submitting the paper job to Sidekick-hosted compute.")
+        run.markQueued(
+            message: "Submitting the paper job to Sidekick-hosted compute.",
+            queueState: .queued
+        )
         try persistModelChanges(in: run.modelContext)
 
         do {
@@ -480,7 +583,11 @@ final class HeartbeatManager: ObservableObject {
             run.datasetIDs = submission.selectedDatasetIDs
             run.allowedDomains = submission.allowedDomains
             paper.codexTaskID = submission.taskID
-            run.markRunning(stage: .plan, message: ResearchRunStage.plan.title)
+            run.markRunning(
+                stage: .plan,
+                message: ResearchRunStage.plan.title,
+                activeTaskID: submission.taskID
+            )
             try PaperArtifactStore.persistPendingSubmission(
                 submission,
                 title: run.title,
@@ -520,6 +627,11 @@ final class HeartbeatManager: ObservableObject {
         var currentPapers = try modelContext.fetch(
             FetchDescriptor<Paper>(sortBy: [SortDescriptor(\.createdAt, order: .reverse)])
         )
+        let activeRuns = try modelContext.fetch(FetchDescriptor<ResearchRun>())
+        if activeRuns.contains(where: { $0.status == .running }) {
+            return submitted
+        }
+
         guard submitted > 0 || shouldAssessNotes(notes: notes, existingPapers: currentPapers) else {
             return submitted
         }

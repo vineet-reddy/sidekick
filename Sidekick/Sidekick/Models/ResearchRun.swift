@@ -332,7 +332,9 @@ final class ResearchRun {
         currentStage = stage
         status = .running
         queueState = .queued
-        self.activeTaskID = activeTaskID
+        if let activeTaskID {
+            self.activeTaskID = activeTaskID
+        }
         lastError = nil
         if let message {
             latestProgressMessage = message

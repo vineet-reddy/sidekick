@@ -340,21 +340,33 @@ final class OpenAIService: ObservableObject {
         datasetIDs: [String]
     ) async throws -> ResearchRunPreparation {
         _ = try? await github.ensureDeviceSession(forceRefresh: true)
-        let combinedDatasetIDs = datasetIDs
+        let requestedDatasetIDs = datasetIDs
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
+        let noteTexts = notes.map(\.content)
+        let sourceSelection = await trustedDatasets.sourceSelection(
+            datasetIDs: requestedDatasetIDs,
+            noteTexts: noteTexts
+        )
+        let resolvedDatasetIDs = Array(
+            Set(requestedDatasetIDs + sourceSelection.datasets.map(\.id))
+        ).sorted()
+        let allowedDomains = TrustedDatasetRegistry.allowedDomains(for: sourceSelection.datasets)
         let registryVersion = await trustedDatasets.registryVersion()
         let connected = github.isConnected
+        let connectedMessage = sourceSelection.message
+            ?? "Research queued on Sidekick-hosted compute."
+        let heldMessage = "Connect GitHub to start this paper. Sidekick requires a public user-owned repo for every run."
 
         return ResearchRunPreparation(
-            selectedDatasetIDs: combinedDatasetIDs,
-            allowedDomains: [],
+            selectedDatasetIDs: resolvedDatasetIDs,
+            allowedDomains: allowedDomains,
             registryVersion: registryVersion,
-            sourceSupportTier: combinedDatasetIDs.isEmpty ? .experimental : .supported,
+            sourceSupportTier: sourceSelection.supportTier,
             schedulingDisposition: connected ? .autoStart : .hold,
             initialStatusMessage: connected
-                ? "Research queued on Sidekick-hosted compute."
-                : "Connect GitHub to start this paper. Sidekick requires a public user-owned repo for every run.",
+                ? connectedMessage
+                : heldMessage,
             planArtifact: nil,
             inspectionArtifact: nil,
             analysisArtifact: nil,

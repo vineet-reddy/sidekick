@@ -27,6 +27,73 @@ nonisolated struct TaskOutputProvenance: Codable {
         case leftTrustedSet = "left_trusted_set"
         case externalSources = "external_sources"
         case notes
+        case datasetAccessionID = "dataset_accession_id"
+        case researchQuestion = "research_question"
+        case substrateClass = "substrate_class"
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+
+        if let values = try? container.decode([String].self, forKey: .usedDatasetIDs) {
+            usedDatasetIDs = values
+        } else if let value = try? container.decode(String.self, forKey: .usedDatasetIDs) {
+            usedDatasetIDs = value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? [] : [value]
+        } else if let value = try? container.decode(String.self, forKey: .datasetAccessionID) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            usedDatasetIDs = trimmed.isEmpty ? [] : [trimmed]
+        } else {
+            usedDatasetIDs = []
+        }
+
+        if let values = try? container.decode([String].self, forKey: .accessedDomains) {
+            accessedDomains = values
+        } else if let value = try? container.decode(String.self, forKey: .accessedDomains) {
+            accessedDomains = value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? [] : [value]
+        } else {
+            accessedDomains = []
+        }
+
+        leftTrustedSet = (try? container.decode(Bool.self, forKey: .leftTrustedSet)) ?? false
+
+        if let values = try? container.decode([String].self, forKey: .externalSources) {
+            externalSources = values
+        } else if let value = try? container.decode(String.self, forKey: .externalSources) {
+            externalSources = value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? [] : [value]
+        } else {
+            externalSources = []
+        }
+
+        if let noteText = try? container.decode(String.self, forKey: .notes),
+           !noteText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            notes = noteText
+            return
+        }
+
+        let researchQuestion = (try? container.decode(String.self, forKey: .researchQuestion))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let substrateClass = (try? container.decode(String.self, forKey: .substrateClass))?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let accession = usedDatasetIDs.first
+
+        let synthesizedParts = [
+            accession.map { "Dataset accession: \($0)" },
+            substrateClass.flatMap { $0.isEmpty ? nil : "Substrate class: \($0)" },
+            researchQuestion.flatMap { $0.isEmpty ? nil : "Research question: \($0)" }
+        ].compactMap { $0 }
+
+        notes = synthesizedParts.isEmpty
+            ? "The task completed without structured provenance notes."
+            : synthesizedParts.joined(separator: "\n")
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(usedDatasetIDs, forKey: .usedDatasetIDs)
+        try container.encode(accessedDomains, forKey: .accessedDomains)
+        try container.encode(leftTrustedSet, forKey: .leftTrustedSet)
+        try container.encode(externalSources, forKey: .externalSources)
+        try container.encode(notes, forKey: .notes)
     }
 }
 
